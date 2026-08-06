@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  ENVIRONMENT: development
+  MARKETSTACK_API_KEY: test-provider-key-never-used
+  MARKETSTACK_BASE_URL: https://marketstack.invalid/v2
+  MARKETSTACK_MONTHLY_BUDGET: "90"
+  APP_ACCESS_KEY_SHA256: 7c222fb2927d828af22f592134e8932480637c0d23f8469b0e9e25c531b77a92
+  SESSION_SECRET: test-only-session-secret-with-at-least-32-characters
+  UPSTASH_REDIS_REST_URL: https://upstash.invalid
+  UPSTASH_REDIS_REST_TOKEN: test-token-never-used
+  ALLOWED_ORIGIN: http://testserver
+  ALLOWED_HOSTS: testserver,localhost,127.0.0.1
+  SESSION_COOKIE_SECURE: "false"
+  HTTP_TIMEOUT_SECONDS: "1"
+
+jobs:
+  quality:
+    name: Lint, type-check, and audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy app api
+      - run: python -m pip_audit
+
+  tests:
+    name: Unit and integration coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - name: Run tests with 80% line and branch coverage
+        run: pytest -m "not e2e"
+
+  browser:
+    name: Optional Playwright tests
+    if: ${{ vars.RUN_PLAYWRIGHT == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m playwright install --with-deps chromium
+      - name: Run browser tests against fake services only
+        run: pytest -m e2e --no-cov
