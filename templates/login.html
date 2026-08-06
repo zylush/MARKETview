@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>Sign in | Marketstack Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='login.css') }}">
+  </head>
+  <body>
+    <a class="skip-link" href="#login-main">Skip to sign in</a>
+    <main id="login-main" class="login-shell">
+      <section class="login-panel" aria-labelledby="login-heading">
+        <div class="brand" aria-label="Marketstack Dashboard">
+          <span class="brand-mark" aria-hidden="true">M</span>
+          <span>Marketstack</span>
+        </div>
+        <div class="login-intro">
+          <p class="eyebrow">Personal market dashboard</p>
+          <h1 id="login-heading">Sign in to your workspace</h1>
+          <p>Enter the app password to access market history and company data.</p>
+        </div>
+
+        {% if error %}
+          <div class="form-alert" role="alert" data-testid="login-error">{{ error }}</div>
+        {% endif %}
+
+        <form class="login-form" method="post" action="/auth/login" data-testid="login-form">
+          {% if csrf_token is defined and csrf_token %}
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          {% endif %}
+          <div class="field">
+            <label for="password">Password</label>
+            <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+          </div>
+          <button type="submit">Sign in</button>
+        </form>
+      </section>
+    </main>
+  </body>
+</html>
