@@ -1,0 +1,1 @@
+"""Marketstack dashboard application package."""
