@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, TypeVar
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -20,6 +22,41 @@ from app.models import Dividend, EODBar, Exchange, Page, Split, Ticker, Usage
 from app.validation import validate_cursor, validate_date_range, validate_limit, validate_symbol
 
 T = TypeVar("T")
+_SENSITIVE_QUERY_NAMES = frozenset(
+    {"access_key", "api_key", "apikey", "password", "secret", "token"}
+)
+
+
+def _redact_query_argument(value: object) -> object:
+    if not isinstance(value, (str, httpx.URL)):
+        return value
+    raw = str(value)
+    if "?" not in raw:
+        return value
+    parsed = urlsplit(raw)
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    redacted = [
+        (name, "REDACTED" if name.lower() in _SENSITIVE_QUERY_NAMES else item)
+        for name, item in pairs
+    ]
+    if pairs == redacted:
+        return value
+    query = urlencode(redacted, doseq=True)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
+
+
+class _SensitiveQueryFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(_redact_query_argument(value) for value in record.args)
+        return True
+
+
+def _install_http_log_redaction() -> None:
+    httpx_logger = logging.getLogger("httpx")
+    if not any(isinstance(item, _SensitiveQueryFilter) for item in httpx_logger.filters):
+        httpx_logger.addFilter(_SensitiveQueryFilter())
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 class MarketstackProvider:
@@ -35,6 +72,7 @@ class MarketstackProvider:
     ) -> None:
         if not access_key:
             raise ValueError("Marketstack access key is required")
+        _install_http_log_redaction()
         self._access_key = access_key
         self._base_url = base_url.rstrip("/")
         self._client = client or httpx.AsyncClient(timeout=timeout_seconds)

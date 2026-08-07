@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from typing import Any
 
 import httpx
@@ -48,6 +49,31 @@ def test_adapter_maps_v2_tickers_and_pagination_without_leaking_key() -> None:
     assert page.next_cursor == "1"
     assert seen[0].url.params["access_key"] == "super-secret"
     assert "access_key" not in seen[0].headers
+
+
+def test_adapter_redacts_query_credentials_from_http_client_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"data": [], "pagination": {"offset": 0, "limit": 1, "count": 0}},
+        )
+
+    async def scenario() -> None:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            provider = MarketstackProvider("super-secret", client=client)
+            await provider.list_tickers(limit=1)
+        finally:
+            await client.aclose()
+
+    caplog.set_level(logging.INFO, logger="httpx")
+    run(scenario())
+
+    assert "super-secret" not in caplog.text
+    assert "access_key=REDACTED" in caplog.text
+    assert "limit=1" in caplog.text
 
 
 @pytest.mark.parametrize(
