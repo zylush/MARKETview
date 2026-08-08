@@ -297,10 +297,10 @@ async def test_latest_route_maps_the_real_market_data_candles_boundary(settings)
     request = upstream_requests[0]
     assert request.url.path == "/v1/stocks/candles/D/AAPL/"
     assert dict(request.url.params) == {
-        "to": "today",
         "countback": "1",
         "adjustsplits": "false",
     }
+    assert "to" not in request.url.params
     assert request.headers.get_list("Authorization") == ["Bearer provider-only-secret"]
     assert "x-app-key" not in request.headers
     assert await shared_cache.current_count(service.quota_key) == 1

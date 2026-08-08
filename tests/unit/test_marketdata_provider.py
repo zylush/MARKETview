@@ -84,10 +84,10 @@ async def test_latest_uses_exact_candles_path_query_and_bearer_header() -> None:
     assert request.method == "GET"
     assert request.url.path == "/v1/stocks/candles/D/AAPL/"
     assert dict(request.url.params) == {
-        "to": "today",
         "countback": "1",
         "adjustsplits": "false",
     }
+    assert "to" not in request.url.params
     assert request.headers.get_list("authorization") == [f"Bearer {PROVIDER_TEST_SENTINEL}"]
     assert request.headers.get_list("accept") == ["application/json"]
     assert PROVIDER_TEST_SENTINEL not in str(request.url)

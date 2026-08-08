@@ -63,7 +63,7 @@ Both supported operations call `/stocks/candles/D/{symbol}/` beneath the upstrea
 
 | Operation | Query |
 | --- | --- |
-| Latest | `to=today&countback=1&adjustsplits=false` |
+| Latest | `countback=1&adjustsplits=false` (no `to`, so the provider returns the most recent candle) |
 | History | `from=YYYY-MM-DD&to=YYYY-MM-DD&adjustsplits=false` |
 
 The explicit `adjustsplits=false` setting means returned prices are unadjusted for stock splits.

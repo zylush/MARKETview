@@ -147,7 +147,7 @@ class MarketDataAppProvider:
             checked_symbol = validate_symbol(symbol)
             result, detached_error = await self._request_candles(
                 checked_symbol,
-                {"to": "today", "countback": "1", "adjustsplits": "false"},
+                {"countback": "1", "adjustsplits": "false"},
             )
         except MarketDataError as error:
             detached_error = self._detached_public_error(error)

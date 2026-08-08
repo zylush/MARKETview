@@ -15,7 +15,11 @@ from app.errors import (
     ProviderUnavailableError,
 )
 from app.providers.marketdata import MarketDataAppProvider
-from tests.unit.test_marketdata_provider import TOKEN, candles_payload, provider_for
+from tests.unit.test_marketdata_provider import (
+    PROVIDER_TEST_SENTINEL,
+    candles_payload,
+    provider_for,
+)
 
 
 class _AliasedResponse:
@@ -61,7 +65,7 @@ class _UnexpectedFailureClient:
 
 def _provider_with_client(client: Any) -> MarketDataAppProvider:
     return MarketDataAppProvider(
-        TOKEN,
+        PROVIDER_TEST_SENTINEL,
         base_url="https://api.marketdata.app/v1",
         client=client,
     )
@@ -80,7 +84,10 @@ def _provider_traceback_locals(error: BaseException) -> list[str]:
 @pytest.mark.asyncio
 async def test_deep_aliased_payload_is_not_mutated_or_retained_by_failure() -> None:
     payload: dict[str, Any] = candles_payload(o=[1], h=[2], l=[0], c=[1], v=[1], t=[1704067200])
-    private_branch = {"token": TOKEN, "message": "private-deep-payload-sentinel"}
+    private_branch = {
+        "token": PROVIDER_TEST_SENTINEL,
+        "message": "private-deep-payload-sentinel",
+    }
     payload["private"] = {"left": private_branch, "right": private_branch}
     original = copy.deepcopy(payload)
     client = _InjectedClient(_AliasedResponse(200, payload))
@@ -91,13 +98,16 @@ async def test_deep_aliased_payload_is_not_mutated_or_retained_by_failure() -> N
     assert result.date == date(2024, 1, 1)
     assert payload == original
     assert payload["private"]["left"] is payload["private"]["right"]
-    assert TOKEN not in repr(provider.__dict__)
+    assert PROVIDER_TEST_SENTINEL not in repr(provider.__dict__)
 
 
 @pytest.mark.asyncio
 async def test_malformed_aliased_payload_failure_does_not_mutate_or_retain_payload() -> None:
     payload: dict[str, Any] = candles_payload(t=[1704067200])
-    payload["private"] = {"token": TOKEN, "message": "private-malformed-payload-sentinel"}
+    payload["private"] = {
+        "token": PROVIDER_TEST_SENTINEL,
+        "message": "private-malformed-payload-sentinel",
+    }
     original = copy.deepcopy(payload)
     client = _InjectedClient(_AliasedResponse(200, payload))
     provider = _provider_with_client(client)
@@ -108,7 +118,7 @@ async def test_malformed_aliased_payload_failure_does_not_mutate_or_retain_paylo
     assert payload == original
     assert "private-malformed-payload-sentinel" not in str(captured.value)
     for surface in _provider_traceback_locals(captured.value):
-        assert TOKEN not in surface
+        assert PROVIDER_TEST_SENTINEL not in surface
         assert "private-malformed-payload-sentinel" not in surface
 
 
@@ -124,7 +134,7 @@ async def test_json_decoder_recursion_is_detached_without_response_retention() -
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
     for surface in _provider_traceback_locals(captured.value):
-        assert TOKEN not in surface
+        assert PROVIDER_TEST_SENTINEL not in surface
         assert "private-decoder-recursion-sentinel" not in surface
 
 
@@ -146,7 +156,7 @@ async def test_unexpected_transport_exception_is_sanitized_without_retry_or_rete
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
     forbidden = (
-        TOKEN,
+        PROVIDER_TEST_SENTINEL,
         "PRIVATE-SYMBOL",
         "2001-02-03",
         "2001-02-04",
@@ -167,9 +177,11 @@ async def test_late_httpx_and_httpcore_child_loggers_cannot_bypass_scrubbing(
 
     def handler(request: httpx.Request) -> httpx.Response:
         logging.getLogger(f"httpx.late.{unique}").error(
-            "url=%s Authorization=Bearer %s", request.url, TOKEN
+            "url=%s Authorization=Bearer %s", request.url, PROVIDER_TEST_SENTINEL
         )
-        logging.getLogger(f"httpcore.late.{unique}").error("headers Authorization=Bearer %s", TOKEN)
+        logging.getLogger(f"httpcore.late.{unique}").error(
+            "headers Authorization=Bearer %s", PROVIDER_TEST_SENTINEL
+        )
         logging.getLogger(f"application.safe.{unique}").warning("unrelated-log-preserved")
         return httpx.Response(
             200,
@@ -183,7 +195,7 @@ async def test_late_httpx_and_httpcore_child_loggers_cannot_bypass_scrubbing(
         finally:
             await client.aclose()
 
-    assert TOKEN not in caplog.text
+    assert PROVIDER_TEST_SENTINEL not in caplog.text
     assert "Authorization" not in caplog.text
     assert "unrelated-log-preserved" in caplog.text
 
@@ -197,7 +209,11 @@ async def test_private_history_inputs_are_absent_from_provider_exception_graph()
     provider, client = provider_for(
         lambda request: httpx.Response(
             401,
-            json={"s": "error", "errmsg": "private-body-sentinel", "token": TOKEN},
+            json={
+                "s": "error",
+                "errmsg": "private-body-sentinel",
+                "token": PROVIDER_TEST_SENTINEL,
+            },
         )
     )
     try:
@@ -213,7 +229,7 @@ async def test_private_history_inputs_are_absent_from_provider_exception_graph()
         await client.aclose()
 
     forbidden = (
-        TOKEN,
+        PROVIDER_TEST_SENTINEL,
         private_symbol,
         private_cursor,
         private_start,
@@ -319,12 +335,12 @@ async def test_outbound_headers_never_include_application_access_key() -> None:
         await client.aclose()
 
     assert "x-app-key" not in captured[0].headers
-    assert captured[0].headers.get_list("authorization") == [f"Bearer {TOKEN}"]
+    assert captured[0].headers.get_list("authorization") == [f"Bearer {PROVIDER_TEST_SENTINEL}"]
 
 
 @pytest.mark.asyncio
 async def test_context_manager_closes_owned_client() -> None:
-    provider = MarketDataAppProvider(TOKEN)
+    provider = MarketDataAppProvider(PROVIDER_TEST_SENTINEL)
 
     async with provider as entered:
         assert entered is provider
@@ -336,7 +352,7 @@ async def test_context_manager_closes_owned_client() -> None:
     ("token", "base_url"),
     [
         ("private-invalid-token\n", "https://api.marketdata.app/v1"),
-        (TOKEN, "https://private-url.example/not-v1?private=query"),
+        (PROVIDER_TEST_SENTINEL, "https://private-url.example/not-v1?private=query"),
     ],
 )
 def test_constructor_validation_discards_private_inputs_from_traceback(
