@@ -164,6 +164,7 @@ async def test_unexpected_transport_exception_is_sanitized_without_retry_or_rete
         "87654321",
         "Authorization",
         "adjustsplits",
+        "adjustdividends",
         "private-unexpected-transport-sentinel",
     )
     for surface in _provider_traceback_locals(captured.value):
@@ -244,6 +245,7 @@ async def test_private_history_inputs_are_absent_from_provider_exception_graph(
         "private-body-sentinel",
         "Authorization",
         "adjustsplits",
+        "adjustdividends",
     )
     pending: list[BaseException] = [captured.value]
     while pending:

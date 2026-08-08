@@ -300,8 +300,10 @@ async def test_latest_route_maps_the_real_market_data_candles_boundary(settings)
     assert dict(request.url.params) == {
         "countback": "1",
         "adjustsplits": "false",
+        "adjustdividends": "false",
     }
     assert "to" not in request.url.params
+    assert not {"token", "access_key", "api_key"} & set(request.url.params)
     assert request.headers.get_list("Authorization") == ["Bearer provider-only-secret"]
     assert "x-app-key" not in request.headers
     assert await shared_cache.current_count(service.quota_key) == 1
@@ -361,6 +363,7 @@ async def test_exact_reported_history_range_reaches_documented_provider_boundary
         "from": "2025-08-08",
         "to": "2026-08-08",
         "adjustsplits": "false",
+        "adjustdividends": "false",
     }
     assert not {"limit", "cursor", "offset", "token", "access_key", "api_key"} & set(
         upstream_requests[0].url.params

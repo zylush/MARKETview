@@ -80,7 +80,8 @@ responses retain the envelope
 `{success, data, meta: {request_id, source, as_of, cached, stale, pagination}, error}`.
 
 Latest and history use Market Data's `/stocks/candles/D/{symbol}/` endpoint. Requests explicitly
-set `adjustsplits=false`, so prices are unadjusted for splits. Latest uses `countback=1`
+set `adjustsplits=false&adjustdividends=false`, so prices are unadjusted for splits and
+dividends. Latest uses `countback=1`
 without a `to` value, which asks Market Data for the most recent candle;
 history uses the client's bounded `from` and `to` dates unchanged, including weekends and holidays;
 Market Data determines whether candles exist. HTTP `200` and `203` are accepted as success. A `204`

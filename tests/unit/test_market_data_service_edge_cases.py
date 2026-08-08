@@ -142,6 +142,67 @@ async def test_contract_revision_bypasses_old_latest_negative_cache_key() -> Non
 
 
 @pytest.mark.asyncio
+async def test_new_contract_bypasses_v3_latest_result_cache_key() -> None:
+    provider = CompleteProvider()
+    cache = MemoryCache()
+    v3_key = CacheKeyBuilder().build(
+        "latest_eod",
+        {"symbol": "AAPL", "provider_contract": "marketdata-candles-v3"},
+    )
+    await cache.set(
+        v3_key,
+        {
+            "status": "ok",
+            "payload": EODBar(symbol="AAPL", date="2026-08-06", close=Decimal("999")).model_dump(
+                mode="json"
+            ),
+            "as_of": "2026-08-07T00:00:00+00:00",
+        },
+        ttl_seconds=3600,
+    )
+    service = MarketDataService(provider, cache)
+
+    result = await service.latest_eod("AAPL")
+
+    assert result.close == Decimal("1.5")
+    assert [name for name, _ in provider.calls] == ["latest"]
+    assert await cache.current_count(service.quota_key) == 1
+
+
+@pytest.mark.asyncio
+async def test_new_contract_bypasses_v3_history_result_cache_key() -> None:
+    provider = CompleteProvider()
+    cache = MemoryCache()
+    v3_key = CacheKeyBuilder().build(
+        "eod_history",
+        {
+            "symbol": "AAPL",
+            "start": date(2026, 8, 1),
+            "end": date(2026, 8, 7),
+            "provider_contract": "marketdata-candles-v3",
+        },
+    )
+    await cache.set(
+        v3_key,
+        {
+            "status": "ok",
+            "payload": Page(
+                items=(EODBar(symbol="AAPL", date="2026-08-06", close=Decimal("999")),)
+            ).model_dump(mode="json"),
+            "as_of": "2026-08-07T00:00:00+00:00",
+        },
+        ttl_seconds=3600,
+    )
+    service = MarketDataService(provider, cache)
+
+    result = await service.history("AAPL", date(2026, 8, 1), date(2026, 8, 7))
+
+    assert result.items[0].close == Decimal("1")
+    assert [name for name, _ in provider.calls] == ["history"]
+    assert await cache.current_count(service.quota_key) == 1
+
+
+@pytest.mark.asyncio
 async def test_weekend_only_range_reaches_provider_without_local_semantic_rejection() -> None:
     provider = CompleteProvider()
     cache = MemoryCache()

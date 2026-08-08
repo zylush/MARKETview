@@ -63,10 +63,11 @@ Both supported operations call `/stocks/candles/D/{symbol}/` beneath the upstrea
 
 | Operation | Query |
 | --- | --- |
-| Latest | `countback=1&adjustsplits=false` (no `to`, so the provider returns the most recent candle) |
-| History | `from=YYYY-MM-DD&to=YYYY-MM-DD&adjustsplits=false` |
+| Latest | `countback=1&adjustsplits=false&adjustdividends=false` (no `to`, so the provider returns the most recent candle) |
+| History | `from=YYYY-MM-DD&to=YYYY-MM-DD&adjustsplits=false&adjustdividends=false` |
 
-The explicit `adjustsplits=false` setting means returned prices are unadjusted for stock splits.
+The explicit `adjustsplits=false&adjustdividends=false` settings mean returned prices are
+unadjusted for stock splits and dividends.
 History dates pass through unchanged, including weekends and holidays; documented provider
 `no_data` responses become application 404 responses. Provider HTTP `400`, `413`, and `422`
 responses are uncached upstream request failures (502), never application validation errors.

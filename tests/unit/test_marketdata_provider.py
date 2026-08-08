@@ -86,6 +86,7 @@ async def test_latest_uses_exact_candles_path_query_and_bearer_header() -> None:
     assert dict(request.url.params) == {
         "countback": "1",
         "adjustsplits": "false",
+        "adjustdividends": "false",
     }
     assert "to" not in request.url.params
     assert request.headers.get_list("authorization") == [f"Bearer {PROVIDER_TEST_SENTINEL}"]
@@ -134,7 +135,13 @@ async def test_history_uses_exact_query_and_applies_immutable_local_pagination()
         "from": "2024-01-01",
         "to": "2024-01-03",
         "adjustsplits": "false",
+        "adjustdividends": "false",
     }
+    assert not {"limit", "cursor", "offset", "token", "access_key", "api_key"} & set(
+        captured[0].url.params
+    )
+    assert captured[0].headers.get_list("authorization") == [f"Bearer {PROVIDER_TEST_SENTINEL}"]
+    assert PROVIDER_TEST_SENTINEL not in str(captured[0].url)
 
 
 @pytest.mark.asyncio

@@ -25,7 +25,7 @@ from app.validation import validate_cursor, validate_date_range, validate_limit,
 
 ResultT = TypeVar("ResultT", bound=BaseModel)
 _MAX_HISTORY_BARS = 366
-_PROVIDER_CONTRACT_REVISION = "marketdata-candles-v3"
+_PROVIDER_CONTRACT_REVISION = "marketdata-candles-v4"
 
 
 @dataclass(frozen=True, slots=True)
