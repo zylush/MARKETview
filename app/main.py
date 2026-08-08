@@ -36,6 +36,8 @@ from app.errors import (
     ProviderAuthenticationError,
     ProviderNotFoundError,
     ProviderRateLimitError,
+    ProviderRequestRejectedError,
+    ProviderTimeoutError,
     ProviderUnavailableError,
     ProviderValidationError,
     QuotaExceededError,
@@ -45,6 +47,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 CSRF_COOKIE = "marketdata_csrf"
 logger = logging.getLogger(__name__)
 _SAFE_SEMANTIC_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_SAFE_CACHE_OUTCOMES = frozenset({"hit", "miss", "stale", "bypassed-invalid"})
 
 
 class _UnavailableService:
@@ -69,7 +72,7 @@ def _error_code(status_code: int) -> str:
         401: "unauthorized",
         403: "forbidden",
         404: "not_found",
-        422: "validation_error",
+        422: "VALIDATION_ERROR",
         429: "rate_limit_exceeded",
         501: "not_implemented",
         503: "rate_limiter_unavailable",
@@ -97,6 +100,7 @@ def _safe_diagnostic(value: object, *, numeric: bool = False) -> int | str | Non
 
 
 def _log_market_data_failure(request: Request, exc: MarketDataError) -> None:
+    cache_outcome = getattr(exc, "cache_outcome", "miss")
     logger.warning(
         "market_data_request_failed",
         extra={
@@ -106,6 +110,11 @@ def _log_market_data_failure(request: Request, exc: MarketDataError) -> None:
                 getattr(exc, "upstream_status", None), numeric=True
             ),
             "semantic_code": _safe_diagnostic(getattr(exc, "semantic_code", None)),
+            "cache_outcome": (
+                cache_outcome
+                if isinstance(cache_outcome, str) and cache_outcome in _SAFE_CACHE_OUTCOMES
+                else "miss"
+            ),
         },
     )
 
@@ -269,7 +278,7 @@ def create_app(
     @application.exception_handler(RequestValidationError)
     async def validation_exception(request: Request, exc: RequestValidationError) -> JSONResponse:
         del exc
-        return _error_response(request, 422, "validation_error", "request validation failed")
+        return _error_response(request, 422, "VALIDATION_ERROR", "request validation failed")
 
     @application.exception_handler(MarketDataError)
     async def market_data_exception(request: Request, exc: MarketDataError) -> JSONResponse:
@@ -286,8 +295,13 @@ def create_app(
             code, message = "CACHE_UNAVAILABLE", "the cache service is unavailable"
         elif isinstance(exc, ProviderNotFoundError):
             code, message = "NOT_FOUND", "market data was not found"
+        elif isinstance(exc, ProviderRequestRejectedError):
+            code = "UPSTREAM_REQUEST_REJECTED"
+            message = "the market data provider rejected the request"
         elif isinstance(exc, (InputValidationError, ProviderValidationError)):
-            code, message = "INVALID_REQUEST", "the market data request is invalid"
+            code, message = "VALIDATION_ERROR", "the market data request is invalid"
+        elif isinstance(exc, ProviderTimeoutError):
+            code, message = "UPSTREAM_TIMEOUT", "the market data provider timed out"
         elif isinstance(exc, ProviderUnavailableError):
             code, message = "UPSTREAM_UNAVAILABLE", "the market data provider is unavailable"
         else:

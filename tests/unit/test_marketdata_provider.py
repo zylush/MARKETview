@@ -16,9 +16,9 @@ from app.errors import (
     ProviderError,
     ProviderNotFoundError,
     ProviderRateLimitError,
+    ProviderRequestRejectedError,
     ProviderTimeoutError,
     ProviderUnavailableError,
-    ProviderValidationError,
 )
 from app.providers.marketdata import MarketDataAppProvider
 
@@ -161,8 +161,9 @@ async def test_200_and_203_are_success(status: int) -> None:
         (204, None, ProviderNotFoundError),
         (200, {"s": "no_data"}, ProviderNotFoundError),
         (404, {"s": "error", "errmsg": "private symbol details"}, ProviderNotFoundError),
-        (400, {"s": "error", "errmsg": "private query"}, ProviderValidationError),
-        (413, {"s": "error"}, ProviderValidationError),
+        (400, {"s": "error", "errmsg": "private query"}, ProviderRequestRejectedError),
+        (413, {"s": "error"}, ProviderRequestRejectedError),
+        (422, {"s": "error", "errmsg": "private query"}, ProviderRequestRejectedError),
         (401, {"s": "error", "errmsg": "private auth"}, ProviderAuthenticationError),
         (402, {"s": "error", "errmsg": "private plan"}, ProviderAccessRestrictedError),
         (403, {"s": "error", "errmsg": "private IP"}, ProviderAccessRestrictedError),

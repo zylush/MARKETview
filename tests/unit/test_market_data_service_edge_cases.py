@@ -11,8 +11,8 @@ from app.cache.memory import MemoryCache
 from app.errors import (
     CacheUnavailableError,
     ProviderNotFoundError,
+    ProviderRequestRejectedError,
     ProviderUnavailableError,
-    ProviderValidationError,
     QuotaExceededError,
 )
 from app.models import EODBar, Page
@@ -70,17 +70,8 @@ async def test_service_delegates_normalized_history_parameters() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("public_end", "provider_end"),
-    [
-        (date(2026, 8, 7), date(2026, 8, 7)),
-        (date(2026, 8, 8), date(2026, 8, 7)),
-        (date(2026, 8, 9), date(2026, 8, 7)),
-    ],
-)
-async def test_history_normalizes_only_the_provider_end_to_a_weekday(
-    public_end: date, provider_end: date
-) -> None:
+@pytest.mark.parametrize("public_end", [date(2026, 8, 7), date(2026, 8, 8), date(2026, 8, 9)])
+async def test_history_preserves_weekday_and_weekend_provider_dates(public_end: date) -> None:
     provider = CompleteProvider()
     service = MarketDataService(provider, MemoryCache())
 
@@ -88,11 +79,11 @@ async def test_history_normalizes_only_the_provider_end_to_a_weekday(
 
     assert result.total == 1
     assert provider.calls[0][1]["start_date"] == date(2026, 8, 1)
-    assert provider.calls[0][1]["end_date"] == provider_end
+    assert provider.calls[0][1]["end_date"] == public_end
 
 
 @pytest.mark.asyncio
-async def test_equivalent_friday_and_weekend_ranges_share_one_cached_provider_fetch() -> None:
+async def test_distinct_friday_and_weekend_ranges_keep_distinct_cache_results() -> None:
     provider = CompleteProvider()
     cache = MemoryCache()
     service = MarketDataService(provider, cache)
@@ -102,38 +93,56 @@ async def test_equivalent_friday_and_weekend_ranges_share_one_cached_provider_fe
     sunday = await service.history("AAPL", date(2026, 8, 1), date(2026, 8, 9))
 
     assert friday == saturday == sunday
-    assert [name for name, _ in provider.calls] == ["history"]
-    assert await cache.current_count(service.quota_key) == 1
+    assert [name for name, _ in provider.calls] == ["history", "history", "history"]
+    assert await cache.current_count(service.quota_key) == 3
 
 
 @pytest.mark.asyncio
-async def test_weekend_end_uses_new_normalized_key_and_bypasses_old_negative_cache() -> None:
+async def test_contract_revision_bypasses_all_old_history_negative_cache_keys() -> None:
     provider = CompleteProvider()
     cache = MemoryCache()
-    old_weekend_key = CacheKeyBuilder().build(
-        "eod_history",
-        {
-            "symbol": "AAPL",
-            "start": date(2025, 8, 8),
-            "end": date(2026, 8, 8),
-        },
-    )
-    await cache.set(
-        old_weekend_key,
-        {"status": "invalid", "code": ProviderValidationError.code},
-        ttl_seconds=3600,
-    )
+    for old_end in (date(2026, 8, 7), date(2026, 8, 8)):
+        old_key = CacheKeyBuilder().build(
+            "eod_history",
+            {"symbol": "AAPL", "start": date(2025, 8, 8), "end": old_end},
+        )
+        await cache.set(
+            old_key,
+            {"status": "invalid", "code": "provider_validation_error"},
+            ttl_seconds=3600,
+        )
     service = MarketDataService(provider, cache)
+    await cache.reserve_quota(service.quota_key, limit=90, window_seconds=86400)
 
     result = await service.history("AAPL", date(2025, 8, 8), date(2026, 8, 8))
 
     assert result.total == 1
     assert [name for name, _ in provider.calls] == ["history"]
-    assert provider.calls[0][1]["end_date"] == date(2026, 8, 7)
+    assert provider.calls[0][1]["end_date"] == date(2026, 8, 8)
+    assert await cache.current_count(service.quota_key) == 2
 
 
 @pytest.mark.asyncio
-async def test_weekend_only_range_returns_empty_page_without_provider_or_quota_use() -> None:
+async def test_contract_revision_bypasses_old_latest_negative_cache_key() -> None:
+    provider = CompleteProvider()
+    cache = MemoryCache()
+    old_key = CacheKeyBuilder().build("latest_eod", {"symbol": "AAPL"})
+    await cache.set(
+        old_key,
+        {"status": "invalid", "code": "provider_validation_error"},
+        ttl_seconds=3600,
+    )
+    service = MarketDataService(provider, cache)
+
+    result = await service.latest_eod("AAPL")
+
+    assert result.symbol == "AAPL"
+    assert [name for name, _ in provider.calls] == ["latest"]
+    assert await cache.current_count(service.quota_key) == 1
+
+
+@pytest.mark.asyncio
+async def test_weekend_only_range_reaches_provider_without_local_semantic_rejection() -> None:
     provider = CompleteProvider()
     cache = MemoryCache()
     service = MarketDataService(provider, cache)
@@ -146,8 +155,24 @@ async def test_weekend_only_range_returns_empty_page_without_provider_or_quota_u
         cursor="9",
     )
 
-    assert result == Page[EODBar](items=(), total=0, next_cursor=None)
-    assert provider.calls == []
+    assert result.total == 1
+    assert provider.calls[0][1]["start_date"] == date(2026, 8, 8)
+    assert provider.calls[0][1]["end_date"] == date(2026, 8, 8)
+    assert await cache.current_count(service.quota_key) == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_request_rejection_is_not_cached_and_refunds_each_reservation() -> None:
+    provider = CompleteProvider()
+    provider.failure = ProviderRequestRejectedError("private upstream response")
+    cache = MemoryCache()
+    service = MarketDataService(provider, cache)
+
+    for _ in range(2):
+        with pytest.raises(ProviderRequestRejectedError):
+            await service.history("AAPL", date(2025, 8, 8), date(2026, 8, 8))
+
+    assert [name for name, _ in provider.calls] == ["history", "history"]
     assert await cache.current_count(service.quota_key) == 0
 
 

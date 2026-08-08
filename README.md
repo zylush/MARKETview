@@ -82,10 +82,12 @@ responses retain the envelope
 Latest and history use Market Data's `/stocks/candles/D/{symbol}/` endpoint. Requests explicitly
 set `adjustsplits=false`, so prices are unadjusted for splits. Latest uses `countback=1`
 without a `to` value, which asks Market Data for the most recent candle;
-history uses bounded `from` and `to` dates. A Saturday or Sunday history end is normalized to the
-preceding Friday for the provider request and cache key while the public calendar-date contract is
-preserved. HTTP `200` and `203` are accepted as success. A `204`
+history uses the client's bounded `from` and `to` dates unchanged, including weekends and holidays;
+Market Data determines whether candles exist. HTTP `200` and `203` are accepted as success. A `204`
 or a documented no-data result maps to not found. Automatic provider retries are disabled.
+Provider HTTP `400`, `413`, and `422` responses are treated as uncached upstream request failures,
+not client validation errors. Provider-result cache keys carry a candles-contract revision so old
+negative entries are bypassed without resetting the independent daily quota counter.
 
 ## Daily credits and cache
 

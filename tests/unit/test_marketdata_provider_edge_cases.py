@@ -12,6 +12,7 @@ from app.errors import (
     ProviderAuthenticationError,
     ProviderError,
     ProviderRateLimitError,
+    ProviderRequestRejectedError,
     ProviderUnavailableError,
 )
 from app.providers.marketdata import MarketDataAppProvider
@@ -201,14 +202,20 @@ async def test_late_httpx_and_httpcore_child_loggers_cannot_bypass_scrubbing(
 
 
 @pytest.mark.asyncio
-async def test_private_history_inputs_are_absent_from_provider_exception_graph() -> None:
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [(401, ProviderAuthenticationError), (400, ProviderRequestRejectedError)],
+)
+async def test_private_history_inputs_are_absent_from_provider_exception_graph(
+    status: int, expected: type[ProviderError]
+) -> None:
     private_symbol = "PRIVATE-SYMBOL-987654321"
     private_cursor = "87654321"
     private_start = "2001-02-03"
     private_end = "2001-02-04"
     provider, client = provider_for(
         lambda request: httpx.Response(
-            401,
+            status,
             json={
                 "s": "error",
                 "errmsg": "private-body-sentinel",
@@ -217,7 +224,7 @@ async def test_private_history_inputs_are_absent_from_provider_exception_graph()
         )
     )
     try:
-        with pytest.raises(ProviderAuthenticationError) as captured:
+        with pytest.raises(expected) as captured:
             await provider.eod_history(
                 private_symbol,
                 start_date=private_start,
@@ -277,6 +284,9 @@ async def test_bool_and_non_finite_numeric_values_are_rejected(payload: dict[str
 @pytest.mark.parametrize(
     ("status", "response_kwargs", "expected"),
     [
+        (400, {"content": b"private request body"}, ProviderRequestRejectedError),
+        (413, {"json": {"errmsg": "private request body"}}, ProviderRequestRejectedError),
+        (422, {"content": b"private request body"}, ProviderRequestRejectedError),
         (401, {"content": b"<html>private auth body</html>"}, ProviderAuthenticationError),
         (429, {"json": ["private rate body"]}, ProviderRateLimitError),
         (500, {"content": b"private server body"}, ProviderUnavailableError),

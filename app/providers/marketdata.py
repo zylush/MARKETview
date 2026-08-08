@@ -19,6 +19,7 @@ from app.errors import (
     ProviderError,
     ProviderNotFoundError,
     ProviderRateLimitError,
+    ProviderRequestRejectedError,
     ProviderTimeoutError,
     ProviderUnavailableError,
     ProviderValidationError,
@@ -389,8 +390,8 @@ class MarketDataAppProvider:
         if status in {204, 404}:
             error: ProviderError = ProviderNotFoundError("market data was not found")
             semantic_code = "no_data"
-        elif status in {400, 413}:
-            error = ProviderValidationError("market data provider rejected the request")
+        elif status in {400, 413, 422}:
+            error = ProviderRequestRejectedError("market data provider rejected the request")
             semantic_code = "request_rejected"
         elif status == 401:
             error = ProviderAuthenticationError("market data provider rejected its credentials")
@@ -449,6 +450,8 @@ class MarketDataAppProvider:
             detached = ProviderRateLimitError("market data provider request limit was reached")
         elif isinstance(error, ProviderNotFoundError):
             detached = ProviderNotFoundError("market data was not found")
+        elif isinstance(error, ProviderRequestRejectedError):
+            detached = ProviderRequestRejectedError("market data provider rejected the request")
         elif isinstance(error, ProviderValidationError):
             detached = ProviderValidationError("market data provider rejected the request")
         elif isinstance(error, ProviderTimeoutError):

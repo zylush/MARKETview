@@ -17,6 +17,7 @@ from app.errors import (
     CacheUnavailableError,
     ProviderAccessRestrictedError,
     ProviderAuthenticationError,
+    ProviderNotFoundError,
     ProviderTimeoutError,
     ProviderUnavailableError,
     QuotaExceededError,
@@ -311,7 +312,7 @@ async def test_latest_route_maps_the_real_market_data_candles_boundary(settings)
 
 
 @pytest.mark.asyncio
-async def test_history_weekend_end_is_normalized_only_at_the_provider_boundary(settings) -> None:
+async def test_exact_reported_history_range_reaches_documented_provider_boundary(settings) -> None:
     upstream_requests: list[httpx.Request] = []
     candle_time = int(datetime(2026, 8, 7, tzinfo=UTC).timestamp())
 
@@ -358,10 +359,72 @@ async def test_history_weekend_end_is_normalized_only_at_the_provider_boundary(s
     assert len(upstream_requests) == 1
     assert dict(upstream_requests[0].url.params) == {
         "from": "2025-08-08",
-        "to": "2026-08-07",
+        "to": "2026-08-08",
         "adjustsplits": "false",
     }
+    assert not {"limit", "cursor", "offset", "token", "access_key", "api_key"} & set(
+        upstream_requests[0].url.params
+    )
+    assert upstream_requests[0].headers.get_list("Authorization") == ["Bearer provider-only-secret"]
+    assert "x-app-key" not in upstream_requests[0].headers
     assert await shared_cache.current_count(service.quota_key) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upstream_status", [400, 413, 422])
+async def test_upstream_request_rejection_is_502_not_cached_and_refunds_quota(
+    settings,
+    upstream_status: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    upstream_calls = 0
+
+    async def upstream(_request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return httpx.Response(
+            upstream_status,
+            json={"s": "error", "errmsg": "private-provider-body"},
+        )
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    provider = MarketDataAppProvider("provider-only-secret", client=upstream_client)
+    shared_cache = MemoryCache()
+    service = MarketDataService(provider, shared_cache)
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=shared_cache),
+        raise_app_exceptions=False,
+    )
+    caplog.set_level(logging.WARNING, logger="app.main")
+    try:
+        async with httpx.AsyncClient(
+            transport=transport, base_url=settings.allowed_origin
+        ) as local:
+            responses = [
+                await local.get(
+                    "/api/v1/eod/history/AAPL?date_from=2025-08-08&date_to=2026-08-08&limit=1000",
+                    headers={"X-App-Key": "correct horse battery staple"},
+                )
+                for _ in range(2)
+            ]
+    finally:
+        await upstream_client.aclose()
+
+    assert [response.status_code for response in responses] == [502, 502]
+    assert [response.json()["error"]["code"] for response in responses] == [
+        "UPSTREAM_REQUEST_REJECTED",
+        "UPSTREAM_REQUEST_REJECTED",
+    ]
+    assert all("private-provider-body" not in response.text for response in responses)
+    assert upstream_calls == 2
+    assert await shared_cache.current_count(service.quota_key) == 0
+    records = [
+        record for record in caplog.records if record.message == "market_data_request_failed"
+    ]
+    assert len(records) == 2
+    assert all(record.upstream_status == upstream_status for record in records)
+    assert all(record.semantic_code == "request_rejected" for record in records)
+    assert all(record.cache_outcome == "miss" for record in records)
 
 
 @pytest.mark.asyncio
@@ -451,6 +514,7 @@ async def test_invalid_symbols_return_422_without_service_calls(
     response = await client.get(f"/api/v1/eod/latest/{symbol}", headers=api_headers)
 
     assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
     assert service.calls == []
 
 
@@ -460,6 +524,7 @@ async def test_invalid_symbols_return_422_without_service_calls(
     [
         "date_from=2026-01-01",
         "date_to=2026-01-02",
+        "date_from=not-a-date&date_to=2026-01-02",
         "date_from=2026-01-02&date_to=2026-01-01",
         "date_from=2025-01-01&date_to=2026-01-02",
     ],
@@ -476,6 +541,7 @@ async def test_invalid_history_ranges_return_422_without_service_calls(
     )
 
     assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
     assert service.calls == []
 
 
@@ -756,8 +822,9 @@ async def test_login_session_authorizes_supported_api_and_logout(client: httpx.A
     [
         (CacheUnavailableError("redis token leaked"), 503, "CACHE_UNAVAILABLE"),
         (QuotaExceededError("provider token leaked"), 429, "UPSTREAM_QUOTA_EXHAUSTED"),
+        (ProviderNotFoundError("provider body leaked"), 404, "NOT_FOUND"),
         (ProviderUnavailableError("provider private host leaked"), 502, "UPSTREAM_UNAVAILABLE"),
-        (ProviderTimeoutError("provider timeout detail leaked"), 504, "UPSTREAM_UNAVAILABLE"),
+        (ProviderTimeoutError("provider timeout detail leaked"), 504, "UPSTREAM_TIMEOUT"),
     ],
 )
 async def test_domain_failures_are_sanitized(

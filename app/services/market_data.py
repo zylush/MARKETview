@@ -17,7 +17,6 @@ from app.errors import (
     CacheUnavailableError,
     MarketDataError,
     ProviderNotFoundError,
-    ProviderValidationError,
     QuotaExceededError,
 )
 from app.models import EODBar, Page, Usage
@@ -26,6 +25,7 @@ from app.validation import validate_cursor, validate_date_range, validate_limit,
 
 ResultT = TypeVar("ResultT", bound=BaseModel)
 _MAX_HISTORY_BARS = 366
+_PROVIDER_CONTRACT_REVISION = "marketdata-candles-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,11 +99,6 @@ class MarketDataService:
         snapshot = current or self._utc_now()
         return max(1, int((self._next_reset(snapshot) - snapshot).total_seconds()))
 
-    @staticmethod
-    def _provider_history_end(public_end: date) -> date:
-        weekend_days = max(0, public_end.weekday() - 4)
-        return public_end - timedelta(days=weekend_days)
-
     async def aclose(self) -> None:
         """Close provider/cache resources while respecting their own ownership semantics."""
         for resource in (self._provider, self._cache):
@@ -120,7 +115,10 @@ class MarketDataService:
 
     async def latest_eod(self, symbol: str) -> EODBar:
         checked_symbol = validate_symbol(symbol)
-        key = self._keys.build("latest_eod", {"symbol": checked_symbol})
+        key = self._keys.build(
+            "latest_eod",
+            {"symbol": checked_symbol, "provider_contract": _PROVIDER_CONTRACT_REVISION},
+        )
         return await self._cached(
             key,
             self._ttls.latest,
@@ -142,21 +140,13 @@ class MarketDataService:
         checked_start, checked_end = validate_date_range(start_date, end_date)
         checked_limit = validate_limit(limit)
         checked_cursor = validate_cursor(offset if offset is not None else cursor)
-        provider_end = self._provider_history_end(checked_end)
-        if provider_end < checked_start:
-            now = self._utc_now()
-            self._metadata.set(
-                ServiceMetadata(source="local", as_of=now, cached=False, stale=False)
-            )
-            return self._paginate_history(
-                Page[EODBar](), limit=checked_limit, cursor=checked_cursor
-            )
         key = self._keys.build(
             "eod_history",
             {
                 "symbol": checked_symbol,
                 "start": checked_start,
-                "end": provider_end,
+                "end": checked_end,
+                "provider_contract": _PROVIDER_CONTRACT_REVISION,
             },
         )
         ttl = (
@@ -171,7 +161,7 @@ class MarketDataService:
             lambda: self._provider.eod_history(
                 checked_symbol,
                 start_date=checked_start,
-                end_date=provider_end,
+                end_date=checked_end,
                 limit=_MAX_HISTORY_BARS,
                 cursor=None,
             ),
@@ -376,7 +366,7 @@ class MarketDataService:
         stale: CacheEntry[Any] | None,
         error: MarketDataError,
     ) -> ResultT:
-        if isinstance(error, (ProviderNotFoundError, ProviderValidationError)):
+        if isinstance(error, ProviderNotFoundError):
             cache_failed = False
             try:
                 await self._cache.set(
@@ -396,6 +386,7 @@ class MarketDataService:
                 raise CacheUnavailableError("cache service is unavailable")
         if stale is not None:
             return self._decode(stale, model, source="stale")
+        error.cache_outcome = "miss"
         raise error
 
     async def _read(self, key: str) -> CacheEntry[Any] | None:
@@ -416,8 +407,12 @@ class MarketDataService:
             raise CacheUnavailableError("cache contained an invalid entry")
         if envelope.get("status") == "invalid":
             if envelope.get("code") == ProviderNotFoundError.code:
-                raise ProviderNotFoundError("market data was not found")
-            raise ProviderValidationError("market data request is invalid")
+                not_found_error = ProviderNotFoundError("market data was not found")
+                not_found_error.cache_outcome = "hit"
+                raise not_found_error
+            cache_error = CacheUnavailableError("cache contained an invalid entry")
+            cache_error.cache_outcome = "hit"
+            raise cache_error
         try:
             result = model.model_validate(envelope["payload"])
         except (KeyError, ValueError, TypeError):

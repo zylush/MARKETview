@@ -4,6 +4,7 @@ from __future__ import annotations
 class MarketDataError(Exception):
     code = "market_data_error"
     status_code = 500
+    cache_outcome = "miss"
 
 
 class InputValidationError(MarketDataError, ValueError):
@@ -41,6 +42,13 @@ class ProviderNotFoundError(ProviderError):
 class ProviderValidationError(ProviderError):
     code = "provider_validation_error"
     status_code = 422
+
+
+class ProviderRequestRejectedError(ProviderError):
+    """The upstream provider rejected an otherwise valid application request."""
+
+    code = "provider_request_rejected"
+    status_code = 502
 
 
 class ProviderUnavailableError(ProviderError):
