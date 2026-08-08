@@ -17,7 +17,7 @@ class CacheEntry[ValueT]:
 
 
 class CacheKeyBuilder:
-    def __init__(self, *, schema_version: str = "v1", prefix: str = "marketdata") -> None:
+    def __init__(self, *, schema_version: str = "v2", prefix: str = "marketdata") -> None:
         self._schema_version = schema_version
         self._prefix = prefix
 
@@ -38,6 +38,7 @@ class Cache(Protocol):
     async def reserve_quota(
         self, key: str, *, limit: int = 90, window_seconds: int = 86400
     ) -> int | None: ...
+    async def release_quota(self, key: str) -> int: ...
     async def current_count(self, key: str) -> int: ...
     async def increment_rate(self, key: str, *, window_seconds: int) -> int: ...
     async def acquire_lock(self, key: str, token: str, *, ttl_seconds: int) -> bool: ...

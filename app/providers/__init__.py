@@ -1,4 +1,4 @@
 from app.providers.base import MarketDataProvider
-from app.providers.marketstack import MarketstackProvider
+from app.providers.marketdata import MarketDataAppProvider
 
-__all__ = ["MarketDataProvider", "MarketstackProvider"]
+__all__ = ["MarketDataAppProvider", "MarketDataProvider"]

@@ -14,7 +14,7 @@ from app.main import create_app
 @dataclass(frozen=True)
 class TestSettings:
     session_secret: str = "test-session-secret-that-is-long-enough"
-    session_cookie_name: str = "marketstack_session"
+    session_cookie_name: str = "marketdata_session"
     session_max_age_seconds: int = 3600
     cookie_secure: bool = False
     environment: str = "test"
@@ -42,33 +42,22 @@ class FakeService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
-    async def tickers(self, **params: Any) -> dict[str, Any]:
-        self.calls = [*self.calls, ("tickers", params)]
-        return {"items": [{"symbol": "AAPL"}], "next_cursor": "10", "total": 20}
-
-    async def exchanges(self, **params: Any) -> dict[str, Any]:
-        self.calls = [*self.calls, ("exchanges", params)]
-        return {"items": [{"mic": "XNAS"}], "pagination": {"count": 1}}
-
     async def latest_eod(self, symbol: str) -> dict[str, Any]:
         self.calls = [*self.calls, ("latest_eod", {"symbol": symbol})]
         return {"symbol": symbol, "close": 201.0}
 
     async def eod_history(self, symbol: str, **params: Any) -> dict[str, Any]:
         self.calls = [*self.calls, ("eod_history", {"symbol": symbol, **params})]
-        return {"items": [], "pagination": {"count": 0}}
+        return {"items": [], "next_cursor": None, "total": 0}
 
-    async def splits(self, **params: Any) -> dict[str, Any]:
-        self.calls = [*self.calls, ("splits", params)]
-        return {"items": [], "pagination": {"count": 0}}
-
-    async def dividends(self, **params: Any) -> dict[str, Any]:
-        self.calls = [*self.calls, ("dividends", params)]
-        return {"items": [], "pagination": {"count": 0}}
-
-    async def usage(self) -> dict[str, int]:
+    async def usage(self) -> dict[str, int | str]:
         self.calls = [*self.calls, ("usage", {})]
-        return {"requests": 7}
+        return {
+            "requests_used": 7,
+            "requests_limit": 90,
+            "requests_remaining": 83,
+            "reset_at": "2026-08-09T00:00:00Z",
+        }
 
     async def health(self) -> dict[str, bool]:
         raise AssertionError("public health must not call the upstream service")

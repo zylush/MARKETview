@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import socket
 import threading
 import time
@@ -70,51 +69,6 @@ class FakeMarketService:
             "stale": False,
         }
 
-    @staticmethod
-    def _tickers() -> tuple[dict[str, str], ...]:
-        return (
-            {
-                "symbol": "AAPL",
-                "name": "Apple Inc.",
-                "exchange": "NASDAQ",
-                "mic": "XNAS",
-                "country": "United States",
-                "currency": "USD",
-            },
-            {
-                "symbol": "MSFT",
-                "name": "Microsoft Corporation",
-                "exchange": "NASDAQ",
-                "mic": "XNAS",
-                "country": "United States",
-                "currency": "USD",
-            },
-        )
-
-    async def tickers(self, **params: Any) -> dict[str, Any]:
-        search = str(params.get("search", "")).casefold()
-        items = [
-            dict(ticker)
-            for ticker in self._tickers()
-            if not search
-            or search in ticker["symbol"].casefold()
-            or search in ticker["name"].casefold()
-        ]
-        return {"items": items, "next_cursor": None, "total": len(items)}
-
-    async def exchanges(self, **params: Any) -> dict[str, Any]:
-        del params
-        items = [
-            {
-                "name": "Nasdaq Stock Market",
-                "acronym": "NASDAQ",
-                "mic": "XNAS",
-                "country": "United States",
-                "currency": "USD",
-            }
-        ]
-        return {"items": items, "next_cursor": None, "total": len(items)}
-
     async def latest_eod(self, symbol: str) -> dict[str, Any]:
         close = 423.46 if symbol == "MSFT" else 229.35
         return {
@@ -150,39 +104,13 @@ class FakeMarketService:
         ]
         return {"items": items, "next_cursor": None, "total": len(items)}
 
-    async def splits(self, **params: Any) -> dict[str, Any]:
-        item = {
-            "symbol": params["symbol"],
-            "date": "2022-06-06",
-            "split_factor": "2:1",
-        }
-        return {"items": [item], "next_cursor": None, "total": 1}
-
-    async def dividends(self, **params: Any) -> dict[str, Any]:
-        item = {
-            "symbol": params["symbol"],
-            "date": "2026-06-12",
-            "dividend": 0.83,
-            "currency": "USD",
-        }
-        return {"items": [item], "next_cursor": None, "total": 1}
-
     async def usage(self) -> dict[str, Any]:
         return {
-            "used": 17,
-            "limit": 100,
-            "remaining": 83,
-            "reset_at": "2026-09-01T00:00:00Z",
+            "requests_used": 17,
+            "requests_limit": 90,
+            "requests_remaining": 73,
+            "reset_at": "2026-08-09T00:00:00Z",
         }
-
-
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    if os.getenv("RUN_E2E") == "1":
-        return
-    skip = pytest.mark.skip(reason="set RUN_E2E=1 to execute loopback browser tests")
-    for item in items:
-        if item.get_closest_marker("e2e"):
-            item.add_marker(skip)
 
 
 def _wait_until_ready(base_url: str, thread: threading.Thread) -> None:
@@ -209,7 +137,7 @@ def e2e_server() -> Iterator[RunningServer]:
     base_url = f"http://127.0.0.1:{port}"
     settings = E2ESettings(
         session_secret="e2e-session-secret-at-least-sixteen-chars",
-        session_cookie_name="marketstack_e2e_session",
+        session_cookie_name="marketdata_e2e_session",
         session_max_age_seconds=600,
         cookie_secure=False,
         environment="test",
@@ -230,7 +158,7 @@ def e2e_server() -> Iterator[RunningServer]:
     thread = threading.Thread(
         target=server.run,
         kwargs={"sockets": [listener]},
-        name="marketstack-e2e-server",
+        name="marketdata-e2e-server",
         daemon=True,
     )
     thread.start()

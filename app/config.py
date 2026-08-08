@@ -16,15 +16,45 @@ from pydantic import (
 from pydantic_core import InitErrorDetails
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-_INVALID_MARKETSTACK_KEY = "__invalid_marketstack_key__"
+_INVALID_MARKETDATA_TOKEN = "__invalid_marketdata_token__"  # noqa: S105
+_PRODUCTION_MARKETDATA_BASE_URL = "https://api.marketdata.app/v1"
+_TOKEN_PLACEHOLDERS = frozenset(
+    {
+        "<your-marketdata-token>",
+        "your-marketdata-token",
+        "your-api-key",
+        "example",
+        "change-me",
+        "changeme",
+        "replace-me",
+        "replace-with-your-key",
+    }
+)
 
 
-class _MarketstackCredentialConflictError(RuntimeError):
-    pass
+def _normalized_token_secret(value: object) -> SecretStr:
+    if not isinstance(value, (str, SecretStr)):
+        return SecretStr(_INVALID_MARKETDATA_TOKEN)
+    raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+    contains_control = any(ord(character) < 32 or ord(character) == 127 for character in raw)
+    normalized = raw.strip()
+    is_quoted = (
+        len(normalized) >= 2 and normalized[0] in {"'", '"'} and normalized[-1] == normalized[0]
+    )
+    placeholder = normalized.lower()
+    if (
+        not normalized
+        or contains_control
+        or is_quoted
+        or placeholder in _TOKEN_PLACEHOLDERS
+        or (placeholder.startswith("<") and placeholder.endswith(">"))
+    ):
+        return SecretStr(_INVALID_MARKETDATA_TOKEN)
+    return SecretStr(normalized)
 
 
 class Settings(BaseSettings):
-    """Environment-backed application settings; secrets are never represented as plain text."""
+    """Environment-backed application settings with secret-safe validation."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -38,34 +68,31 @@ class Settings(BaseSettings):
     environment: str = "development"
     vercel: str | None = Field(default=None, validation_alias="VERCEL")
     vercel_env: str | None = Field(default=None, validation_alias="VERCEL_ENV")
-    marketstack_api_key: SecretStr = Field(
+    marketdata_token: SecretStr = Field(
         default=SecretStr(""),
-        validation_alias="MARKETSTACK_API_KEY",
+        validation_alias="MARKETDATA_TOKEN",
     )
-    legacy_marketstack_access_key: SecretStr | None = Field(
-        default=None,
-        validation_alias="MARKETSTACK_ACCESS_KEY",
-        exclude=True,
-        repr=False,
+    marketdata_base_url: str = Field(
+        default=_PRODUCTION_MARKETDATA_BASE_URL,
+        validation_alias="MARKETDATA_BASE_URL",
     )
-    marketstack_base_url: str = "https://api.marketstack.com/v2"
-    marketstack_timeout_seconds: float = Field(
+    http_timeout_seconds: float = Field(
         default=10.0,
         gt=0,
         le=60,
-        validation_alias=AliasChoices("HTTP_TIMEOUT_SECONDS", "MARKETSTACK_TIMEOUT_SECONDS"),
+        validation_alias="HTTP_TIMEOUT_SECONDS",
     )
-    upstash_redis_rest_url: str | None = None
-    upstash_redis_rest_token: SecretStr | None = None
-    provider_monthly_budget: int = Field(
+    marketdata_daily_credit_budget: int = Field(
         default=90,
         gt=0,
-        validation_alias=AliasChoices("MARKETSTACK_MONTHLY_BUDGET", "PROVIDER_MONTHLY_BUDGET"),
+        validation_alias="MARKETDATA_DAILY_CREDIT_BUDGET",
     )
-    cache_schema_version: str = "v1"
+    cache_schema_version: str = "v2"
 
+    upstash_redis_rest_url: str | None = None
+    upstash_redis_rest_token: SecretStr | None = None
     session_secret: SecretStr = Field(default_factory=lambda: SecretStr(secrets.token_urlsafe(32)))
-    session_cookie_name: str = "marketstack_session"
+    session_cookie_name: str = "marketdata_session"
     session_max_age_seconds: int = Field(default=3600, gt=0)
     cookie_secure: bool = Field(
         default=False,
@@ -84,7 +111,6 @@ class Settings(BaseSettings):
 
     def __init__(self, **values: Any) -> None:
         sanitized_error: ValidationError | None = None
-        sanitized_conflict: RuntimeError | None = None
         try:
             super().__init__(**values)
         except ValidationError as error:
@@ -97,110 +123,69 @@ class Settings(BaseSettings):
                 hide_input=True,
             )
             values = {}
-        except _MarketstackCredentialConflictError:
-            sanitized_conflict = RuntimeError("conflicting Marketstack credential variables")
-            values = {}
         if sanitized_error is not None:
             raise sanitized_error from None
-        if sanitized_conflict is not None:
-            raise sanitized_conflict from None
 
     @model_validator(mode="before")
     @classmethod
-    def derive_deployment_posture(cls, values: Any) -> Any:
+    def protect_secret_inputs_and_derive_posture(cls, values: Any) -> Any:
         if not isinstance(values, dict):
             return values
-        vercel = values.get("vercel", values.get("VERCEL"))
-        vercel_env = values.get("vercel_env", values.get("VERCEL_ENV"))
-        marker = str(vercel or "").strip().lower()
-        deployed = marker not in {"", "0", "false", "no", "off"} or bool(
-            str(vercel_env or "").strip()
-        )
-        return {**values, "environment": "production"} if deployed else values
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_marketstack_credentials(cls, values: Any) -> Any:
-        if not isinstance(values, dict):
-            return values
-        canonical_keys = ("marketstack_api_key", "MARKETSTACK_API_KEY")
-        legacy_keys = (
-            "marketstack_access_key",
-            "legacy_marketstack_access_key",
-            "MARKETSTACK_ACCESS_KEY",
-        )
-        canonical = cls._first_present(values, canonical_keys)
-        legacy = cls._first_present(values, legacy_keys)
-        normalized_canonical = cls._normalize_marketstack_key(canonical)
-        normalized_legacy = cls._normalize_marketstack_key(legacy)
-        if (
-            normalized_canonical is not None
-            and normalized_legacy is not None
-            and normalized_canonical != normalized_legacy
-        ):
-            values = {}
-            canonical = None
-            legacy = None
-            normalized_canonical = None
-            normalized_legacy = None
-            raise _MarketstackCredentialConflictError
-        selected = normalized_canonical if normalized_canonical is not None else normalized_legacy
-        normalized_values = {
-            key: value
-            for key, value in values.items()
-            if key not in {*canonical_keys, *legacy_keys}
-        }
-        secret_input_keys = {
+        token_keys = {"marketdata_token", "MARKETDATA_TOKEN"}
+        other_secret_keys = {
             "session_secret",
             "SESSION_SECRET",
             "upstash_redis_rest_token",
             "UPSTASH_REDIS_REST_TOKEN",
         }
-        protected_values = {
-            key: SecretStr(value) if key in secret_input_keys and isinstance(value, str) else value
-            for key, value in normalized_values.items()
+        protected = {
+            key: _normalized_token_secret(value)
+            if key in token_keys
+            else SecretStr(value)
+            if key in other_secret_keys and isinstance(value, str)
+            else value
+            for key, value in values.items()
         }
-        if selected is not None:
-            return {**protected_values, "MARKETSTACK_API_KEY": selected}
-        return protected_values
-
-    @staticmethod
-    def _first_present(values: dict[str, Any], keys: tuple[str, ...]) -> Any:
-        return next((values[key] for key in keys if key in values), None)
-
-    @staticmethod
-    def _normalize_marketstack_key(value: Any) -> SecretStr | None:
-        if value is None:
-            return None
-        raw_value = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
-        if any(ord(character) < 32 or ord(character) == 127 for character in raw_value):
-            return SecretStr(_INVALID_MARKETSTACK_KEY)
-        normalized = raw_value.strip()
-        placeholder_values = {
-            "<your-marketstack-api-key>",
-            "your-marketstack-api-key",
-            "your-api-key",
-            "example",
-            "change-me",
-            "changeme",
-            "replace-me",
-            "replace-with-your-key",
-        }
-        is_quoted = (
-            len(normalized) >= 2 and normalized[0] in {"'", '"'} and normalized[-1] == normalized[0]
+        vercel = protected.get("vercel", protected.get("VERCEL"))
+        vercel_env = protected.get("vercel_env", protected.get("VERCEL_ENV"))
+        marker = str(vercel or "").strip().lower()
+        deployed = marker not in {"", "0", "false", "no", "off"} or bool(
+            str(vercel_env or "").strip()
         )
-        if not normalized or is_quoted or normalized.lower() in placeholder_values:
-            return SecretStr(_INVALID_MARKETSTACK_KEY)
-        return SecretStr(normalized)
+        return {**protected, "environment": "production"} if deployed else protected
 
-    @field_validator("marketstack_api_key")
+    @field_validator("marketdata_token")
     @classmethod
-    def reject_invalid_marketstack_key(cls, value: SecretStr) -> SecretStr:
-        if value.get_secret_value() == _INVALID_MARKETSTACK_KEY:
-            raise ValueError("MARKETSTACK_API_KEY is invalid")
+    def reject_invalid_marketdata_token(cls, value: SecretStr) -> SecretStr:
+        if value.get_secret_value() == _INVALID_MARKETDATA_TOKEN:
+            raise ValueError("MARKETDATA_TOKEN is invalid")
         return value
 
-    @field_validator("marketstack_base_url", "upstash_redis_rest_url", mode="before")
+    @field_validator("marketdata_base_url", mode="before")
+    @classmethod
+    def normalize_marketdata_base_url(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        normalized = value[:-1] if value.endswith("/") else value
+        try:
+            parsed = urlsplit(normalized)
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError("MARKETDATA_BASE_URL must target a v1 API root") from error
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path != "/v1"
+            or parsed.query
+            or parsed.fragment
+            or (port is not None and not 1 <= port <= 65535)
+        ):
+            raise ValueError("MARKETDATA_BASE_URL must target a v1 API root")
+        return normalized
+
+    @field_validator("upstash_redis_rest_url", mode="before")
     @classmethod
     def strip_trailing_slash(cls, value: object) -> object:
         return value.rstrip("/") if isinstance(value, str) else value
@@ -213,7 +198,7 @@ class Settings(BaseSettings):
         return value
 
     @model_validator(mode="after")
-    def validate_production_security(self) -> Settings:
+    def validate_security_posture(self) -> Settings:
         allowed_environments = {
             "local",
             "development",
@@ -225,11 +210,14 @@ class Settings(BaseSettings):
         }
         if self.environment.lower() not in allowed_environments:
             raise ValueError("ENVIRONMENT must be an explicit supported value")
-        if self.environment.lower() not in {"production", "prod"}:
+        if not self.is_deployed:
             return self
+
         missing: list[str] = []
-        if not self.marketstack_api_key.get_secret_value():
-            missing.append("MARKETSTACK_API_KEY")
+        if not self.marketdata_token.get_secret_value():
+            missing.append("MARKETDATA_TOKEN")
+        if self.marketdata_base_url != _PRODUCTION_MARKETDATA_BASE_URL:
+            missing.append("MARKETDATA_BASE_URL")
         if (
             "session_secret" not in self.model_fields_set
             or len(self.session_secret.get_secret_value()) < 32
@@ -252,8 +240,6 @@ class Settings(BaseSettings):
             missing.append("ALLOWED_HOSTS")
         if not self.cookie_secure:
             missing.append("SESSION_COOKIE_SECURE=true")
-        if self.marketstack_base_url != "https://api.marketstack.com/v2":
-            missing.append("MARKETSTACK_BASE_URL")
         if not self._valid_https_url(
             self.upstash_redis_rest_url, host_suffix=".upstash.io", root_only=True
         ):
@@ -272,7 +258,6 @@ class Settings(BaseSettings):
     def _valid_https_url(
         value: str | None,
         *,
-        exact_host: str | None = None,
         host_suffix: str | None = None,
         root_only: bool,
     ) -> bool:
@@ -294,10 +279,7 @@ class Settings(BaseSettings):
             or port not in (None, 443)
         ):
             return False
-        normalized_host = host.lower()
-        if exact_host is not None and normalized_host != exact_host:
-            return False
-        if host_suffix is not None and not normalized_host.endswith(host_suffix):
+        if host_suffix is not None and not host.lower().endswith(host_suffix):
             return False
         return not root_only or parsed.path in {"", "/"}
 
@@ -316,14 +298,6 @@ class Settings(BaseSettings):
             and all(character.isalnum() or character == "-" for character in label)
             for label in labels
         )
-
-    @property
-    def marketstack_monthly_budget(self) -> int:
-        return self.provider_monthly_budget
-
-    @property
-    def http_timeout_seconds(self) -> float:
-        return self.marketstack_timeout_seconds
 
     @property
     def session_cookie_secure(self) -> bool:

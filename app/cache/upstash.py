@@ -19,6 +19,12 @@ _QUOTA_SCRIPT = (
     "local limit=tonumber(ARGV[1]); if n>=limit then return -1 end; "
     "n=redis.call('incr',KEYS[1]); if n==1 then redis.call('expire',KEYS[1],ARGV[2]); end; return n"
 )
+_QUOTA_ROLLBACK_SCRIPT = (
+    "local n=tonumber(redis.call('get',KEYS[1]) or '0'); "
+    "if n<=0 then redis.call('del',KEYS[1]); return 0 end; "
+    "n=redis.call('decr',KEYS[1]); "
+    "if n<=0 then redis.call('del',KEYS[1]); return 0 end; return n"
+)
 _RELEASE_SCRIPT = (
     "if redis.call('get',KEYS[1]) == ARGV[1] "
     "then return redis.call('del',KEYS[1]) else return 0 end"
@@ -48,12 +54,15 @@ class UpstashCache:
             await self._client.aclose()
 
     async def _command(self, command: list[Any]) -> Any:
+        failed = False
         try:
             response = await self._client.post(self._url, headers=self._headers, json=command)
             response.raise_for_status()
             body = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise CacheUnavailableError("cache service is unavailable") from exc
+        except (httpx.HTTPError, ValueError):
+            failed = True
+        if failed:
+            raise CacheUnavailableError("cache service is unavailable")
         if not isinstance(body, dict) or body.get("error") is not None:
             raise CacheUnavailableError("cache service rejected the command")
         return body.get("result")
@@ -70,8 +79,9 @@ class UpstashCache:
             return CacheEntry(
                 value=envelope["value"], is_fresh=float(envelope["fresh_until"]) > now
             )
-        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
-            raise CacheUnavailableError("cache contained an invalid entry") from exc
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            pass
+        raise CacheUnavailableError("cache contained an invalid entry")
 
     async def set(self, key: str, value: Any, *, ttl_seconds: int, stale_seconds: int = 0) -> None:
         now = self._clock()
@@ -91,6 +101,9 @@ class UpstashCache:
     ) -> int | None:
         count = int(await self._command(["EVAL", _QUOTA_SCRIPT, 1, key, limit, window_seconds]))
         return count if count >= 0 else None
+
+    async def release_quota(self, key: str) -> int:
+        return int(await self._command(["EVAL", _QUOTA_ROLLBACK_SCRIPT, 1, key]))
 
     async def current_count(self, key: str) -> int:
         value = await self._command(["GET", key])

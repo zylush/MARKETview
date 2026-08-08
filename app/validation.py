@@ -5,7 +5,7 @@ from datetime import date
 
 from app.errors import InputValidationError
 
-_SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9.\-_:]{0,31}$")
+_SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,31}$")
 _CURSOR = re.compile(r"^\d{1,12}$")
 
 

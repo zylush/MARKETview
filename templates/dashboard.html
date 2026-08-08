@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light">
     <meta name="csrf-token" content="{{ csrf_token | default('', true) }}">
-    <title>Market Dashboard</title>
+    <title>Market Data Dashboard</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
     <script
       src="https://cdn.jsdelivr.net/npm/chart.js@4.4.8/dist/chart.umd.min.js"
@@ -19,9 +19,9 @@
     <a class="skip-link" href="#dashboard-main">Skip to market data</a>
     <header class="app-header">
       <div class="header-inner">
-        <a class="brand" href="/dashboard" aria-label="Marketstack dashboard home">
+        <a class="brand" href="/dashboard" aria-label="Market Data dashboard home">
           <span class="brand-mark" aria-hidden="true">M</span>
-          <span>Marketstack</span>
+          <span>Market Data</span>
         </a>
         <div class="header-context" aria-live="polite">
           <span class="context-label">Viewing</span>
@@ -42,34 +42,34 @@
       <section class="search-section" aria-labelledby="search-heading">
         <div class="section-heading compact-heading">
           <div>
-            <p class="eyebrow">Security lookup</p>
+            <p class="eyebrow">Symbol lookup</p>
             <h1 id="search-heading">Market dashboard</h1>
           </div>
           <p id="data-freshness" class="freshness">Data status unavailable</p>
         </div>
-        <form id="ticker-search-form" class="search-form" role="search" autocomplete="off">
+        <form id="ticker-search-form" class="search-form" role="search" autocomplete="off" novalidate>
           <div class="search-field">
-            <label for="ticker-search">Search by ticker or company name</label>
+            <label for="ticker-search">Stock symbol</label>
             <div class="search-control">
               <input
                 id="ticker-search"
-                name="search"
-                type="search"
-                role="combobox"
-                placeholder="For example, AAPL or Apple"
+                name="symbol"
+                type="text"
+                inputmode="latin"
+                minlength="1"
+                maxlength="32"
+                pattern="[A-Za-z0-9][A-Za-z0-9.\-]{0,31}"
+                placeholder="For example, AAPL or BRK.B"
                 aria-describedby="search-help search-error"
-                aria-controls="ticker-results"
-                aria-expanded="false"
-                aria-haspopup="listbox"
-                aria-autocomplete="list"
+                autocapitalize="characters"
+                spellcheck="false"
                 data-testid="ticker-search"
                 required
               >
-              <button class="button button-primary" type="submit" data-testid="search-submit">Search</button>
+              <button class="button button-primary" type="submit" data-testid="search-submit">Load symbol</button>
             </div>
-            <p id="search-help" class="field-help">Enter at least one character, then select a matching security.</p>
-            <p id="search-error" class="field-error" role="alert" hidden></p>
-            <ul id="ticker-results" class="search-results" role="listbox" hidden></ul>
+            <p id="search-help" class="field-help">Enter 1–32 letters, numbers, periods, or hyphens.</p>
+            <p id="search-error" class="field-error" role="alert" aria-live="assertive" hidden></p>
           </div>
         </form>
       </section>
@@ -78,16 +78,16 @@
         <div class="section-heading">
           <div>
             <p class="eyebrow">Latest end-of-day quote</p>
-            <h2 id="overview-heading"><span id="company-name">Select a security</span> <span id="company-symbol" class="symbol-label"></span></h2>
+            <h2 id="overview-heading"><span id="company-symbol">Select a symbol</span></h2>
           </div>
           <p id="quote-date" class="as-of">As of —</p>
         </div>
         <div id="quote-loading" class="loading-state" role="status">Loading latest quote…</div>
         <div id="quote-error" class="section-message error-message" role="alert" hidden></div>
-        <div id="quote-empty" class="section-message" hidden>No quote is available for this security.</div>
+        <div id="quote-empty" class="section-message" hidden>No quote is available for this symbol.</div>
         <dl id="quote-metrics" class="metric-grid" data-testid="quote-summary" hidden>
           <div class="metric metric-primary">
-            <dt>Close</dt>
+            <dt>Unadjusted close</dt>
             <dd id="metric-close">—</dd>
             <span id="metric-change" class="change-badge">Change unavailable</span>
           </div>
@@ -98,88 +98,59 @@
         </dl>
       </section>
 
-      <div class="dashboard-grid">
-        <section class="metadata-section panel" aria-labelledby="metadata-heading" data-testid="company-metadata">
-          <div class="section-heading">
-            <div>
-              <p class="eyebrow">Listing</p>
-              <h2 id="metadata-heading">Company and exchange</h2>
-            </div>
-          </div>
-          <div id="metadata-loading" class="loading-state" role="status">Loading company metadata…</div>
-          <div id="metadata-error" class="section-message error-message" role="alert" hidden></div>
-          <dl id="metadata-list" class="metadata-list" hidden>
-            <div><dt>Company</dt><dd id="meta-company">—</dd></div>
-            <div><dt>Symbol</dt><dd id="meta-symbol">—</dd></div>
-            <div><dt>Exchange</dt><dd id="meta-exchange">—</dd></div>
-            <div><dt>MIC</dt><dd id="meta-mic">—</dd></div>
-            <div><dt>Country</dt><dd id="meta-country">—</dd></div>
-            <div><dt>Currency</dt><dd id="meta-currency">—</dd></div>
-          </dl>
-        </section>
-
-        <section class="usage-section panel" aria-labelledby="usage-heading" data-testid="quota-usage">
-          <div class="section-heading">
-            <div>
-              <p class="eyebrow">Account</p>
-              <h2 id="usage-heading">API usage</h2>
-            </div>
-          </div>
-          <div id="usage-loading" class="loading-state" role="status">Loading quota…</div>
-          <div id="usage-error" class="section-message error-message" role="alert" hidden></div>
-          <div id="usage-content" hidden>
-            <div class="usage-total"><strong id="usage-used">—</strong><span>of <span id="usage-limit">—</span> requests used</span></div>
-            <div
-              id="usage-progress"
-              class="progress-track"
-              role="progressbar"
-              aria-label="Monthly API request usage"
-              aria-valuemin="0"
-              aria-valuemax="100"
-              aria-valuenow="0"
-            ><span id="usage-bar"></span></div>
-            <p id="usage-reset" class="field-help">Reset date unavailable</p>
-          </div>
-        </section>
-      </div>
-
-      <section class="history-section panel" aria-labelledby="history-heading">
-        <div class="section-heading history-heading">
+      <section class="usage-section panel" aria-labelledby="usage-heading" data-testid="quota-usage">
+        <div class="section-heading">
           <div>
-            <p class="eyebrow">Adjusted close</p>
-            <h2 id="history-heading">Price history</h2>
-          </div>
-          <div class="range-presets" aria-label="Quick date ranges">
-            <button class="range-button" type="button" data-days="30">1M</button>
-            <button class="range-button" type="button" data-days="90">3M</button>
-            <button class="range-button" type="button" data-days="180">6M</button>
-            <button class="range-button is-active" type="button" data-days="365" aria-pressed="true">1Y</button>
+            <p class="eyebrow">Local accounting</p>
+            <h2 id="usage-heading">Daily API usage</h2>
           </div>
         </div>
-        <form id="history-form" class="date-range-form">
-          <div class="field inline-field">
-            <label for="date-from">From</label>
-            <input id="date-from" name="date_from" type="date" required>
+        <div id="usage-loading" class="loading-state" role="status">Loading daily quota…</div>
+        <div id="usage-error" class="section-message error-message" role="alert" hidden></div>
+        <div id="usage-content" hidden>
+          <div class="usage-total"><strong id="usage-used">—</strong><span>of <span id="usage-limit">—</span> daily credits used</span></div>
+          <div
+            id="usage-progress"
+            class="progress-track"
+            role="progressbar"
+            aria-label="Daily API credit usage"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuenow="0"
+          ><span id="usage-bar"></span></div>
+          <p id="usage-reset" class="field-help">Reset time unavailable</p>
+        </div>
+      </section>
+
+      <section class="history-section panel" aria-labelledby="history-heading">
+        <div class="section-heading history-heading-row">
+          <div>
+            <p class="eyebrow">Daily candles</p>
+            <h2 id="history-heading">Unadjusted close history</h2>
           </div>
-          <div class="field inline-field">
-            <label for="date-to">To</label>
-            <input id="date-to" name="date_to" type="date" required>
-          </div>
-          <button class="button button-secondary" type="submit">Apply range</button>
-        </form>
-        <div id="history-loading" class="loading-state chart-loading" role="status">Loading price history…</div>
+          <form id="history-range-form" class="range-form">
+            <label>From <input id="date-from" name="date_from" type="date" required></label>
+            <label>To <input id="date-to" name="date_to" type="date" required></label>
+            <button class="button button-secondary" type="submit">Apply range</button>
+          </form>
+        </div>
+        <div class="range-shortcuts" aria-label="Quick date ranges">
+          <button class="range-button" type="button" data-days="30" aria-pressed="false">1 month</button>
+          <button class="range-button" type="button" data-days="90" aria-pressed="false">3 months</button>
+          <button class="range-button" type="button" data-days="365" aria-pressed="true">1 year</button>
+        </div>
+        <div id="history-loading" class="loading-state" role="status">Loading price history…</div>
         <div id="history-error" class="section-message error-message" role="alert" hidden></div>
         <div id="history-empty" class="section-message" hidden>No price history is available for this range.</div>
         <div id="history-content" hidden>
           <p id="chart-summary" class="sr-only" data-testid="chart-summary"></p>
-          <div class="chart-frame" data-testid="history-chart">
-            <canvas id="price-chart" role="img" aria-labelledby="history-heading chart-summary"></canvas>
+          <div class="chart-wrap" data-testid="history-chart">
+            <canvas id="price-chart" role="img" aria-label="Daily unadjusted closing price chart"></canvas>
           </div>
-          <details id="history-table-details" class="table-disclosure">
+          <details id="history-table-details" class="history-details">
             <summary>View accessible price table</summary>
             <div class="table-wrap">
-              <table>
-                <caption>Historical daily open, high, low, close, and volume</caption>
+              <table aria-label="Historical daily open, high, low, close, and volume">
                 <thead><tr><th scope="col">Date</th><th scope="col">Open</th><th scope="col">High</th><th scope="col">Low</th><th scope="col">Close</th><th scope="col">Volume</th></tr></thead>
                 <tbody id="history-table-body"></tbody>
               </table>
@@ -187,38 +158,7 @@
           </details>
         </div>
       </section>
-
-      <div class="actions-grid">
-        <section class="panel" aria-labelledby="splits-heading">
-          <div class="section-heading"><div><p class="eyebrow">Corporate actions</p><h2 id="splits-heading">Stock splits</h2></div></div>
-          <div id="splits-loading" class="loading-state" role="status">Loading stock splits…</div>
-          <div id="splits-error" class="section-message error-message" role="alert" hidden></div>
-          <div id="splits-empty" class="section-message" hidden>No stock splits found.</div>
-          <div id="splits-content" class="table-wrap" hidden>
-            <table data-testid="splits-table">
-              <caption class="sr-only">Stock splits</caption>
-              <thead><tr><th scope="col">Date</th><th scope="col">Ratio</th></tr></thead>
-              <tbody id="splits-table-body"></tbody>
-            </table>
-          </div>
-        </section>
-
-        <section class="panel" aria-labelledby="dividends-heading">
-          <div class="section-heading"><div><p class="eyebrow">Corporate actions</p><h2 id="dividends-heading">Dividends</h2></div></div>
-          <div id="dividends-loading" class="loading-state" role="status">Loading dividends…</div>
-          <div id="dividends-error" class="section-message error-message" role="alert" hidden></div>
-          <div id="dividends-empty" class="section-message" hidden>No dividends found.</div>
-          <div id="dividends-content" class="table-wrap" hidden>
-            <table data-testid="dividends-table">
-              <caption class="sr-only">Dividends</caption>
-              <thead><tr><th scope="col">Date</th><th scope="col">Amount</th></tr></thead>
-              <tbody id="dividends-table-body"></tbody>
-            </table>
-          </div>
-        </section>
-      </div>
     </main>
-
     <noscript><p class="noscript-message">JavaScript is required to load live market data.</p></noscript>
   </body>
 </html>

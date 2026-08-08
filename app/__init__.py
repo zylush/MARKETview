@@ -1,1 +1,1 @@
-"""Marketstack dashboard application package."""
+"""Market Data dashboard application package."""

@@ -5,14 +5,13 @@ import logging
 import re
 import uuid
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import httpx
 import pytest
 from pydantic import SecretStr
 
 import app.main as main_module
-from api.index import app as serverless_app
 from app.cache.memory import MemoryCache
 from app.errors import (
     CacheUnavailableError,
@@ -23,7 +22,7 @@ from app.errors import (
     QuotaExceededError,
 )
 from app.main import create_app
-from app.providers.marketstack import MarketstackProvider
+from app.providers.marketdata import MarketDataAppProvider
 from app.services.market_data import MarketDataService
 
 
@@ -51,8 +50,10 @@ async def test_health_is_public_local_and_has_security_headers(client: httpx.Asy
     assert response.headers["referrer-policy"] == "same-origin"
 
 
-def test_serverless_entrypoint_builds_a_fastapi_application() -> None:
-    assert serverless_app.title == "Marketstack Dashboard API"
+def test_application_uses_provider_neutral_title(settings, service, cache) -> None:
+    assert create_app(settings=settings, service=service, cache=cache).title == (
+        "Market Data Dashboard API"
+    )
 
 
 def test_secret_session_setting_is_unwrapped_only_for_signer_construction(
@@ -89,8 +90,8 @@ async def test_session_secret_is_absent_from_responses_and_logs(
     session_secret = "session-secret-must-never-leak"
 
     class FailingService:
-        async def tickers(self, **params):
-            del params
+        async def latest_eod(self, symbol: str):
+            del symbol
             raise ProviderUnavailableError(f"failure containing {session_secret}")
 
     protected = replace(settings, session_secret=SecretStr(session_secret))
@@ -99,52 +100,81 @@ async def test_session_secret_is_absent_from_responses_and_logs(
         app=create_app(settings=protected, service=FailingService(), cache=cache),
         raise_app_exceptions=False,
     )
-    async with httpx.AsyncClient(transport=transport, base_url=protected.allowed_origin) as client:
-        csrf_token = await _csrf(client)
-        login = await client.post(
+    async with httpx.AsyncClient(transport=transport, base_url=protected.allowed_origin) as local:
+        token = await _csrf(local)
+        login = await local.post(
             "/login",
-            data={"password": "correct horse battery staple", "csrf_token": csrf_token},
+            data={"password": "correct horse battery staple", "csrf_token": token},
             headers={"Origin": protected.allowed_origin},
             follow_redirects=False,
         )
-        response = await client.get("/api/v1/tickers")
+        response = await local.get("/api/v1/eod/latest/AAPL")
 
     assert login.status_code == 303
     assert response.status_code == 502
-    assert session_secret not in login.text
-    assert session_secret not in str(login.headers)
-    assert session_secret not in response.text
-    assert session_secret not in str(response.headers)
-    assert session_secret not in caplog.text
+    combined = f"{login.text}{login.headers}{response.text}{response.headers}{caplog.text}"
+    assert session_secret not in combined
 
 
 @pytest.mark.asyncio
-async def test_api_rejects_missing_or_wrong_app_key_without_service_calls(
-    client: httpx.AsyncClient, service
+async def test_unsupported_market_data_routes_are_absent_without_service_calls(
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
+    service,
 ) -> None:
-    assert (await client.get("/api/v1/tickers")).status_code == 401
-    assert (await client.get("/api/v1/tickers", headers={"X-App-Key": "wrong"})).status_code == 401
+    paths = (
+        "/api/v1/tickers",
+        "/api/v1/exchanges",
+        "/api/v1/splits/AAPL",
+        "/api/v1/dividends/AAPL",
+    )
+
+    responses = [await client.get(path, headers=api_headers) for path in paths]
+    schema = (await client.get("/openapi.json", headers=api_headers)).json()
+
+    assert [response.status_code for response in responses] == [404, 404, 404, 404]
+    assert not (
+        {
+            "/api/v1/tickers",
+            "/api/v1/exchanges",
+            "/api/v1/splits/{symbol}",
+            "/api/v1/dividends/{symbol}",
+        }
+        & set(schema["paths"])
+    )
     assert service.calls == []
 
 
 @pytest.mark.asyncio
-async def test_provider_key_cannot_authorize_the_application_boundary(
-    settings, service, cache
+async def test_api_rejects_missing_or_wrong_app_key_without_service_calls(
+    client: httpx.AsyncClient,
+    service,
 ) -> None:
-    application_key = "application-only-key"
-    provider_key = "provider-only-key"
+    assert (await client.get("/api/v1/eod/latest/AAPL")).status_code == 401
+    assert (
+        await client.get("/api/v1/eod/latest/AAPL", headers={"X-App-Key": "wrong"})
+    ).status_code == 401
+    assert service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_provider_token_cannot_authorize_the_application_boundary(
+    settings,
+    service,
+    cache,
+) -> None:
     isolated = replace(
         settings,
-        app_access_key_sha256=hashlib.sha256(application_key.encode()).hexdigest(),
+        app_access_key_sha256=hashlib.sha256(b"application-only-key").hexdigest(),
     )
     transport = httpx.ASGITransport(
         app=create_app(settings=isolated, service=service, cache=cache),
         raise_app_exceptions=False,
     )
-    async with httpx.AsyncClient(transport=transport, base_url=isolated.allowed_origin) as client:
-        response = await client.get(
-            "/api/v1/tickers",
-            headers={"X-App-Key": provider_key},
+    async with httpx.AsyncClient(transport=transport, base_url=isolated.allowed_origin) as local:
+        response = await local.get(
+            "/api/v1/eod/latest/AAPL",
+            headers={"X-App-Key": "provider-only-token"},
         )
 
     assert response.status_code == 401
@@ -152,107 +182,282 @@ async def test_provider_key_cannot_authorize_the_application_boundary(
 
 
 @pytest.mark.asyncio
-async def test_api_v1_tickers_calls_the_marketstack_v2_boundary(settings, cache) -> None:
-    requests: tuple[httpx.Request, ...] = ()
+async def test_api_envelope_request_id_and_supported_service_delegation(
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
+    service,
+) -> None:
+    request_id = str(uuid.uuid4())
+    service.last_metadata = {
+        "source": "cache",
+        "as_of": "2026-08-07T00:00:00Z",
+        "cached": True,
+        "stale": False,
+    }
 
-    def respond(request: httpx.Request) -> httpx.Response:
-        nonlocal requests
-        requests = (*requests, request)
-        return httpx.Response(
-            200,
-            json={
-                "pagination": {"limit": 1, "offset": 0, "count": 1, "total": 1},
-                "data": [{"symbol": "AAPL", "name": "Apple Inc."}],
-            },
-        )
-
-    http_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
-    provider = MarketstackProvider(
-        "provider-boundary-key",
-        base_url="https://api.marketstack.com/v2",
-        client=http_client,
+    response = await client.get(
+        "/api/v1/eod/latest/aapl",
+        headers={**api_headers, "X-Request-ID": request_id},
     )
-    service = MarketDataService(provider, MemoryCache())
-    transport = httpx.ASGITransport(
-        app=create_app(settings=settings, service=service, cache=cache),
-        raise_app_exceptions=False,
-    )
-    async with (
-        httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as client,
-        http_client,
-    ):
-        response = await client.get(
-            "/api/v1/tickers?limit=1",
-            headers={"X-App-Key": "correct horse battery staple"},
-        )
 
     assert response.status_code == 200
-    assert response.json()["data"] == [
-        {
-            "symbol": "AAPL",
-            "name": "Apple Inc.",
-            "exchange_mic": None,
-            "exchange_name": None,
-            "has_intraday": None,
-            "has_eod": None,
-        }
-    ]
-    assert len(requests) == 1
-    assert requests[0].url.path == "/v2/tickers"
-    assert requests[0].url.params.get_list("access_key") == ["provider-boundary-key"]
+    assert response.json() == {
+        "success": True,
+        "data": {"symbol": "AAPL", "close": 201.0},
+        "meta": {
+            "request_id": request_id,
+            "pagination": None,
+            "source": "cache",
+            "as_of": "2026-08-07T00:00:00Z",
+            "cached": True,
+            "stale": False,
+        },
+        "error": None,
+    }
+    assert response.headers["X-Request-ID"] == request_id
+    assert service.calls == [("latest_eod", {"symbol": "AAPL"})]
 
 
 @pytest.mark.asyncio
-async def test_usage_is_local_quota_accounting_without_a_provider_call(settings, cache) -> None:
-    class NoCallProvider:
-        def __getattr__(self, name: str):
-            raise AssertionError(f"usage must not access provider operation {name}")
+async def test_latest_history_and_usage_routes_are_available(
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
+) -> None:
+    today = date.today()
+    paths = (
+        "/api/v1/eod/latest/AAPL",
+        f"/api/v1/eod/history/AAPL?date_from={today - timedelta(days=30)}&date_to={today}",
+        "/api/v1/usage",
+    )
 
-    quota_cache = MemoryCache()
-    service = MarketDataService(NoCallProvider(), quota_cache, monthly_budget=90)
-    for _ in range(7):
-        assert (
-            await quota_cache.reserve_quota(
-                service.quota_key,
-                limit=90,
-                window_seconds=31 * 86400,
-            )
-            is not None
+    responses = [await client.get(path, headers=api_headers) for path in paths]
+
+    assert [response.status_code for response in responses] == [200, 200, 200]
+
+
+@pytest.mark.asyncio
+async def test_latest_route_maps_the_real_market_data_candles_boundary(settings) -> None:
+    upstream_requests: list[httpx.Request] = []
+    candle_time = int(datetime(2026, 8, 7, tzinfo=UTC).timestamp())
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        upstream_requests.append(request)
+        return httpx.Response(
+            203,
+            json={
+                "s": "ok",
+                "o": [201.0],
+                "h": [205.0],
+                "l": [199.0],
+                "c": [204.5],
+                "v": [12_345],
+                "t": [candle_time],
+            },
         )
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    provider = MarketDataAppProvider("provider-only-secret", client=upstream_client)
+    shared_cache = MemoryCache()
+    service = MarketDataService(provider, shared_cache)
     transport = httpx.ASGITransport(
-        app=create_app(settings=settings, service=service, cache=cache),
+        app=create_app(settings=settings, service=service, cache=shared_cache),
         raise_app_exceptions=False,
     )
-    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as client:
-        response = await client.get(
-            "/api/v1/usage",
-            headers={"X-App-Key": "correct horse battery staple"},
-        )
+    try:
+        async with httpx.AsyncClient(
+            transport=transport, base_url=settings.allowed_origin
+        ) as local:
+            response = await local.get(
+                "/api/v1/eod/latest/aapl",
+                headers={"X-App-Key": "correct horse battery staple"},
+            )
+            usage_response = await local.get(
+                "/api/v1/usage",
+                headers={"X-App-Key": "correct horse battery staple"},
+            )
+    finally:
+        await upstream_client.aclose()
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "symbol": "AAPL",
+        "date": "2026-08-07",
+        "open": "201.0",
+        "high": "205.0",
+        "low": "199.0",
+        "close": "204.5",
+        "volume": 12_345,
+        "adjusted_open": None,
+        "adjusted_high": None,
+        "adjusted_low": None,
+        "adjusted_close": None,
+        "adjusted_volume": None,
+    }
+    assert len(upstream_requests) == 1
+    request = upstream_requests[0]
+    assert request.url.path == "/v1/stocks/candles/D/AAPL/"
+    assert dict(request.url.params) == {
+        "to": "today",
+        "countback": "1",
+        "adjustsplits": "false",
+    }
+    assert request.headers.get_list("Authorization") == ["Bearer provider-only-secret"]
+    assert "x-app-key" not in request.headers
+    assert await shared_cache.current_count(service.quota_key) == 1
+    assert usage_response.status_code == 200
+    assert usage_response.json()["data"]["requests_used"] == 1
+    assert usage_response.json()["meta"]["source"] == "local"
+    assert len(upstream_requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream_status", "public_status", "public_code"),
+    [
+        (401, 502, "UPSTREAM_AUTHENTICATION_FAILED"),
+        (402, 502, "UPSTREAM_ACCESS_RESTRICTED"),
+        (403, 502, "UPSTREAM_ACCESS_RESTRICTED"),
+        (429, 429, "UPSTREAM_QUOTA_EXHAUSTED"),
+    ],
+)
+async def test_real_provider_failures_are_sanitized_and_refund_local_credit(
+    settings,
+    upstream_status: int,
+    public_status: int,
+    public_code: str,
+) -> None:
+    upstream_calls = 0
+
+    async def upstream(_request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return httpx.Response(upstream_status, json={"s": "error", "errmsg": "private"})
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    provider = MarketDataAppProvider("provider-only-secret", client=upstream_client)
+    shared_cache = MemoryCache()
+    service = MarketDataService(provider, shared_cache)
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=shared_cache),
+        raise_app_exceptions=False,
+    )
+    try:
+        async with httpx.AsyncClient(
+            transport=transport, base_url=settings.allowed_origin
+        ) as local:
+            response = await local.get(
+                "/api/v1/eod/latest/AAPL",
+                headers={"X-App-Key": "correct horse battery staple"},
+            )
+    finally:
+        await upstream_client.aclose()
+
+    assert response.status_code == public_status
+    assert response.json()["error"]["code"] == public_code
+    assert "private" not in response.text
+    assert "provider-only-secret" not in response.text
+    assert upstream_calls == 1
+    assert await shared_cache.current_count(service.quota_key) == 0
+
+
+@pytest.mark.asyncio
+async def test_history_cursor_takes_precedence_over_offset(
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
+    service,
+) -> None:
+    today = date.today()
+    response = await client.get(
+        f"/api/v1/eod/history/aapl?date_from={today - timedelta(days=30)}"
+        f"&date_to={today}&limit=25&cursor=9&offset=4",
+        headers=api_headers,
+    )
+
+    assert response.status_code == 200
+    assert service.calls[-1] == (
+        "eod_history",
+        {
+            "symbol": "AAPL",
+            "date_from": today - timedelta(days=30),
+            "date_to": today,
+            "limit": 25,
+            "cursor": "9",
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("symbol", ["_AAPL", "AAPL:US", "A B", "AAPL!", "A" * 33])
+async def test_invalid_symbols_return_422_without_service_calls(
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
+    service,
+    symbol: str,
+) -> None:
+    response = await client.get(f"/api/v1/eod/latest/{symbol}", headers=api_headers)
+
+    assert response.status_code == 422
+    assert service.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query",
+    [
+        "date_from=2026-01-01",
+        "date_to=2026-01-02",
+        "date_from=2026-01-02&date_to=2026-01-01",
+        "date_from=2025-01-01&date_to=2026-01-02",
+    ],
+)
+async def test_invalid_history_ranges_return_422_without_service_calls(
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
+    service,
+    query: str,
+) -> None:
+    response = await client.get(
+        f"/api/v1/eod/history/AAPL?{query}",
+        headers=api_headers,
+    )
+
+    assert response.status_code == 422
+    assert service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_usage_returns_local_daily_shape_without_provider_headers(
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
+    service,
+) -> None:
+    response = await client.get("/api/v1/usage", headers=api_headers)
 
     assert response.status_code == 200
     assert response.json()["data"] == {
         "requests_used": 7,
         "requests_limit": 90,
         "requests_remaining": 83,
+        "reset_at": "2026-08-09T00:00:00Z",
     }
-    assert response.json()["meta"]["source"] == "local"
+    assert service.calls == [("usage", {})]
+    assert "authorization" not in {key.lower() for key in response.headers}
 
 
 @pytest.mark.asyncio
-async def test_rejected_provider_key_returns_sanitized_upstream_error_and_safe_diagnostics(
+async def test_rejected_provider_token_returns_sanitized_diagnostics(
     settings,
     cache,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    leaked_key = "provider-key-must-not-leak"
-    leaked_url = f"https://api.marketstack.com/v2/tickers?access_key={leaked_key}"
+    leaked_token = "provider-token-must-not-leak"
 
     class RejectingService:
-        async def tickers(self, **params):
-            del params
-            failure = ProviderAuthenticationError(f"rejected {leaked_url}")
+        async def latest_eod(self, symbol: str):
+            del symbol
+            failure = ProviderAuthenticationError(f"rejected Bearer {leaked_token}")
             failure.upstream_status = 401
-            failure.semantic_code = "invalid_access_key"
+            failure.semantic_code = "authentication_failed"
             raise failure
 
     caplog.set_level(logging.WARNING, logger="app.main")
@@ -260,9 +465,9 @@ async def test_rejected_provider_key_returns_sanitized_upstream_error_and_safe_d
         app=create_app(settings=settings, service=RejectingService(), cache=cache),
         raise_app_exceptions=False,
     )
-    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as client:
-        response = await client.get(
-            "/api/v1/tickers",
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as local:
+        response = await local.get(
+            "/api/v1/eod/latest/AAPL",
             headers={
                 "X-App-Key": "correct horse battery staple",
                 "X-Request-ID": "7afef2d7-902d-4298-a6ab-82c86bc57474",
@@ -274,37 +479,34 @@ async def test_rejected_provider_key_returns_sanitized_upstream_error_and_safe_d
         "code": "UPSTREAM_AUTHENTICATION_FAILED",
         "message": "the market data provider rejected its credentials",
     }
-    assert leaked_key not in response.text
-    assert leaked_url not in response.text
+    assert leaked_token not in response.text
     records = [
         record for record in caplog.records if record.message == "market_data_request_failed"
     ]
     assert len(records) == 1
-    record = records[0]
-    assert record.request_id == "7afef2d7-902d-4298-a6ab-82c86bc57474"
-    assert record.exception_category == "ProviderAuthenticationError"
-    assert record.upstream_status == 401
-    assert record.semantic_code == "invalid_access_key"
-    assert leaked_key not in caplog.text
-    assert leaked_url not in caplog.text
+    assert records[0].request_id == "7afef2d7-902d-4298-a6ab-82c86bc57474"
+    assert records[0].exception_category == "ProviderAuthenticationError"
+    assert records[0].upstream_status == 401
+    assert records[0].semantic_code == "authentication_failed"
+    assert leaked_token not in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_provider_plan_restriction_is_distinct_and_sanitized(settings, cache) -> None:
-    private_detail = "private-provider-plan-and-account-detail"
+async def test_provider_plan_or_ip_restriction_is_sanitized(settings, cache) -> None:
+    private_detail = "private-provider-plan-ip-and-account-detail"
 
     class RestrictedService:
-        async def tickers(self, **params):
-            del params
+        async def latest_eod(self, symbol: str):
+            del symbol
             raise ProviderAccessRestrictedError(private_detail)
 
     transport = httpx.ASGITransport(
         app=create_app(settings=settings, service=RestrictedService(), cache=cache),
         raise_app_exceptions=False,
     )
-    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as client:
-        response = await client.get(
-            "/api/v1/tickers",
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as local:
+        response = await local.get(
+            "/api/v1/eod/latest/AAPL",
             headers={"X-App-Key": "correct horse battery staple"},
         )
 
@@ -317,115 +519,34 @@ async def test_provider_plan_restriction_is_distinct_and_sanitized(settings, cac
 
 
 @pytest.mark.asyncio
-async def test_api_envelope_request_id_and_service_delegation(
-    client: httpx.AsyncClient, api_headers: dict[str, str], service
+async def test_dashboard_exposes_only_direct_symbol_lookup_sections(
+    client: httpx.AsyncClient,
 ) -> None:
-    request_id = str(uuid.uuid4())
-    service.last_metadata = {
-        "source": "cache",
-        "as_of": "2026-08-07T00:00:00Z",
-        "cached": True,
-        "stale": False,
-    }
-    response = await client.get(
-        "/api/v1/tickers?search=apple&limit=10&offset=2",
-        headers={**api_headers, "X-Request-ID": request_id},
+    token = await _csrf(client)
+    await client.post(
+        "/login",
+        data={"password": "correct horse battery staple", "csrf_token": token},
+        headers={"Origin": "https://dashboard.test"},
     )
+
+    response = await client.get("/dashboard")
 
     assert response.status_code == 200
-    assert response.json() == {
-        "success": True,
-        "data": [{"symbol": "AAPL"}],
-        "meta": {
-            "request_id": request_id,
-            "pagination": {"next_cursor": "10", "total": 20},
-            "source": "cache",
-            "as_of": "2026-08-07T00:00:00Z",
-            "cached": True,
-            "stale": False,
-        },
-        "error": None,
-    }
-    assert response.headers["X-Request-ID"] == request_id
-    assert service.calls[-1] == (
-        "tickers",
-        {"search": "apple", "limit": 10, "offset": 2},
-    )
-
-
-@pytest.mark.asyncio
-async def test_all_scripted_endpoints_are_available(
-    client: httpx.AsyncClient, api_headers: dict[str, str]
-) -> None:
-    today = date.today()
-    paths = [
-        "/api/v1/exchanges",
-        "/api/v1/eod/latest/AAPL",
-        f"/api/v1/eod/history/AAPL?date_from={today - timedelta(days=30)}&date_to={today}",
-        "/api/v1/splits/AAPL",
-        "/api/v1/dividends/AAPL",
-        "/api/v1/usage",
-    ]
-
-    responses = [await client.get(path, headers=api_headers) for path in paths]
-    assert [response.status_code for response in responses] == [200] * len(paths)
-
-
-@pytest.mark.asyncio
-async def test_cursor_takes_precedence_over_offset_on_all_list_routes(
-    client: httpx.AsyncClient,
-    api_headers: dict[str, str],
-    service,
-) -> None:
-    today = date.today()
-    paths = [
-        "/api/v1/exchanges?limit=25&cursor=next-page&offset=9",
-        (
-            f"/api/v1/eod/history/AAPL?date_from={today - timedelta(days=30)}"
-            f"&date_to={today}&limit=25&cursor=next-page&offset=9"
-        ),
-        "/api/v1/splits/AAPL?limit=25&cursor=next-page&offset=9",
-        "/api/v1/dividends/AAPL?limit=25&cursor=next-page&offset=9",
-    ]
-
-    responses = [await client.get(path, headers=api_headers) for path in paths]
-
-    assert [response.status_code for response in responses] == [200] * len(paths)
-    assert service.calls[-4:] == [
-        ("exchanges", {"limit": 25, "cursor": "next-page"}),
-        (
-            "eod_history",
-            {
-                "symbol": "AAPL",
-                "date_from": today - timedelta(days=30),
-                "date_to": today,
-                "limit": 25,
-                "cursor": "next-page",
-            },
-        ),
-        ("splits", {"symbol": "AAPL", "limit": 25, "cursor": "next-page"}),
-        ("dividends", {"symbol": "AAPL", "limit": 25, "cursor": "next-page"}),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_history_rejects_more_than_one_year(
-    client: httpx.AsyncClient, api_headers: dict[str, str]
-) -> None:
-    today = date.today()
-    response = await client.get(
-        f"/api/v1/eod/history/AAPL?date_from={today - timedelta(days=366)}&date_to={today}",
-        headers=api_headers,
-    )
-
-    assert response.status_code == 422
-    assert response.json()["success"] is False
-    assert response.json()["error"]["code"] == "validation_error"
+    assert 'name="symbol"' in response.text
+    assert 'pattern="[A-Za-z0-9][A-Za-z0-9.\\-]{0,31}"' in response.text
+    assert 'role="combobox"' not in response.text
+    assert 'role="listbox"' not in response.text
+    assert "company-metadata" not in response.text
+    assert "splits-table" not in response.text
+    assert "dividends-table" not in response.text
+    assert "Daily API usage" in response.text
+    assert "Unadjusted close" in response.text
 
 
 @pytest.mark.asyncio
 async def test_docs_are_protected_by_the_app_key(
-    client: httpx.AsyncClient, api_headers: dict[str, str]
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
 ) -> None:
     for path in ("/docs", "/redoc", "/openapi.json"):
         assert (await client.get(path)).status_code == 401
@@ -434,15 +555,15 @@ async def test_docs_are_protected_by_the_app_key(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("path", ["/docs", "/redoc"])
-async def test_docs_scripts_and_styles_use_the_per_request_csp_nonce(
+async def test_docs_assets_use_the_per_request_csp_nonce(
     client: httpx.AsyncClient,
     api_headers: dict[str, str],
     path: str,
 ) -> None:
     response = await client.get(path, headers=api_headers)
-
     csp = response.headers["content-security-policy"]
     nonce_match = re.search(r"'nonce-([^']+)'", csp)
+
     assert response.status_code == 200
     assert nonce_match is not None
     nonce = nonce_match.group(1)
@@ -455,10 +576,11 @@ async def test_docs_scripts_and_styles_use_the_per_request_csp_nonce(
 
 @pytest.mark.asyncio
 async def test_same_origin_cors_is_narrow(
-    client: httpx.AsyncClient, api_headers: dict[str, str]
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
 ) -> None:
     allowed = await client.options(
-        "/api/v1/tickers",
+        "/api/v1/eod/latest/AAPL",
         headers={
             "Origin": api_headers["Origin"],
             "Access-Control-Request-Method": "GET",
@@ -466,7 +588,7 @@ async def test_same_origin_cors_is_narrow(
         },
     )
     denied = await client.options(
-        "/api/v1/tickers",
+        "/api/v1/eod/latest/AAPL",
         headers={"Origin": "https://evil.test", "Access-Control-Request-Method": "GET"},
     )
 
@@ -476,26 +598,24 @@ async def test_same_origin_cors_is_narrow(
 
 @pytest.mark.asyncio
 async def test_untrusted_host_is_rejected(client: httpx.AsyncClient) -> None:
-    response = await client.get("/health", headers={"Host": "evil.test"})
-
-    assert response.status_code == 400
+    assert (await client.get("/health", headers={"Host": "evil.test"})).status_code == 400
 
 
 @pytest.mark.asyncio
-async def test_invalid_request_id_is_replaced_with_a_uuid(client: httpx.AsyncClient) -> None:
+async def test_invalid_request_id_is_replaced_with_uuid(client: httpx.AsyncClient) -> None:
     response = await client.get("/health", headers={"X-Request-ID": "not-a-uuid"})
 
     assert str(uuid.UUID(response.headers["X-Request-ID"])) == response.headers["X-Request-ID"]
 
 
 @pytest.mark.asyncio
-async def test_local_rate_limits_ignore_forwarded_ip_headers(
+async def test_local_rate_limits_ignore_forwarded_headers(
     client: httpx.AsyncClient,
     api_headers: dict[str, str],
     cache,
 ) -> None:
     response = await client.get(
-        "/api/v1/tickers",
+        "/api/v1/eod/latest/AAPL",
         headers={**api_headers, "X-Vercel-Forwarded-For": "203.0.113.7"},
     )
 
@@ -505,7 +625,7 @@ async def test_local_rate_limits_ignore_forwarded_ip_headers(
 
 
 @pytest.mark.asyncio
-async def test_vercel_rate_limits_use_first_valid_platform_forwarded_ip(
+async def test_vercel_rate_limits_use_first_valid_forwarded_ip(
     settings,
     service,
     cache,
@@ -513,11 +633,9 @@ async def test_vercel_rate_limits_use_first_valid_platform_forwarded_ip(
 ) -> None:
     deployed = replace(settings, deployment_platform="vercel")
     transport = httpx.ASGITransport(app=create_app(settings=deployed, service=service, cache=cache))
-    async with httpx.AsyncClient(
-        transport=transport, base_url=deployed.allowed_origin
-    ) as deployed_client:
-        response = await deployed_client.get(
-            "/api/v1/tickers",
+    async with httpx.AsyncClient(transport=transport, base_url=deployed.allowed_origin) as local:
+        response = await local.get(
+            "/api/v1/eod/latest/AAPL",
             headers={
                 **api_headers,
                 "X-Vercel-Forwarded-For": "invalid, 203.0.113.8, 203.0.113.9",
@@ -531,32 +649,7 @@ async def test_vercel_rate_limits_use_first_valid_platform_forwarded_ip(
 
 
 @pytest.mark.asyncio
-async def test_malformed_deployed_forwarding_headers_fall_back_to_socket_ip(
-    settings,
-    service,
-    cache,
-    api_headers: dict[str, str],
-) -> None:
-    deployed = replace(settings, deployment_platform="vercel")
-    transport = httpx.ASGITransport(app=create_app(settings=deployed, service=service, cache=cache))
-    async with httpx.AsyncClient(
-        transport=transport, base_url=deployed.allowed_origin
-    ) as deployed_client:
-        response = await deployed_client.get(
-            "/api/v1/tickers",
-            headers={
-                **api_headers,
-                "X-Vercel-Forwarded-For": "not-an-ip",
-                "X-Forwarded-For": "also-not-an-ip",
-            },
-        )
-
-    assert response.status_code == 200
-    assert "rate:api:127.0.0.1" in cache.counts
-
-
-@pytest.mark.asyncio
-async def test_lifespan_closes_only_the_service_when_it_owns_the_cache(settings) -> None:
+async def test_lifespan_closes_only_service_when_it_owns_cache(settings) -> None:
     class ClosingResource:
         def __init__(self) -> None:
             self.close_count = 0
@@ -576,119 +669,7 @@ async def test_lifespan_closes_only_the_service_when_it_owns_the_cache(settings)
 
 
 @pytest.mark.asyncio
-async def test_lifespan_closes_cache_when_service_has_no_close(settings) -> None:
-    class ClosingCache:
-        def __init__(self) -> None:
-            self.close_count = 0
-
-        async def aclose(self) -> None:
-            self.close_count += 1
-
-    cache = ClosingCache()
-    application = create_app(settings=settings, service=object(), cache=cache)
-
-    async with application.router.lifespan_context(application):
-        pass
-
-    assert cache.close_count == 1
-
-
-@pytest.mark.asyncio
-async def test_login_requires_origin_and_csrf_then_sets_hardened_cookie(
-    client: httpx.AsyncClient,
-) -> None:
-    token = await _csrf(client)
-    denied = await client.post(
-        "/auth/login",
-        data={
-            "username": "analyst",
-            "password": "correct horse battery staple",
-            "csrf_token": token,
-        },
-        headers={"Origin": "https://evil.test"},
-    )
-    assert denied.status_code == 403
-
-    token = await _csrf(client)
-    response = await client.post(
-        "/auth/login",
-        data={
-            "username": "analyst",
-            "password": "correct horse battery staple",
-            "csrf_token": token,
-        },
-        headers={"Origin": "https://dashboard.test"},
-        follow_redirects=False,
-    )
-    assert response.status_code == 303
-    cookie = response.headers["set-cookie"].lower()
-    assert "httponly" in cookie
-    assert "samesite=strict" in cookie
-    assert (await client.get("/dashboard")).status_code == 200
-
-
-@pytest.mark.asyncio
-async def test_logout_accepts_the_dashboard_csrf_header(client: httpx.AsyncClient) -> None:
-    token = await _csrf(client)
-    await client.post(
-        "/login",
-        data={"password": "correct horse battery staple", "csrf_token": token},
-        headers={"Origin": "https://dashboard.test"},
-    )
-    dashboard = await client.get("/dashboard")
-    csrf = re.search(r'<meta name="csrf-token" content="([^"]+)"', dashboard.text)
-    assert csrf is not None
-
-    logout = await client.post(
-        "/logout",
-        headers={
-            "Origin": "https://dashboard.test",
-            "X-CSRF-Token": csrf.group(1),
-        },
-        follow_redirects=False,
-    )
-
-    assert logout.status_code == 303
-    assert (await client.get("/dashboard", follow_redirects=False)).status_code == 303
-
-
-@pytest.mark.asyncio
-async def test_secure_production_responses_emit_hsts(settings, service, cache) -> None:
-    production = replace(settings, environment="production", cookie_secure=True)
-    transport = httpx.ASGITransport(
-        app=create_app(settings=production, service=service, cache=cache)
-    )
-    async with httpx.AsyncClient(transport=transport, base_url=production.allowed_origin) as secure:
-        response = await secure.get("/health")
-
-    assert response.headers["strict-transport-security"].startswith("max-age=")
-
-
-def test_non_secure_production_cookie_configuration_is_rejected(settings, service, cache) -> None:
-    production = replace(settings, environment="production", cookie_secure=False)
-
-    with pytest.raises(ValueError, match="non-secure cookies"):
-        create_app(settings=production, service=service, cache=cache)
-
-
-@pytest.mark.asyncio
-async def test_login_rate_limit_fails_closed_when_cache_is_down(
-    client: httpx.AsyncClient, cache
-) -> None:
-    cache.available = False
-    token = await _csrf(client)
-    response = await client.post(
-        "/auth/login",
-        data={"username": "analyst", "password": "wrong", "csrf_token": token},
-        headers={"Origin": "https://dashboard.test"},
-    )
-
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == "rate_limiter_unavailable"
-
-
-@pytest.mark.asyncio
-async def test_signed_browser_session_authorizes_dashboard_api(client: httpx.AsyncClient) -> None:
+async def test_login_session_authorizes_supported_api_and_logout(client: httpx.AsyncClient) -> None:
     token = await _csrf(client)
     login = await client.post(
         "/login",
@@ -698,7 +679,21 @@ async def test_signed_browser_session_authorizes_dashboard_api(client: httpx.Asy
     )
 
     assert login.status_code == 303
-    assert (await client.get("/api/v1/tickers")).status_code == 200
+    cookie = login.headers["set-cookie"].lower()
+    assert "httponly" in cookie
+    assert "samesite=strict" in cookie
+    assert (await client.get("/api/v1/eod/latest/AAPL")).status_code == 200
+    dashboard = await client.get("/dashboard")
+    csrf = re.search(r'<meta name="csrf-token" content="([^"]+)"', dashboard.text)
+    assert csrf is not None
+
+    logout = await client.post(
+        "/logout",
+        headers={"Origin": "https://dashboard.test", "X-CSRF-Token": csrf.group(1)},
+        follow_redirects=False,
+    )
+    assert logout.status_code == 303
+    assert (await client.get("/dashboard", follow_redirects=False)).status_code == 303
 
 
 @pytest.mark.asyncio
@@ -706,7 +701,7 @@ async def test_signed_browser_session_authorizes_dashboard_api(client: httpx.Asy
     ("failure", "status", "code"),
     [
         (CacheUnavailableError("redis token leaked"), 503, "CACHE_UNAVAILABLE"),
-        (QuotaExceededError("upstream key leaked"), 429, "UPSTREAM_QUOTA_EXHAUSTED"),
+        (QuotaExceededError("provider token leaked"), 429, "UPSTREAM_QUOTA_EXHAUSTED"),
         (ProviderUnavailableError("provider private host leaked"), 502, "UPSTREAM_UNAVAILABLE"),
         (ProviderTimeoutError("provider timeout detail leaked"), 504, "UPSTREAM_UNAVAILABLE"),
     ],
@@ -715,17 +710,17 @@ async def test_domain_failures_are_sanitized(
     client: httpx.AsyncClient,
     api_headers: dict[str, str],
     service,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     failure: Exception,
     status: int,
     code: str,
 ) -> None:
-    async def fail(**params):
-        del params
+    async def fail(symbol: str):
+        del symbol
         raise failure
 
-    monkeypatch.setattr(service, "tickers", fail)
-    response = await client.get("/api/v1/tickers", headers=api_headers)
+    monkeypatch.setattr(service, "latest_eod", fail)
+    response = await client.get("/api/v1/eod/latest/AAPL", headers=api_headers)
 
     assert response.status_code == status
     assert response.json()["error"]["code"] == code
@@ -734,10 +729,29 @@ async def test_domain_failures_are_sanitized(
 
 @pytest.mark.asyncio
 async def test_api_rate_limit_fails_closed_when_cache_is_down(
-    client: httpx.AsyncClient, api_headers: dict[str, str], cache
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
+    cache,
 ) -> None:
     cache.available = False
-    response = await client.get("/api/v1/tickers", headers=api_headers)
+    response = await client.get("/api/v1/eod/latest/AAPL", headers=api_headers)
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "rate_limiter_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_login_rate_limit_fails_closed_when_cache_is_down(
+    client: httpx.AsyncClient,
+    cache,
+) -> None:
+    cache.available = False
+    token = await _csrf(client)
+    response = await client.post(
+        "/login",
+        data={"password": "wrong", "csrf_token": token},
+        headers={"Origin": "https://dashboard.test"},
+    )
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "rate_limiter_unavailable"

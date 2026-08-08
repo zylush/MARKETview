@@ -22,6 +22,10 @@ def test_cache_keys_are_stable_versioned_and_do_not_expose_inputs() -> None:
     assert "MSFT" not in first
 
 
+def test_cache_keys_default_to_market_data_schema_v2() -> None:
+    assert CacheKeyBuilder().build("latest", {"symbol": "AAPL"}).startswith("marketdata:v2:latest:")
+
+
 def test_memory_cache_supports_stale_entries_quota_and_locks() -> None:
     async def scenario() -> None:
         now = [1000.0]
@@ -40,11 +44,30 @@ def test_memory_cache_supports_stale_entries_quota_and_locks() -> None:
         assert await cache.reserve_quota("quota", limit=2, window_seconds=60) == 2
         assert await cache.reserve_quota("quota", limit=2, window_seconds=60) is None
         assert await cache.current_count("quota") == 2
+        assert await cache.release_quota("quota") == 1
+        assert await cache.release_quota("quota") == 0
+        assert await cache.release_quota("quota") == 0
         assert await cache.increment_rate("rate", window_seconds=60) == 1
         assert await cache.acquire_lock("lock", "token-a", ttl_seconds=10)
         assert not await cache.acquire_lock("lock", "token-b", ttl_seconds=10)
         assert not await cache.release_lock("lock", "token-b")
         assert await cache.release_lock("lock", "token-a")
+
+    run(scenario())
+
+
+def test_memory_quota_reservations_and_rollbacks_are_atomic_under_concurrency() -> None:
+    async def scenario() -> None:
+        cache = MemoryCache()
+        reservations = await asyncio.gather(
+            *(cache.reserve_quota("daily", limit=25, window_seconds=60) for _ in range(100))
+        )
+        assert sum(item is not None for item in reservations) == 25
+        assert await cache.current_count("daily") == 25
+
+        released = await asyncio.gather(*(cache.release_quota("daily") for _ in range(100)))
+        assert sorted(released).count(0) == 76
+        assert await cache.current_count("daily") == 0
 
     run(scenario())
 
@@ -64,7 +87,7 @@ def test_memory_quota_window_resets_without_counting_rejected_reservations() -> 
 
 def test_upstash_uses_redis_rest_commands_and_token_safe_release() -> None:
     commands: list[list[Any]] = []
-    replies = iter([None, "OK", 1, "OK", 1])
+    replies = iter([None, "OK", 1, 0, "OK", 1])
 
     def handler(request: httpx.Request) -> httpx.Response:
         commands.append(__import__("json").loads(request.content))
@@ -77,6 +100,7 @@ def test_upstash_uses_redis_rest_commands_and_token_safe_release() -> None:
             assert await cache.get("missing") is None
             await cache.set("k", {"v": 1}, ttl_seconds=10, stale_seconds=20)
             assert await cache.reserve_quota("q", limit=90, window_seconds=60) == 1
+            assert await cache.release_quota("q") == 0
             assert await cache.acquire_lock("l", "owner", ttl_seconds=5)
             assert await cache.release_lock("l", "owner")
         finally:
@@ -88,6 +112,8 @@ def test_upstash_uses_redis_rest_commands_and_token_safe_release() -> None:
     assert commands[1][0:2] == ["SET", "k"]
     assert commands[1][-2:] == ["EX", 30]
     assert commands[2][0] == "EVAL"
-    assert commands[3] == ["SET", "l", "owner", "NX", "EX", 5]
-    assert commands[4][0] == "EVAL"
-    assert "redis.call('get'" in commands[4][1]
+    assert commands[3][0:3] == ["EVAL", commands[3][1], 1]
+    assert "decr" in commands[3][1]
+    assert commands[4] == ["SET", "l", "owner", "NX", "EX", 5]
+    assert commands[5][0] == "EVAL"
+    assert "redis.call('get'" in commands[5][1]

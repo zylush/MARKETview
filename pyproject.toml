@@ -3,9 +3,9 @@ requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "marketstack-dashboard"
+name = "marketdata-dashboard"
 version = "0.1.0"
-description = "A quota-conscious Marketstack dashboard for Vercel."
+description = "A quota-conscious Market Data daily-candles dashboard for Vercel."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

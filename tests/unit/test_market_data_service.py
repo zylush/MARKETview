@@ -6,7 +6,7 @@ import pytest
 
 from app.cache.memory import MemoryCache
 from app.errors import CacheUnavailableError, ProviderUnavailableError, QuotaExceededError
-from app.models import EODBar, Page, Ticker, Usage
+from app.models import EODBar, Page
 from app.services.market_data import MarketDataService, ServiceTTLs
 
 
@@ -19,34 +19,42 @@ class FakeProvider:
         self.calls: dict[str, int] = {}
         self.error: Exception | None = None
         self.gate: asyncio.Event | None = None
+        self.history_items: tuple[EODBar, ...] = (
+            EODBar(symbol="MSFT", date="2026-08-07", close=2),
+        )
 
     async def _result(self, name: str, value: Any) -> Any:
-        self.calls[name] = self.calls.get(name, 0) + 1
+        self.calls = {**self.calls, name: self.calls.get(name, 0) + 1}
         if self.gate is not None:
             await self.gate.wait()
         if self.error:
             raise self.error
         return value
 
-    async def list_tickers(self, *, limit: int = 100, cursor: str | None = None) -> Page[Ticker]:
-        return await self._result("tickers", Page(items=(Ticker(symbol="MSFT", name="Microsoft"),)))
-
     async def latest_eod(self, symbol: str) -> EODBar:
         return await self._result(
             "latest",
-            EODBar(symbol=symbol, date="2025-01-02", open=1, high=2, low=1, close=2, volume=3),
+            EODBar(symbol=symbol, date="2026-08-07", open=1, high=2, low=1, close=2, volume=3),
         )
 
-    async def usage(self) -> Usage:
-        return await self._result("usage", Usage(requests_used=1, requests_limit=100))
+    async def eod_history(
+        self,
+        symbol: str,
+        *,
+        start_date: date,
+        end_date: date,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> Page[EODBar]:
+        del start_date, end_date, limit, cursor
+        items = tuple(item.model_copy(update={"symbol": symbol}) for item in self.history_items)
+        return await self._result("history", Page(items=items, total=len(items)))
 
 
-def test_ttls_match_policy() -> None:
+def test_ttls_match_supported_market_data_policy() -> None:
     ttls = ServiceTTLs()
-    assert ttls.references == 7 * 86400
     assert ttls.completed_history == 30 * 86400
     assert ttls.latest == 6 * 3600
-    assert ttls.corporate_actions == 24 * 3600
     assert ttls.invalid == 3600
     assert ttls.stale == 7 * 86400
 
@@ -56,28 +64,66 @@ def test_service_caches_provider_results_and_reserves_quota_only_on_miss() -> No
     cache = MemoryCache()
     service = MarketDataService(provider, cache)
 
-    first = run(service.tickers(limit=10))
-    second = run(service.tickers(limit=10))
+    first = run(service.latest_eod("msft"))
+    second = run(service.latest_eod("MSFT"))
 
     assert first == second
-    assert provider.calls == {"tickers": 1}
+    assert provider.calls == {"latest": 1}
     assert run(cache.current_count(service.quota_key)) == 1
 
 
-def test_service_quota_is_monthly_utc_and_usage_is_local_without_provider_call() -> None:
-    provider = FakeProvider()
-    cache = MemoryCache()
-    now = datetime(2026, 8, 7, tzinfo=UTC)
-    service = MarketDataService(provider, cache, monthly_budget=90, now=lambda: now)
-    run(service.latest_eod("MSFT"))
+def test_history_pages_share_one_complete_range_provider_fetch() -> None:
+    async def scenario() -> None:
+        provider = FakeProvider()
+        provider.history_items = tuple(
+            EODBar(symbol="MSFT", date=date(2026, 8, day), close=day) for day in range(1, 6)
+        )
+        cache = MemoryCache()
+        service = MarketDataService(provider, cache, now=lambda: datetime(2026, 8, 7, tzinfo=UTC))
 
-    usage = run(service.usage())
+        first = await service.history("MSFT", date(2026, 8, 1), date(2026, 8, 5), limit=2)
+        second = await service.history(
+            "MSFT", date(2026, 8, 1), date(2026, 8, 5), limit=2, cursor="2"
+        )
 
-    assert usage.requests_used == 1
-    assert usage.requests_limit == 90
-    assert usage.requests_remaining == 89
-    assert provider.calls == {"latest": 1}
-    assert "2026-08" not in service.quota_key
+        assert [item.date.day for item in first.items] == [1, 2]
+        assert first.total == 5
+        assert first.next_cursor == "2"
+        assert [item.date.day for item in second.items] == [3, 4]
+        assert second.total == 5
+        assert second.next_cursor == "4"
+        assert provider.calls == {"history": 1}
+        assert await cache.current_count(service.quota_key) == 1
+
+    run(scenario())
+
+
+def test_service_quota_is_daily_utc_and_usage_is_local_without_provider_call() -> None:
+    async def scenario() -> None:
+        provider = FakeProvider()
+        cache = MemoryCache()
+        current = [datetime(2026, 8, 7, 23, 59, 30, tzinfo=UTC)]
+        service = MarketDataService(provider, cache, daily_credit_budget=90, now=lambda: current[0])
+        first_key = service.quota_key
+        await service.latest_eod("MSFT")
+
+        usage = await service.usage()
+
+        assert usage.requests_used == 1
+        assert usage.requests_limit == 90
+        assert usage.requests_remaining == 89
+        assert usage.reset_at == datetime(2026, 8, 8, tzinfo=UTC)
+        assert service.last_metadata is not None
+        assert service.last_metadata.source == "local"
+        assert provider.calls == {"latest": 1}
+
+        current[0] = datetime(2026, 8, 8, tzinfo=UTC)
+        assert service.quota_key != first_key
+        reset_usage = await service.usage()
+        assert reset_usage.requests_used == 0
+        assert reset_usage.reset_at == datetime(2026, 8, 9, tzinfo=UTC)
+
+    run(scenario())
 
 
 def test_service_exposes_task_local_cache_metadata() -> None:
@@ -124,26 +170,44 @@ def test_service_coalesces_concurrent_misses() -> None:
         results = await asyncio.gather(*tasks)
         assert len(results) == 8
         assert provider.calls == {"latest": 1}
+        assert await cache.current_count(service.quota_key) == 1
         assert cache.acquired == 1
         assert cache.released == 1
 
     run(scenario())
 
 
-def test_service_returns_stale_on_provider_failure_or_exhausted_quota() -> None:
-    async def scenario(error: Exception) -> EODBar:
+def test_service_rolls_back_failed_provider_reservation_and_returns_stale() -> None:
+    async def scenario() -> None:
         clock = [1000.0]
         provider = FakeProvider()
         cache = MemoryCache(clock=lambda: clock[0])
         service = MarketDataService(provider, cache)
         expected = await service.latest_eod("MSFT")
+        assert await cache.current_count(service.quota_key) == 1
         clock[0] += ServiceTTLs().latest + 1
-        provider.error = error
-        assert await service.latest_eod("MSFT") == expected
-        return expected
+        provider.error = ProviderUnavailableError("temporarily unavailable")
 
-    run(scenario(ProviderUnavailableError("temporarily unavailable")))
-    run(scenario(QuotaExceededError("quota exhausted")))
+        assert await service.latest_eod("MSFT") == expected
+        assert provider.calls == {"latest": 2}
+        assert await cache.current_count(service.quota_key) == 1
+
+    run(scenario())
+
+
+def test_service_returns_stale_without_call_when_quota_is_exhausted() -> None:
+    async def scenario() -> None:
+        clock = [1000.0]
+        provider = FakeProvider()
+        cache = MemoryCache(clock=lambda: clock[0])
+        service = MarketDataService(provider, cache, daily_credit_budget=1)
+        expected = await service.latest_eod("MSFT")
+        clock[0] += ServiceTTLs().latest + 1
+
+        assert await service.latest_eod("MSFT") == expected
+        assert provider.calls == {"latest": 1}
+
+    run(scenario())
 
 
 def test_service_fails_closed_when_cache_is_unavailable_without_stale() -> None:
@@ -191,3 +255,16 @@ def test_service_closes_provider_and_cache_lifecycles() -> None:
     assert service.manages(provider)
     assert service.manages(cache)
     assert not service.manages(object())
+
+
+def test_quota_rejection_does_not_increment_or_call_provider() -> None:
+    provider = FakeProvider()
+    cache = MemoryCache()
+    service = MarketDataService(provider, cache, daily_credit_budget=1)
+    assert run(cache.reserve_quota(service.quota_key, limit=1, window_seconds=60)) == 1
+
+    with pytest.raises(QuotaExceededError, match="daily"):
+        run(service.latest_eod("AAPL"))
+
+    assert run(cache.current_count(service.quota_key)) == 1
+    assert provider.calls == {}

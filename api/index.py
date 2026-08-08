@@ -5,7 +5,7 @@ from app.cache.memory import MemoryCache
 from app.cache.upstash import UpstashCache
 from app.config import Settings, get_settings
 from app.main import create_app
-from app.providers.marketstack import MarketstackProvider
+from app.providers.marketdata import MarketDataAppProvider
 from app.services.market_data import MarketDataService
 
 
@@ -23,20 +23,20 @@ def _runtime_dependencies(settings: Settings | None = None) -> tuple[object, obj
     else:
         raise RuntimeError("a shared cache is required outside local and test environments")
 
-    marketstack_api_key = settings.marketstack_api_key.get_secret_value()
-    if not marketstack_api_key:
+    marketdata_token = settings.marketdata_token.get_secret_value()
+    if not marketdata_token:
         if not settings.is_local_environment:
-            raise RuntimeError("MARKETSTACK_API_KEY is required")
+            raise RuntimeError("MARKETDATA_TOKEN is required")
         return settings, object(), cache
-    provider = MarketstackProvider(
-        marketstack_api_key,
-        base_url=settings.marketstack_base_url,
-        timeout_seconds=settings.marketstack_timeout_seconds,
+    provider = MarketDataAppProvider(
+        marketdata_token,
+        base_url=settings.marketdata_base_url,
+        timeout_seconds=settings.http_timeout_seconds,
     )
     service = MarketDataService(
         provider,
         cache,
-        monthly_budget=settings.marketstack_monthly_budget,
+        daily_credit_budget=settings.marketdata_daily_credit_budget,
         schema_version=settings.cache_schema_version,
     )
     return settings, service, cache

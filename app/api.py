@@ -113,34 +113,6 @@ def build_api_router(
 
     protected = [Depends(authorize)]
 
-    @router.get("/tickers", dependencies=protected)
-    async def tickers(
-        request: Request,
-        search: str | None = Query(default=None, min_length=1, max_length=100),
-        limit: int = Query(default=100, ge=1, le=1000),
-        offset: int = Query(default=0, ge=0, le=100_000),
-        cursor: str | None = Query(default=None, max_length=100),
-    ) -> dict[str, Any]:
-        params = pagination_params(limit, cursor, offset)
-        if search is not None:
-            params = {**params, "search": search}
-        data = await call_service(service, ("tickers", "list_tickers"), **params)
-        return envelope(request, data, service_metadata(service))
-
-    @router.get("/exchanges", dependencies=protected)
-    async def exchanges(
-        request: Request,
-        limit: int = Query(default=100, ge=1, le=1000),
-        offset: int = Query(default=0, ge=0, le=100_000),
-        cursor: str | None = Query(default=None, min_length=1, max_length=100),
-    ) -> dict[str, Any]:
-        data = await call_service(
-            service,
-            ("exchanges", "list_exchanges"),
-            **pagination_params(limit, cursor, offset),
-        )
-        return envelope(request, data, service_metadata(service))
-
     @router.get("/eod/latest/{symbol}", dependencies=protected)
     async def latest_eod(
         request: Request,
@@ -183,43 +155,6 @@ def build_api_router(
                 **pagination_params(limit, cursor, offset),
             )
         return envelope(request, data, service_metadata(service))
-
-    async def corporate_actions(
-        request: Request,
-        operation: str,
-        symbol: str,
-        limit: int,
-        offset: int,
-        cursor: str | None,
-    ) -> dict[str, Any]:
-        if not __import__("re").fullmatch(SYMBOL_PATTERN, symbol):
-            raise HTTPException(422, detail="invalid symbol")
-        params = {
-            "symbol": symbol.upper(),
-            **pagination_params(limit, cursor, offset),
-        }
-        data = await call_service(service, (operation,), **params)
-        return envelope(request, data, service_metadata(service))
-
-    @router.get("/splits/{symbol}", dependencies=protected)
-    async def splits(
-        request: Request,
-        symbol: str,
-        limit: int = Query(default=100, ge=1, le=1000),
-        offset: int = Query(default=0, ge=0, le=100_000),
-        cursor: str | None = Query(default=None, min_length=1, max_length=100),
-    ) -> dict[str, Any]:
-        return await corporate_actions(request, "splits", symbol, limit, offset, cursor)
-
-    @router.get("/dividends/{symbol}", dependencies=protected)
-    async def dividends(
-        request: Request,
-        symbol: str,
-        limit: int = Query(default=100, ge=1, le=1000),
-        offset: int = Query(default=0, ge=0, le=100_000),
-        cursor: str | None = Query(default=None, min_length=1, max_length=100),
-    ) -> dict[str, Any]:
-        return await corporate_actions(request, "dividends", symbol, limit, offset, cursor)
 
     @router.get("/usage", dependencies=protected)
     async def usage(request: Request) -> dict[str, Any]:

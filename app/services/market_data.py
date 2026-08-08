@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, TypeVar
 
 from pydantic import BaseModel
@@ -20,22 +20,20 @@ from app.errors import (
     ProviderValidationError,
     QuotaExceededError,
 )
-from app.models import Dividend, EODBar, Exchange, Page, Split, Ticker, Usage
+from app.models import EODBar, Page, Usage
 from app.providers.base import MarketDataProvider
 from app.validation import validate_cursor, validate_date_range, validate_limit, validate_symbol
 
 ResultT = TypeVar("ResultT", bound=BaseModel)
+_MAX_HISTORY_BARS = 366
 
 
 @dataclass(frozen=True, slots=True)
 class ServiceTTLs:
-    references: int = 7 * 86400
     completed_history: int = 30 * 86400
     latest: int = 6 * 3600
-    corporate_actions: int = 24 * 3600
     invalid: int = 3600
     stale: int = 7 * 86400
-    usage: int = 5 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,24 +45,26 @@ class ServiceMetadata:
 
 
 class MarketDataService:
-    """Provider-neutral, quota-aware cache-aside market data service."""
+    """Provider-neutral, cache-aside service with a local daily credit guard."""
 
     def __init__(
         self,
         provider: MarketDataProvider,
         cache: Cache,
         *,
-        monthly_budget: int = 90,
-        schema_version: str = "v1",
+        daily_credit_budget: int = 90,
+        schema_version: str = "v2",
         ttls: ServiceTTLs | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         lock_wait_attempts: int = 5,
         lock_wait_seconds: float = 0.05,
     ) -> None:
+        if daily_credit_budget <= 0:
+            raise ValueError("daily credit budget must be positive")
         self._provider = provider
         self._cache = cache
-        self._monthly_budget = monthly_budget
+        self._daily_credit_budget = daily_credit_budget
         self._keys = CacheKeyBuilder(schema_version=schema_version)
         self._ttls = ttls or ServiceTTLs()
         self._singleflight: dict[str, asyncio.Lock] = {}
@@ -76,24 +76,28 @@ class MarketDataService:
             f"market_data_metadata_{id(self)}", default=None
         )
 
+    def _utc_now(self) -> datetime:
+        return self._now().astimezone(UTC)
+
+    @staticmethod
+    def _next_reset(current: datetime) -> datetime:
+        return datetime.combine(current.date() + timedelta(days=1), datetime.min.time(), UTC)
+
+    def _quota_key_for(self, current: datetime) -> str:
+        return self._keys.build("provider_quota", {"day": current.date().isoformat()})
+
     @property
     def quota_key(self) -> str:
-        return self._keys.build(
-            "provider_quota", {"month": self._now().astimezone(UTC).strftime("%Y-%m")}
-        )
+        return self._quota_key_for(self._utc_now())
 
     @property
     def last_metadata(self) -> ServiceMetadata | None:
         """Metadata for the latest call in the current async task/context."""
         return self._metadata.get()
 
-    def _quota_window_seconds(self) -> int:
-        current = self._now().astimezone(UTC)
-        if current.month == 12:
-            following = datetime(current.year + 1, 1, 1, tzinfo=UTC)
-        else:
-            following = datetime(current.year, current.month + 1, 1, tzinfo=UTC)
-        return max(1, int((following - current).total_seconds()))
+    def _quota_window_seconds(self, current: datetime | None = None) -> int:
+        snapshot = current or self._utc_now()
+        return max(1, int((self._next_reset(snapshot) - snapshot).total_seconds()))
 
     async def aclose(self) -> None:
         """Close provider/cache resources while respecting their own ownership semantics."""
@@ -108,54 +112,6 @@ class MarketDataService:
     def manages(self, resource: object) -> bool:
         """Return whether this service owns lifecycle cleanup for a resource."""
         return resource is self._provider or resource is self._cache
-
-    async def tickers(
-        self,
-        *,
-        search: str | None = None,
-        limit: int = 100,
-        cursor: str | None = None,
-        offset: int | None = None,
-    ) -> Page[Ticker]:
-        checked_limit = validate_limit(limit)
-        checked_cursor = validate_cursor(offset if offset is not None else cursor)
-        normalized_search = search.strip()[:100] if search and search.strip() else None
-        key = self._keys.build(
-            "tickers",
-            {"search": normalized_search, "limit": checked_limit, "cursor": checked_cursor},
-        )
-
-        async def load() -> Page[Ticker]:
-            kwargs: dict[str, Any] = {"limit": checked_limit, "cursor": checked_cursor}
-            if normalized_search is not None:
-                kwargs = {**kwargs, "search": normalized_search}
-            return await self._provider.list_tickers(**kwargs)
-
-        return await self._cached(key, self._ttls.references, Page[Ticker], load)
-
-    async def exchanges(
-        self,
-        *,
-        search: str | None = None,
-        limit: int = 100,
-        cursor: str | None = None,
-        offset: int | None = None,
-    ) -> Page[Exchange]:
-        checked_limit = validate_limit(limit)
-        checked_cursor = validate_cursor(offset if offset is not None else cursor)
-        normalized_search = search.strip()[:100] if search and search.strip() else None
-        key = self._keys.build(
-            "exchanges",
-            {"search": normalized_search, "limit": checked_limit, "cursor": checked_cursor},
-        )
-
-        async def load() -> Page[Exchange]:
-            kwargs: dict[str, Any] = {"limit": checked_limit, "cursor": checked_cursor}
-            if normalized_search is not None:
-                kwargs = {**kwargs, "search": normalized_search}
-            return await self._provider.list_exchanges(**kwargs)
-
-        return await self._cached(key, self._ttls.references, Page[Exchange], load)
 
     async def latest_eod(self, symbol: str) -> EODBar:
         checked_symbol = validate_symbol(symbol)
@@ -187,16 +143,14 @@ class MarketDataService:
                 "symbol": checked_symbol,
                 "start": checked_start,
                 "end": checked_end,
-                "limit": checked_limit,
-                "cursor": checked_cursor,
             },
         )
         ttl = (
             self._ttls.completed_history
-            if checked_end < self._now().astimezone(UTC).date()
+            if checked_end < self._utc_now().date()
             else self._ttls.latest
         )
-        return await self._cached(
+        complete = await self._cached(
             key,
             ttl,
             Page[EODBar],
@@ -204,9 +158,24 @@ class MarketDataService:
                 checked_symbol,
                 start_date=checked_start,
                 end_date=checked_end,
-                limit=checked_limit,
-                cursor=checked_cursor,
+                limit=_MAX_HISTORY_BARS,
+                cursor=None,
             ),
+        )
+        return self._paginate_history(complete, limit=checked_limit, cursor=checked_cursor)
+
+    @staticmethod
+    def _paginate_history(
+        complete: Page[EODBar], *, limit: int, cursor: str | None
+    ) -> Page[EODBar]:
+        offset = int(cursor or 0)
+        total = len(complete.items)
+        items = complete.items[offset : offset + limit]
+        following = offset + len(items)
+        return Page(
+            items=items,
+            total=total,
+            next_cursor=str(following) if following < total else None,
         )
 
     async def eod_history(
@@ -228,103 +197,24 @@ class MarketDataService:
             offset=offset,
         )
 
-    async def splits(
-        self,
-        symbol: str | None = None,
-        *,
-        date_from: date | None = None,
-        date_to: date | None = None,
-        limit: int = 100,
-        cursor: str | None = None,
-        offset: int | None = None,
-    ) -> Page[Split]:
-        checked_symbol = validate_symbol(symbol) if symbol is not None else None
-        checked_dates = self._optional_date_range(date_from, date_to)
-        checked_limit = validate_limit(limit)
-        checked_cursor = validate_cursor(offset if offset is not None else cursor)
-        key = self._keys.build(
-            "splits",
-            {
-                "symbol": checked_symbol,
-                "start": checked_dates[0] if checked_dates else None,
-                "end": checked_dates[1] if checked_dates else None,
-                "limit": checked_limit,
-                "cursor": checked_cursor,
-            },
-        )
-        return await self._cached(
-            key,
-            self._ttls.corporate_actions,
-            Page[Split],
-            lambda: self._provider.splits(
-                checked_symbol,
-                start_date=checked_dates[0] if checked_dates else None,
-                end_date=checked_dates[1] if checked_dates else None,
-                limit=checked_limit,
-                cursor=checked_cursor,
-            ),
-        )
-
-    async def dividends(
-        self,
-        symbol: str | None = None,
-        *,
-        date_from: date | None = None,
-        date_to: date | None = None,
-        limit: int = 100,
-        cursor: str | None = None,
-        offset: int | None = None,
-    ) -> Page[Dividend]:
-        checked_symbol = validate_symbol(symbol) if symbol is not None else None
-        checked_dates = self._optional_date_range(date_from, date_to)
-        checked_limit = validate_limit(limit)
-        checked_cursor = validate_cursor(offset if offset is not None else cursor)
-        key = self._keys.build(
-            "dividends",
-            {
-                "symbol": checked_symbol,
-                "start": checked_dates[0] if checked_dates else None,
-                "end": checked_dates[1] if checked_dates else None,
-                "limit": checked_limit,
-                "cursor": checked_cursor,
-            },
-        )
-        return await self._cached(
-            key,
-            self._ttls.corporate_actions,
-            Page[Dividend],
-            lambda: self._provider.dividends(
-                checked_symbol,
-                start_date=checked_dates[0] if checked_dates else None,
-                end_date=checked_dates[1] if checked_dates else None,
-                limit=checked_limit,
-                cursor=checked_cursor,
-            ),
-        )
-
-    @staticmethod
-    def _optional_date_range(
-        start_date: date | None, end_date: date | None
-    ) -> tuple[date, date] | None:
-        if (start_date is None) != (end_date is None):
-            raise ValueError("start and end dates must be provided together")
-        if start_date is None or end_date is None:
-            return None
-        return validate_date_range(start_date, end_date)
-
     async def usage(self) -> Usage:
+        now = self._utc_now()
+        quota_key = self._quota_key_for(now)
+        failed = False
         try:
-            used = await self._cache.current_count(self.quota_key)
-        except Exception as exc:
-            if isinstance(exc, CacheUnavailableError):
-                raise
-            raise CacheUnavailableError("cache service is unavailable") from exc
-        now = self._now().astimezone(UTC)
+            used = await self._cache.current_count(quota_key)
+        except CacheUnavailableError:
+            raise
+        except Exception:
+            failed = True
+        if failed:
+            raise CacheUnavailableError("cache service is unavailable")
         self._metadata.set(ServiceMetadata(source="local", as_of=now, cached=False, stale=False))
         return Usage(
             requests_used=used,
-            requests_limit=self._monthly_budget,
-            requests_remaining=max(0, self._monthly_budget - used),
+            requests_limit=self._daily_credit_budget,
+            requests_remaining=max(0, self._daily_credit_budget - used),
+            reset_at=self._next_reset(now),
         )
 
     async def _cached(
@@ -354,16 +244,7 @@ class MarketDataService:
                 stale = second or stale
                 distributed_key = self._keys.build("singleflight_lock", {"cache_key": key})
                 token = secrets.token_urlsafe(24)
-                try:
-                    acquired = await self._cache.acquire_lock(
-                        distributed_key, token, ttl_seconds=30
-                    )
-                except Exception as exc:
-                    if stale is not None:
-                        return self._decode(stale, model, source="stale")
-                    if isinstance(exc, CacheUnavailableError):
-                        raise
-                    raise CacheUnavailableError("cache service is unavailable") from exc
+                acquired = await self._acquire_refresh_lock(distributed_key, token, stale)
                 if not acquired:
                     for _ in range(self._lock_wait_attempts):
                         await self._sleep(self._lock_wait_seconds)
@@ -374,43 +255,29 @@ class MarketDataService:
                     if stale is not None:
                         return self._decode(stale, model, source="stale")
                     raise CacheUnavailableError("market data refresh is already in progress")
-                try:
-                    reservation = await self._cache.reserve_quota(
-                        self.quota_key,
-                        limit=self._monthly_budget,
-                        window_seconds=self._quota_window_seconds(),
-                    )
-                except Exception as exc:
-                    if stale is not None:
-                        return self._decode(stale, model, source="stale")
-                    if isinstance(exc, CacheUnavailableError):
-                        raise
-                    raise CacheUnavailableError("cache service is unavailable") from exc
+
+                reservation_time = self._utc_now()
+                reservation_key = self._quota_key_for(reservation_time)
+                reservation = await self._reserve(
+                    reservation_key,
+                    self._quota_window_seconds(reservation_time),
+                    stale,
+                )
                 if reservation is None:
                     if stale is not None:
                         return self._decode(stale, model, source="stale")
-                    raise QuotaExceededError("monthly provider quota is exhausted")
+                    raise QuotaExceededError("daily provider quota is exhausted")
+
                 try:
                     result = await loader()
-                except (ProviderNotFoundError, ProviderValidationError) as exc:
-                    try:
-                        await self._cache.set(
-                            key,
-                            {"status": "invalid", "code": exc.code},
-                            ttl_seconds=self._ttls.invalid,
-                        )
-                    except Exception as cache_exc:
-                        if stale is not None:
-                            return self._decode(stale, model, source="stale")
-                        raise CacheUnavailableError("cache service is unavailable") from cache_exc
-                    if stale is not None:
-                        return self._decode(stale, model, source="stale")
+                except MarketDataError as exc:
+                    await self._rollback_quota(reservation_key)
+                    return await self._handle_provider_error(key, model, stale, exc)
+                except BaseException:
+                    await self._rollback_quota(reservation_key)
                     raise
-                except MarketDataError:
-                    if stale is not None:
-                        return self._decode(stale, model, source="stale")
-                    raise
-                as_of = self._now().astimezone(UTC)
+
+                as_of = self._utc_now()
                 try:
                     await self._cache.set(
                         key,
@@ -422,16 +289,19 @@ class MarketDataService:
                         ttl_seconds=ttl,
                         stale_seconds=self._ttls.stale,
                     )
-                except Exception as exc:
+                except CacheUnavailableError:
                     if stale is not None:
                         return self._decode(stale, model, source="stale")
-                    if isinstance(exc, CacheUnavailableError):
-                        raise
-                    raise CacheUnavailableError("cache service is unavailable") from exc
-                self._metadata.set(
-                    ServiceMetadata(source="provider", as_of=as_of, cached=False, stale=False)
-                )
-                return result
+                    raise
+                except Exception:
+                    if stale is not None:
+                        return self._decode(stale, model, source="stale")
+                else:
+                    self._metadata.set(
+                        ServiceMetadata(source="provider", as_of=as_of, cached=False, stale=False)
+                    )
+                    return result
+                raise CacheUnavailableError("cache service is unavailable")
         finally:
             if acquired and distributed_key is not None and token is not None:
                 with suppress(Exception):
@@ -441,13 +311,90 @@ class MarketDataService:
                     name: value for name, value in self._singleflight.items() if name != key
                 }
 
+    async def _acquire_refresh_lock(
+        self, distributed_key: str, token: str, stale: CacheEntry[Any] | None
+    ) -> bool:
+        failed = False
+        try:
+            return await self._cache.acquire_lock(distributed_key, token, ttl_seconds=30)
+        except CacheUnavailableError:
+            if stale is not None:
+                return False
+            raise
+        except Exception:
+            if stale is not None:
+                return False
+            failed = True
+        if failed:
+            raise CacheUnavailableError("cache service is unavailable")
+        return False
+
+    async def _reserve(
+        self, quota_key: str, window_seconds: int, stale: CacheEntry[Any] | None
+    ) -> int | None:
+        failed = False
+        try:
+            return await self._cache.reserve_quota(
+                quota_key,
+                limit=self._daily_credit_budget,
+                window_seconds=window_seconds,
+            )
+        except CacheUnavailableError:
+            if stale is not None:
+                return None
+            raise
+        except Exception:
+            if stale is not None:
+                return None
+            failed = True
+        if failed:
+            raise CacheUnavailableError("cache service is unavailable")
+        return None
+
+    async def _rollback_quota(self, quota_key: str) -> None:
+        with suppress(Exception):
+            await asyncio.shield(self._cache.release_quota(quota_key))
+
+    async def _handle_provider_error(
+        self,
+        key: str,
+        model: type[ResultT],
+        stale: CacheEntry[Any] | None,
+        error: MarketDataError,
+    ) -> ResultT:
+        if isinstance(error, (ProviderNotFoundError, ProviderValidationError)):
+            cache_failed = False
+            try:
+                await self._cache.set(
+                    key,
+                    {"status": "invalid", "code": error.code},
+                    ttl_seconds=self._ttls.invalid,
+                )
+            except CacheUnavailableError:
+                if stale is not None:
+                    return self._decode(stale, model, source="stale")
+                raise
+            except Exception:
+                if stale is not None:
+                    return self._decode(stale, model, source="stale")
+                cache_failed = True
+            if cache_failed:
+                raise CacheUnavailableError("cache service is unavailable")
+        if stale is not None:
+            return self._decode(stale, model, source="stale")
+        raise error
+
     async def _read(self, key: str) -> CacheEntry[Any] | None:
+        failed = False
         try:
             return await self._cache.get(key)
         except CacheUnavailableError:
             raise
-        except Exception as exc:
-            raise CacheUnavailableError("cache service is unavailable") from exc
+        except Exception:
+            failed = True
+        if failed:
+            raise CacheUnavailableError("cache service is unavailable")
+        return None
 
     def _decode(self, entry: CacheEntry[Any], model: type[ResultT], *, source: str) -> ResultT:
         envelope = entry.value
@@ -459,18 +406,20 @@ class MarketDataService:
             raise ProviderValidationError("market data request is invalid")
         try:
             result = model.model_validate(envelope["payload"])
-        except (KeyError, ValueError, TypeError) as exc:
-            raise CacheUnavailableError("cache contained an invalid entry") from exc
-        try:
-            as_of = datetime.fromisoformat(str(envelope["as_of"]))
         except (KeyError, ValueError, TypeError):
-            as_of = self._now().astimezone(UTC)
-        self._metadata.set(
-            ServiceMetadata(
-                source=source,
-                as_of=as_of,
-                cached=True,
-                stale=source == "stale",
+            pass
+        else:
+            try:
+                as_of = datetime.fromisoformat(str(envelope["as_of"]))
+            except (KeyError, ValueError, TypeError):
+                as_of = self._utc_now()
+            self._metadata.set(
+                ServiceMetadata(
+                    source=source,
+                    as_of=as_of,
+                    cached=True,
+                    stale=source == "stale",
+                )
             )
-        )
-        return result
+            return result
+        raise CacheUnavailableError("cache contained an invalid entry")

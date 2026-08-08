@@ -13,8 +13,8 @@ from app.errors import (
     ProviderUnavailableError,
     QuotaExceededError,
 )
-from app.models import Dividend, EODBar, Exchange, Page, Split, Ticker
-from app.services.market_data import MarketDataService
+from app.models import EODBar, Page
+from app.services.market_data import MarketDataService, ServiceTTLs
 
 
 class CompleteProvider:
@@ -27,14 +27,6 @@ class CompleteProvider:
         if self.failure is not None:
             raise self.failure
         return result
-
-    async def list_tickers(self, **params: Any) -> Page[Ticker]:
-        return await self._return("tickers", params, Page(items=(Ticker(symbol="MSFT"),)))
-
-    async def list_exchanges(self, **params: Any) -> Page[Exchange]:
-        return await self._return(
-            "exchanges", params, Page(items=(Exchange(name="NASDAQ", mic="XNAS"),))
-        )
 
     async def latest_eod(self, symbol: str) -> EODBar:
         return await self._return(
@@ -50,70 +42,59 @@ class CompleteProvider:
             Page(items=(EODBar(symbol=symbol, date="2026-08-01", close=1),)),
         )
 
-    async def splits(self, symbol: str | None, **params: Any) -> Page[Split]:
-        return await self._return(
-            "splits",
-            {"symbol": symbol, **params},
-            Page(items=(Split(symbol=symbol or "MSFT", date="2026-01-01", ratio=2),)),
-        )
-
-    async def dividends(self, symbol: str | None, **params: Any) -> Page[Dividend]:
-        return await self._return(
-            "dividends",
-            {"symbol": symbol, **params},
-            Page(items=(Dividend(symbol=symbol or "MSFT", date="2026-01-01", amount=1),)),
-        )
-
 
 @pytest.mark.asyncio
-async def test_service_delegates_normalized_reference_history_and_action_parameters() -> None:
+async def test_service_delegates_normalized_history_parameters() -> None:
     provider = CompleteProvider()
     now = datetime(2026, 8, 7, tzinfo=UTC)
     service = MarketDataService(provider, MemoryCache(), now=lambda: now)
 
-    await service.tickers(search="  msft  ", limit=10, offset=2)
-    await service.exchanges(search="  nasdaq  ", limit=20, cursor="3")
     await service.eod_history(
         "msft", date_from=date(2026, 8, 1), date_to=date(2026, 8, 7), offset=4
     )
-    await service.splits("msft", date_from=date(2026, 1, 1), date_to=date(2026, 2, 1), offset=5)
-    await service.dividends(limit=25)
 
-    assert provider.calls[0] == ("tickers", {"limit": 10, "cursor": "2", "search": "msft"})
-    assert provider.calls[1] == (
-        "exchanges",
-        {"limit": 20, "cursor": "3", "search": "nasdaq"},
-    )
-    assert provider.calls[2][0] == "history"
-    assert provider.calls[3][1]["start_date"] == date(2026, 1, 1)
-    assert provider.calls[4][1]["symbol"] is None
+    assert provider.calls == [
+        (
+            "history",
+            {
+                "symbol": "MSFT",
+                "start_date": date(2026, 8, 1),
+                "end_date": date(2026, 8, 7),
+                "limit": 366,
+                "cursor": None,
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio
-async def test_service_rejects_partial_action_range_before_provider_or_quota_use() -> None:
+async def test_service_negative_caches_not_found_and_rolls_back_reservation() -> None:
     provider = CompleteProvider()
+    provider.failure = ProviderNotFoundError("private upstream response")
     cache = MemoryCache()
     service = MarketDataService(provider, cache)
 
-    with pytest.raises(ValueError, match="provided together"):
-        await service.splits("MSFT", date_from=date(2026, 1, 1))
-
-    assert provider.calls == []
-    assert await cache.current_count(service.quota_key) == 0
-
-
-@pytest.mark.asyncio
-async def test_service_negative_caches_not_found_without_second_provider_call() -> None:
-    provider = CompleteProvider()
-    provider.failure = ProviderNotFoundError("private upstream response")
-    service = MarketDataService(provider, MemoryCache())
-
     with pytest.raises(ProviderNotFoundError):
         await service.latest_eod("MSFT")
+    assert await cache.current_count(service.quota_key) == 0
     with pytest.raises(ProviderNotFoundError, match="not found"):
         await service.latest_eod("MSFT")
 
     assert [name for name, _ in provider.calls] == ["latest"]
+    assert await cache.current_count(service.quota_key) == 0
+
+
+@pytest.mark.asyncio
+async def test_service_rolls_back_provider_failure_without_stale_data() -> None:
+    provider = CompleteProvider()
+    provider.failure = ProviderUnavailableError("timeout")
+    cache = MemoryCache()
+    service = MarketDataService(provider, cache)
+
+    with pytest.raises(ProviderUnavailableError):
+        await service.latest_eod("MSFT")
+
+    assert await cache.current_count(service.quota_key) == 0
 
 
 @pytest.mark.asyncio
@@ -147,6 +128,28 @@ async def test_service_fails_closed_when_distributed_refresh_is_busy_without_sta
 
 
 @pytest.mark.asyncio
+async def test_service_returns_stale_when_refresh_lock_backend_fails() -> None:
+    class BrokenAcquireCache(MemoryCache):
+        fail_acquire = False
+
+        async def acquire_lock(self, key: str, token: str, *, ttl_seconds: int) -> bool:
+            if self.fail_acquire:
+                raise ConnectionError("private cache endpoint")
+            return await super().acquire_lock(key, token, ttl_seconds=ttl_seconds)
+
+    clock = [1000.0]
+    cache = BrokenAcquireCache(clock=lambda: clock[0])
+    provider = CompleteProvider()
+    service = MarketDataService(provider, cache)
+    expected = await service.latest_eod("MSFT")
+    clock[0] += ServiceTTLs().latest + 1
+    cache.fail_acquire = True
+
+    assert await service.latest_eod("MSFT") == expected
+    assert [name for name, _ in provider.calls] == ["latest"]
+
+
+@pytest.mark.asyncio
 async def test_service_wraps_unknown_cache_failures_and_never_calls_provider() -> None:
     class BrokenCache(MemoryCache):
         async def get(self, key: str):
@@ -160,30 +163,66 @@ async def test_service_wraps_unknown_cache_failures_and_never_calls_provider() -
         await service.latest_eod("MSFT")
 
     assert "redis token" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
     assert provider.calls == []
 
 
 @pytest.mark.asyncio
-async def test_service_propagates_provider_failure_when_no_stale_data_exists() -> None:
+async def test_usable_provider_data_remains_counted_when_cache_write_fails() -> None:
+    class BrokenSetCache(MemoryCache):
+        async def set(
+            self, key: str, value: Any, *, ttl_seconds: int, stale_seconds: int = 0
+        ) -> None:
+            del key, value, ttl_seconds, stale_seconds
+            raise CacheUnavailableError("cache down")
+
+    cache = BrokenSetCache()
     provider = CompleteProvider()
-    provider.failure = ProviderUnavailableError("timeout")
-    service = MarketDataService(provider, MemoryCache())
+    service = MarketDataService(provider, cache)
+
+    with pytest.raises(CacheUnavailableError):
+        await service.latest_eod("MSFT")
+
+    assert await cache.current_count(service.quota_key) == 1
+    assert [name for name, _ in provider.calls] == ["latest"]
+
+
+@pytest.mark.asyncio
+async def test_quota_rollback_failure_is_sanitized_and_does_not_hide_provider_failure() -> None:
+    class BrokenReleaseCache(MemoryCache):
+        async def release_quota(self, key: str) -> int:
+            del key
+            raise ConnectionError("private redis detail")
+
+    provider = CompleteProvider()
+    provider.failure = ProviderUnavailableError("safe provider failure")
+    service = MarketDataService(provider, BrokenReleaseCache())
+
+    with pytest.raises(ProviderUnavailableError, match="safe provider failure") as caught:
+        await service.latest_eod("MSFT")
+
+    assert "redis" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_failure_crossing_utc_midnight_rolls_back_the_original_daily_key() -> None:
+    current = [datetime(2026, 8, 7, 23, 59, 59, tzinfo=UTC)]
+    cache = MemoryCache()
+
+    class MidnightProvider(CompleteProvider):
+        async def latest_eod(self, symbol: str) -> EODBar:
+            self.calls = [*self.calls, ("latest", {"symbol": symbol})]
+            current[0] = datetime(2026, 8, 8, tzinfo=UTC)
+            raise ProviderUnavailableError("provider unavailable")
+
+    service = MarketDataService(MidnightProvider(), cache, now=lambda: current[0])
+    old_key = service.quota_key
 
     with pytest.raises(ProviderUnavailableError):
         await service.latest_eod("MSFT")
 
-
-@pytest.mark.asyncio
-async def test_december_quota_window_rolls_to_next_year() -> None:
-    class RecordingCache(MemoryCache):
-        window_seconds: int | None = None
-
-        async def reserve_quota(self, key: str, *, limit: int = 90, window_seconds: int = 86400):
-            self.window_seconds = window_seconds
-            return await super().reserve_quota(key, limit=limit, window_seconds=window_seconds)
-
-    now = datetime(2026, 12, 31, 23, 0, tzinfo=UTC)
-    cache = RecordingCache()
-    await MarketDataService(CompleteProvider(), cache, now=lambda: now).latest_eod("MSFT")
-
-    assert cache.window_seconds == 3600
+    assert await cache.current_count(old_key) == 0
+    assert await cache.current_count(service.quota_key) == 0

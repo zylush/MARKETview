@@ -23,7 +23,7 @@ def verify_app_key(candidate: str | None, expected_sha256: str | None) -> bool:
 class SessionSigner:
     secret: str
     max_age_seconds: int
-    salt: str = "marketstack-session-v1"
+    salt: str = "marketdata-session-v1"
 
     def _serializer(self) -> URLSafeTimedSerializer:
         return URLSafeTimedSerializer(self.secret, salt=self.salt)

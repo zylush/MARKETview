@@ -82,6 +82,29 @@ class MemoryCache:
             self._counters = {**self._counters, key: updated}
             return updated.value
 
+    async def release_quota(self, key: str) -> int:
+        """Atomically roll back one live reservation without allowing a negative count."""
+        async with self._mutex:
+            now = self._clock()
+            existing = self._counters.get(key)
+            if existing is None or existing.expires_at <= now or existing.value <= 0:
+                if existing is not None:
+                    self._counters = {
+                        name: value for name, value in self._counters.items() if name != key
+                    }
+                return 0
+            remaining = existing.value - 1
+            if remaining == 0:
+                self._counters = {
+                    name: value for name, value in self._counters.items() if name != key
+                }
+                return 0
+            self._counters = {
+                **self._counters,
+                key: _Counter(value=remaining, expires_at=existing.expires_at),
+            }
+            return remaining
+
     async def increment_rate(self, key: str, *, window_seconds: int) -> int:
         return await self._increment(key, window_seconds)
 

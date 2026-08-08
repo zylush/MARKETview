@@ -42,7 +42,7 @@ from app.errors import (
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-CSRF_COOKIE = "marketstack_csrf"
+CSRF_COOKIE = "marketdata_csrf"
 logger = logging.getLogger(__name__)
 _SAFE_SEMANTIC_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
@@ -176,7 +176,7 @@ def create_app(
     settings = settings or _default_settings()
     service = service or _UnavailableService()
     secure_cookie = _cookie_secure(settings)
-    cookie_name = str(setting(settings, "session_cookie_name", "marketstack_session"))
+    cookie_name = str(setting(settings, "session_cookie_name", "marketdata_session"))
     max_age = int(setting(settings, "session_max_age_seconds", 3600, "session_max_age"))
     signer = _make_session_signer(
         setting(settings, "session_secret", "", "session_secret_key", "secret_key"),
@@ -214,7 +214,7 @@ def create_app(
                 await result
 
     application = FastAPI(
-        title="Marketstack Dashboard API",
+        title="Market Data Dashboard API",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -438,7 +438,7 @@ def create_app(
         await require_docs_auth(request)
         response = get_swagger_ui_html(
             openapi_url="/openapi.json",
-            title="Marketstack API docs",
+            title="Market Data API docs",
             swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js",
             swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css",
             swagger_favicon_url="/static/favicon.ico",
@@ -450,7 +450,7 @@ def create_app(
         await require_docs_auth(request)
         response = get_redoc_html(
             openapi_url="/openapi.json",
-            title="Marketstack API reference",
+            title="Market Data API reference",
             redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js",
             redoc_favicon_url="/static/favicon.ico",
             with_google_fonts=False,

@@ -4,21 +4,21 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light">
-    <title>Sign in | Marketstack Dashboard</title>
+    <title>Sign in | Market Data Dashboard</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='login.css') }}">
   </head>
   <body>
     <a class="skip-link" href="#login-main">Skip to sign in</a>
     <main id="login-main" class="login-shell">
       <section class="login-panel" aria-labelledby="login-heading">
-        <div class="brand" aria-label="Marketstack Dashboard">
+        <div class="brand" aria-label="Market Data Dashboard">
           <span class="brand-mark" aria-hidden="true">M</span>
-          <span>Marketstack</span>
+          <span>Market Data</span>
         </div>
         <div class="login-intro">
           <p class="eyebrow">Personal market dashboard</p>
           <h1 id="login-heading">Sign in to your workspace</h1>
-          <p>Enter the app password to access market history and company data.</p>
+          <p>Enter the app password to access daily quotes and market history.</p>
         </div>
 
         {% if error %}

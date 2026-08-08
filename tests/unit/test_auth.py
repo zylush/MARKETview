@@ -8,6 +8,12 @@ from itsdangerous import BadSignature, SignatureExpired
 from app.auth import SessionSigner, verify_app_key
 
 
+def test_default_session_signer_uses_market_data_salt() -> None:
+    signer = SessionSigner("a-long-test-secret", max_age_seconds=60)
+
+    assert signer.salt == "marketdata-session-v1"
+
+
 def test_app_key_is_checked_against_its_sha256_digest() -> None:
     digest = hashlib.sha256(b"right-key").hexdigest()
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import json
 from pathlib import Path
@@ -41,9 +43,10 @@ def test_vercel_runtime_never_selects_process_local_cache() -> None:
 def _secure_environment(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
     values = {
         "ENVIRONMENT": "production",
-        "MARKETSTACK_API_KEY": "  runtime-provider-key  ",
-        "MARKETSTACK_BASE_URL": "https://api.marketstack.com/v2/",
-        "MARKETSTACK_TIMEOUT_SECONDS": "7.5",
+        "MARKETDATA_TOKEN": "  runtime-provider-token  ",
+        "MARKETDATA_BASE_URL": "https://api.marketdata.app/v1/",
+        "HTTP_TIMEOUT_SECONDS": "7.5",
+        "MARKETDATA_DAILY_CREDIT_BUDGET": "81",
         "SESSION_SECRET": "a-session-secret-longer-than-32-bytes",
         "APP_ACCESS_KEY_SHA256": "a" * 64,
         "UPSTASH_REDIS_REST_URL": "https://cache-name.upstash.io",
@@ -53,7 +56,6 @@ def _secure_environment(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> No
         "SESSION_COOKIE_SECURE": "true",
         **overrides,
     }
-    monkeypatch.delenv("MARKETSTACK_ACCESS_KEY", raising=False)
     for name, value in values.items():
         monkeypatch.setenv(name, value)
 
@@ -66,14 +68,14 @@ def test_environment_settings_are_unwrapped_only_at_provider_construction(
     class RecordingProvider:
         def __init__(
             self,
-            access_key: str,
+            token: str,
             *,
             base_url: str,
             timeout_seconds: float,
         ) -> None:
             nonlocal captured
             captured = {
-                "access_key": access_key,
+                "token": token,
                 "base_url": base_url,
                 "timeout_seconds": timeout_seconds,
             }
@@ -82,17 +84,18 @@ def test_environment_settings_are_unwrapped_only_at_provider_construction(
             return None
 
     _secure_environment(monkeypatch)
-    monkeypatch.setattr(runtime, "MarketstackProvider", RecordingProvider)
+    monkeypatch.setattr(runtime, "MarketDataAppProvider", RecordingProvider)
 
     settings = Settings(_env_file=None)
     _, service, _ = _runtime_dependencies(settings=settings)
     try:
         assert captured == {
-            "access_key": "runtime-provider-key",
-            "base_url": "https://api.marketstack.com/v2",
+            "token": "runtime-provider-token",
+            "base_url": "https://api.marketdata.app/v1",
             "timeout_seconds": 7.5,
         }
-        assert isinstance(captured["access_key"], str)
+        assert isinstance(captured["token"], str)
+        assert service._daily_credit_budget == 81
     finally:
         asyncio.run(service.aclose())
 
@@ -100,11 +103,11 @@ def test_environment_settings_are_unwrapped_only_at_provider_construction(
 @pytest.mark.parametrize(
     ("override_name", "override_value", "expected_name"),
     [
-        ("MARKETSTACK_BASE_URL", "https://api.marketstack.com/v1", "MARKETSTACK_BASE_URL"),
-        ("MARKETSTACK_API_KEY", "<your-marketstack-api-key>", "MARKETSTACK_API_KEY"),
-        ("MARKETSTACK_API_KEY", "example", "MARKETSTACK_API_KEY"),
-        ("MARKETSTACK_API_KEY", "change-me", "MARKETSTACK_API_KEY"),
-        ("MARKETSTACK_API_KEY", "your-api-key", "MARKETSTACK_API_KEY"),
+        ("MARKETDATA_BASE_URL", "https://api.marketdata.app/v2", "MARKETDATA_BASE_URL"),
+        ("MARKETDATA_TOKEN", "<your-marketdata-token>", "MARKETDATA_TOKEN"),
+        ("MARKETDATA_TOKEN", "example", "MARKETDATA_TOKEN"),
+        ("MARKETDATA_TOKEN", "change-me", "MARKETDATA_TOKEN"),
+        ("MARKETDATA_TOKEN", "your-api-key", "MARKETDATA_TOKEN"),
     ],
 )
 def test_invalid_production_provider_configuration_fails_before_runtime_construction(
@@ -121,7 +124,7 @@ def test_invalid_production_provider_configuration_fails_before_runtime_construc
             provider_constructions += 1
 
     _secure_environment(monkeypatch, **{override_name: override_value})
-    monkeypatch.setattr(runtime, "MarketstackProvider", ForbiddenProvider)
+    monkeypatch.setattr(runtime, "MarketDataAppProvider", ForbiddenProvider)
 
     with pytest.raises((ValidationError, RuntimeError), match=expected_name):
         _runtime_dependencies(settings=Settings(_env_file=None))
@@ -129,7 +132,7 @@ def test_invalid_production_provider_configuration_fails_before_runtime_construc
     assert provider_constructions == 0
 
 
-def test_missing_production_provider_key_fails_before_runtime_construction(
+def test_missing_production_provider_token_fails_before_runtime_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider_constructions = 0
@@ -140,10 +143,32 @@ def test_missing_production_provider_key_fails_before_runtime_construction(
             provider_constructions += 1
 
     _secure_environment(monkeypatch)
-    monkeypatch.delenv("MARKETSTACK_API_KEY")
-    monkeypatch.setattr(runtime, "MarketstackProvider", ForbiddenProvider)
+    monkeypatch.delenv("MARKETDATA_TOKEN")
+    monkeypatch.setattr(runtime, "MarketDataAppProvider", ForbiddenProvider)
 
-    with pytest.raises(ValidationError, match="MARKETSTACK_API_KEY"):
+    with pytest.raises(ValidationError, match="MARKETDATA_TOKEN"):
         _runtime_dependencies(settings=Settings(_env_file=None))
 
+    assert provider_constructions == 0
+
+
+def test_old_marketstack_only_variables_fail_before_provider_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_constructions = 0
+
+    class ForbiddenProvider:
+        def __init__(self, *_: object, **__: object) -> None:
+            nonlocal provider_constructions
+            provider_constructions += 1
+
+    _secure_environment(monkeypatch)
+    monkeypatch.delenv("MARKETDATA_TOKEN")
+    monkeypatch.setenv("MARKETSTACK_API_KEY", "old-provider-secret")
+    monkeypatch.setattr(runtime, "MarketDataAppProvider", ForbiddenProvider)
+
+    with pytest.raises(ValidationError, match="MARKETDATA_TOKEN") as captured:
+        _runtime_dependencies(settings=Settings(_env_file=None))
+
+    assert "old-provider-secret" not in str(captured.value)
     assert provider_constructions == 0
