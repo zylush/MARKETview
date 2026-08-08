@@ -311,6 +311,60 @@ async def test_latest_route_maps_the_real_market_data_candles_boundary(settings)
 
 
 @pytest.mark.asyncio
+async def test_history_weekend_end_is_normalized_only_at_the_provider_boundary(settings) -> None:
+    upstream_requests: list[httpx.Request] = []
+    candle_time = int(datetime(2026, 8, 7, tzinfo=UTC).timestamp())
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        upstream_requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "s": "ok",
+                "o": [201.0],
+                "h": [205.0],
+                "l": [199.0],
+                "c": [204.5],
+                "v": [12_345],
+                "t": [candle_time],
+            },
+        )
+
+    upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
+    provider = MarketDataAppProvider("provider-only-secret", client=upstream_client)
+    shared_cache = MemoryCache()
+    service = MarketDataService(provider, shared_cache)
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=shared_cache),
+        raise_app_exceptions=False,
+    )
+    try:
+        async with httpx.AsyncClient(
+            transport=transport, base_url=settings.allowed_origin
+        ) as local:
+            response = await local.get(
+                "/api/v1/eod/history/AAPL?date_from=2025-08-08&date_to=2026-08-08&limit=1000",
+                headers={"X-App-Key": "correct horse battery staple"},
+            )
+    finally:
+        await upstream_client.aclose()
+
+    assert response.status_code == 200
+    assert response.json()["data"][0]["date"] == "2026-08-07"
+    assert response.json()["meta"]["pagination"] == {
+        "next_cursor": None,
+        "total": 1,
+    }
+    assert len(upstream_requests) == 1
+    assert dict(upstream_requests[0].url.params) == {
+        "from": "2025-08-08",
+        "to": "2026-08-07",
+        "adjustsplits": "false",
+    }
+    assert await shared_cache.current_count(service.quota_key) == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("upstream_status", "public_status", "public_code"),
     [

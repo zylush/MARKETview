@@ -99,6 +99,11 @@ class MarketDataService:
         snapshot = current or self._utc_now()
         return max(1, int((self._next_reset(snapshot) - snapshot).total_seconds()))
 
+    @staticmethod
+    def _provider_history_end(public_end: date) -> date:
+        weekend_days = max(0, public_end.weekday() - 4)
+        return public_end - timedelta(days=weekend_days)
+
     async def aclose(self) -> None:
         """Close provider/cache resources while respecting their own ownership semantics."""
         for resource in (self._provider, self._cache):
@@ -137,12 +142,21 @@ class MarketDataService:
         checked_start, checked_end = validate_date_range(start_date, end_date)
         checked_limit = validate_limit(limit)
         checked_cursor = validate_cursor(offset if offset is not None else cursor)
+        provider_end = self._provider_history_end(checked_end)
+        if provider_end < checked_start:
+            now = self._utc_now()
+            self._metadata.set(
+                ServiceMetadata(source="local", as_of=now, cached=False, stale=False)
+            )
+            return self._paginate_history(
+                Page[EODBar](), limit=checked_limit, cursor=checked_cursor
+            )
         key = self._keys.build(
             "eod_history",
             {
                 "symbol": checked_symbol,
                 "start": checked_start,
-                "end": checked_end,
+                "end": provider_end,
             },
         )
         ttl = (
@@ -157,7 +171,7 @@ class MarketDataService:
             lambda: self._provider.eod_history(
                 checked_symbol,
                 start_date=checked_start,
-                end_date=checked_end,
+                end_date=provider_end,
                 limit=_MAX_HISTORY_BARS,
                 cursor=None,
             ),

@@ -67,6 +67,9 @@ Both supported operations call `/stocks/candles/D/{symbol}/` beneath the upstrea
 | History | `from=YYYY-MM-DD&to=YYYY-MM-DD&adjustsplits=false` |
 
 The explicit `adjustsplits=false` setting means returned prices are unadjusted for stock splits.
+For history, a public Saturday or Sunday `date_to` is normalized to the preceding Friday only at
+the provider/cache boundary. This avoids invalid non-trading upper bounds and makes equivalent
+Friday/weekend ranges share one cache entry without changing the public request contract.
 HTTP `200` and `203` are successful. HTTP `204` and documented no-data payloads map to not found.
 The adapter validates the provider's parallel open, high, low, close, volume, and timestamp arrays
 before creating immutable normalized bars. History is ordered chronologically and paginated
