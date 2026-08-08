@@ -23,6 +23,24 @@ in a signed Secure, HttpOnly, SameSite=Strict cookie. Upstash holds cache entrie
 distributed locks, and monthly quota accounting. Nothing depends on writable local storage,
 background workers, shared process memory, or instance-local locks.
 
+## Version and credential boundaries
+
+| Boundary | Value | Purpose |
+| --- | --- | --- |
+| Application API | `/api/v1/*` | Stable client-facing routes owned by this service. |
+| Provider API | `https://api.marketstack.com/v2` | Exact production root for outbound Marketstack requests. |
+| Cache schema | `cache_schema_version = "v1"` | Internal Redis key/data compatibility marker; independent of both HTTP API versions. |
+
+`MARKETSTACK_API_KEY` is the canonical outbound provider credential. The deprecated
+`MARKETSTACK_ACCESS_KEY` name is supported only for migration and should be removed; conflicting
+definitions must fail closed. The provider key is unwrapped only at the provider boundary and is
+sent to Marketstack as exactly one URL-encoded `access_key` query parameter.
+
+`APP_ACCESS_KEY_SHA256` belongs to this application instead. It is the stored digest of the raw
+application access value that clients present in `X-App-Key` or at login. Neither credential can
+substitute for the other: the provider key must never be sent as `X-App-Key` or exposed to browser
+code, and the application access value must never be forwarded to Marketstack.
+
 ## Market-data request flow
 
 1. Middleware assigns a request ID and applies host/origin/header policy.
@@ -90,6 +108,24 @@ reject missing secrets, insecure cookies, or incomplete origin/host policy. Oper
 start with `/health` and `/api/v1/usage`, which consume no Marketstack calls. Tests replace Redis
 and provider transports; browser tests are separately gated. A live smoke is manual and limited to
 one bounded request after checking remaining budget.
+
+Production configuration must resolve the upstream root to exactly
+`https://api.marketstack.com/v2`; `/v1`, the host root, extra paths, queries, fragments, alternate
+hosts, and insecure HTTP are rejected. Controlled test and development environments may use an
+explicit mock v2 URL. Startup and CI never make a provider call automatically.
+
+The opt-in live smoke sequence is `GET /health`, authenticated `GET /api/v1/usage`, then—only
+after accepting a possible one-call charge—authenticated `GET /api/v1/tickers?limit=1`. The first
+two calls do not contact Marketstack, and `/api/v1/usage` reports local Redis quota accounting; it
+does not verify the provider key. The ticker call makes at most one intended provider attempt on a
+cache miss.
+
+For a Vercel v2 migration, remove any `/v1` `MARKETSTACK_BASE_URL`; preferably omit the variable
+to use the safe default, or set the exact v2 root. Keep `MARKETSTACK_API_KEY`, remove the deprecated
+alias after migration, ensure the key is configured in each required Vercel environment scope,
+and redeploy after changes. Rotate the provider key immediately if it ever appeared in
+`X-App-Key`, browser code, logs, source control, or a public artifact. Operators should inspect
+variable names and URL categories only, never secret values.
 
 ## Extension policy
 

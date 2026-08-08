@@ -14,10 +14,18 @@ class InputValidationError(MarketDataError, ValueError):
 class ProviderError(MarketDataError):
     code = "provider_error"
     status_code = 502
+    upstream_status: int | None = None
+    semantic_code = "unknown"
 
 
 class ProviderAuthenticationError(ProviderError):
     code = "provider_authentication_error"
+
+
+class ProviderAccessRestrictedError(ProviderError):
+    """The provider credentials are valid but the requested capability is unavailable."""
+
+    code = "provider_access_restricted"
 
 
 class ProviderRateLimitError(ProviderError):

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 import re
 import uuid
 from dataclasses import replace
@@ -7,15 +9,22 @@ from datetime import date, timedelta
 
 import httpx
 import pytest
+from pydantic import SecretStr
 
+import app.main as main_module
 from api.index import app as serverless_app
+from app.cache.memory import MemoryCache
 from app.errors import (
     CacheUnavailableError,
+    ProviderAccessRestrictedError,
+    ProviderAuthenticationError,
     ProviderTimeoutError,
     ProviderUnavailableError,
     QuotaExceededError,
 )
 from app.main import create_app
+from app.providers.marketstack import MarketstackProvider
+from app.services.market_data import MarketDataService
 
 
 async def _csrf(client: httpx.AsyncClient) -> str:
@@ -46,10 +55,265 @@ def test_serverless_entrypoint_builds_a_fastapi_application() -> None:
     assert serverless_app.title == "Marketstack Dashboard API"
 
 
+def test_secret_session_setting_is_unwrapped_only_for_signer_construction(
+    settings,
+    service,
+    cache,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_secret = "session-secret-visible-only-to-signer"
+    captured_secret: str | None = None
+
+    class RecordingSigner:
+        def __init__(self, secret: str, *, max_age_seconds: int) -> None:
+            nonlocal captured_secret
+            del max_age_seconds
+            captured_secret = secret
+
+    monkeypatch.setattr(main_module, "SessionSigner", RecordingSigner)
+    protected = replace(settings, session_secret=SecretStr(session_secret))
+
+    application = create_app(settings=protected, service=service, cache=cache)
+
+    assert application.state.settings is protected
+    assert captured_secret == session_secret
+    assert session_secret not in repr(application.state.settings)
+
+
 @pytest.mark.asyncio
-async def test_api_rejects_missing_or_wrong_app_key(client: httpx.AsyncClient) -> None:
+async def test_session_secret_is_absent_from_responses_and_logs(
+    settings,
+    cache,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session_secret = "session-secret-must-never-leak"
+
+    class FailingService:
+        async def tickers(self, **params):
+            del params
+            raise ProviderUnavailableError(f"failure containing {session_secret}")
+
+    protected = replace(settings, session_secret=SecretStr(session_secret))
+    caplog.set_level(logging.WARNING, logger="app.main")
+    transport = httpx.ASGITransport(
+        app=create_app(settings=protected, service=FailingService(), cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=protected.allowed_origin) as client:
+        csrf_token = await _csrf(client)
+        login = await client.post(
+            "/login",
+            data={"password": "correct horse battery staple", "csrf_token": csrf_token},
+            headers={"Origin": protected.allowed_origin},
+            follow_redirects=False,
+        )
+        response = await client.get("/api/v1/tickers")
+
+    assert login.status_code == 303
+    assert response.status_code == 502
+    assert session_secret not in login.text
+    assert session_secret not in str(login.headers)
+    assert session_secret not in response.text
+    assert session_secret not in str(response.headers)
+    assert session_secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_api_rejects_missing_or_wrong_app_key_without_service_calls(
+    client: httpx.AsyncClient, service
+) -> None:
     assert (await client.get("/api/v1/tickers")).status_code == 401
     assert (await client.get("/api/v1/tickers", headers={"X-App-Key": "wrong"})).status_code == 401
+    assert service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_provider_key_cannot_authorize_the_application_boundary(
+    settings, service, cache
+) -> None:
+    application_key = "application-only-key"
+    provider_key = "provider-only-key"
+    isolated = replace(
+        settings,
+        app_access_key_sha256=hashlib.sha256(application_key.encode()).hexdigest(),
+    )
+    transport = httpx.ASGITransport(
+        app=create_app(settings=isolated, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=isolated.allowed_origin) as client:
+        response = await client.get(
+            "/api/v1/tickers",
+            headers={"X-App-Key": provider_key},
+        )
+
+    assert response.status_code == 401
+    assert service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_api_v1_tickers_calls_the_marketstack_v2_boundary(settings, cache) -> None:
+    requests: tuple[httpx.Request, ...] = ()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests = (*requests, request)
+        return httpx.Response(
+            200,
+            json={
+                "pagination": {"limit": 1, "offset": 0, "count": 1, "total": 1},
+                "data": [{"symbol": "AAPL", "name": "Apple Inc."}],
+            },
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    provider = MarketstackProvider(
+        "provider-boundary-key",
+        base_url="https://api.marketstack.com/v2",
+        client=http_client,
+    )
+    service = MarketDataService(provider, MemoryCache())
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with (
+        httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as client,
+        http_client,
+    ):
+        response = await client.get(
+            "/api/v1/tickers?limit=1",
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == [
+        {
+            "symbol": "AAPL",
+            "name": "Apple Inc.",
+            "exchange_mic": None,
+            "exchange_name": None,
+            "has_intraday": None,
+            "has_eod": None,
+        }
+    ]
+    assert len(requests) == 1
+    assert requests[0].url.path == "/v2/tickers"
+    assert requests[0].url.params.get_list("access_key") == ["provider-boundary-key"]
+
+
+@pytest.mark.asyncio
+async def test_usage_is_local_quota_accounting_without_a_provider_call(settings, cache) -> None:
+    class NoCallProvider:
+        def __getattr__(self, name: str):
+            raise AssertionError(f"usage must not access provider operation {name}")
+
+    quota_cache = MemoryCache()
+    service = MarketDataService(NoCallProvider(), quota_cache, monthly_budget=90)
+    for _ in range(7):
+        assert (
+            await quota_cache.reserve_quota(
+                service.quota_key,
+                limit=90,
+                window_seconds=31 * 86400,
+            )
+            is not None
+        )
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as client:
+        response = await client.get(
+            "/api/v1/usage",
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "requests_used": 7,
+        "requests_limit": 90,
+        "requests_remaining": 83,
+    }
+    assert response.json()["meta"]["source"] == "local"
+
+
+@pytest.mark.asyncio
+async def test_rejected_provider_key_returns_sanitized_upstream_error_and_safe_diagnostics(
+    settings,
+    cache,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    leaked_key = "provider-key-must-not-leak"
+    leaked_url = f"https://api.marketstack.com/v2/tickers?access_key={leaked_key}"
+
+    class RejectingService:
+        async def tickers(self, **params):
+            del params
+            failure = ProviderAuthenticationError(f"rejected {leaked_url}")
+            failure.upstream_status = 401
+            failure.semantic_code = "invalid_access_key"
+            raise failure
+
+    caplog.set_level(logging.WARNING, logger="app.main")
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=RejectingService(), cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as client:
+        response = await client.get(
+            "/api/v1/tickers",
+            headers={
+                "X-App-Key": "correct horse battery staple",
+                "X-Request-ID": "7afef2d7-902d-4298-a6ab-82c86bc57474",
+            },
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"] == {
+        "code": "UPSTREAM_AUTHENTICATION_FAILED",
+        "message": "the market data provider rejected its credentials",
+    }
+    assert leaked_key not in response.text
+    assert leaked_url not in response.text
+    records = [
+        record for record in caplog.records if record.message == "market_data_request_failed"
+    ]
+    assert len(records) == 1
+    record = records[0]
+    assert record.request_id == "7afef2d7-902d-4298-a6ab-82c86bc57474"
+    assert record.exception_category == "ProviderAuthenticationError"
+    assert record.upstream_status == 401
+    assert record.semantic_code == "invalid_access_key"
+    assert leaked_key not in caplog.text
+    assert leaked_url not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_provider_plan_restriction_is_distinct_and_sanitized(settings, cache) -> None:
+    private_detail = "private-provider-plan-and-account-detail"
+
+    class RestrictedService:
+        async def tickers(self, **params):
+            del params
+            raise ProviderAccessRestrictedError(private_detail)
+
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=RestrictedService(), cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as client:
+        response = await client.get(
+            "/api/v1/tickers",
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"] == {
+        "code": "UPSTREAM_ACCESS_RESTRICTED",
+        "message": "the market data provider does not permit this request",
+    }
+    assert private_detail not in response.text
 
 
 @pytest.mark.asyncio

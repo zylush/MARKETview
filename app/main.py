@@ -3,6 +3,8 @@ from __future__ import annotations
 # mypy: disallow_untyped_decorators=False
 import hmac
 import inspect
+import logging
+import re
 import secrets
 import uuid
 from collections.abc import AsyncIterator
@@ -21,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from itsdangerous import BadSignature, SignatureExpired
 from jinja2 import pass_context
+from pydantic import SecretStr
 
 from app.api import build_api_router, envelope
 from app.auth import SessionSigner, verify_app_key
@@ -29,6 +32,8 @@ from app.errors import (
     CacheUnavailableError,
     InputValidationError,
     MarketDataError,
+    ProviderAccessRestrictedError,
+    ProviderAuthenticationError,
     ProviderNotFoundError,
     ProviderRateLimitError,
     ProviderUnavailableError,
@@ -38,6 +43,8 @@ from app.errors import (
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CSRF_COOKIE = "marketstack_csrf"
+logger = logging.getLogger(__name__)
+_SAFE_SEMANTIC_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 class _UnavailableService:
@@ -81,6 +88,37 @@ def _error_response(request: Request, status_code: int, code: str, message: str)
         },
         headers={"X-Request-ID": request_id},
     )
+
+
+def _safe_diagnostic(value: object, *, numeric: bool = False) -> int | str | None:
+    if numeric:
+        return value if isinstance(value, int) and 100 <= value <= 599 else None
+    return value if isinstance(value, str) and _SAFE_SEMANTIC_CODE.fullmatch(value) else None
+
+
+def _log_market_data_failure(request: Request, exc: MarketDataError) -> None:
+    logger.warning(
+        "market_data_request_failed",
+        extra={
+            "request_id": getattr(request.state, "request_id", "unavailable"),
+            "exception_category": type(exc).__name__,
+            "upstream_status": _safe_diagnostic(
+                getattr(exc, "upstream_status", None), numeric=True
+            ),
+            "semantic_code": _safe_diagnostic(getattr(exc, "semantic_code", None)),
+        },
+    )
+
+
+def _make_session_signer(secret_value: object, max_age_seconds: int) -> SessionSigner:
+    secret = (
+        secret_value.get_secret_value()
+        if isinstance(secret_value, SecretStr)
+        else str(secret_value)
+    )
+    if len(secret) < 16:
+        raise ValueError("session secret must contain at least 16 characters")
+    return SessionSigner(secret, max_age_seconds=max_age_seconds)
 
 
 def _cookie_secure(settings: object) -> bool:
@@ -140,10 +178,10 @@ def create_app(
     secure_cookie = _cookie_secure(settings)
     cookie_name = str(setting(settings, "session_cookie_name", "marketstack_session"))
     max_age = int(setting(settings, "session_max_age_seconds", 3600, "session_max_age"))
-    secret = str(setting(settings, "session_secret", "", "session_secret_key", "secret_key"))
-    if len(secret) < 16:
-        raise ValueError("session secret must contain at least 16 characters")
-    signer = SessionSigner(secret, max_age_seconds=max_age)
+    signer = _make_session_signer(
+        setting(settings, "session_secret", "", "session_secret_key", "secret_key"),
+        max_age,
+    )
     allowed_origin = _origin(settings)
     configured_hosts = setting(settings, "allowed_hosts", None)
     if isinstance(configured_hosts, str):
@@ -235,8 +273,15 @@ def create_app(
 
     @application.exception_handler(MarketDataError)
     async def market_data_exception(request: Request, exc: MarketDataError) -> JSONResponse:
+        _log_market_data_failure(request, exc)
         if isinstance(exc, (QuotaExceededError, ProviderRateLimitError)):
             code, message = "UPSTREAM_QUOTA_EXHAUSTED", "upstream request quota is exhausted"
+        elif isinstance(exc, ProviderAuthenticationError):
+            code = "UPSTREAM_AUTHENTICATION_FAILED"
+            message = "the market data provider rejected its credentials"
+        elif isinstance(exc, ProviderAccessRestrictedError):
+            code = "UPSTREAM_ACCESS_RESTRICTED"
+            message = "the market data provider does not permit this request"
         elif isinstance(exc, CacheUnavailableError):
             code, message = "CACHE_UNAVAILABLE", "the cache service is unavailable"
         elif isinstance(exc, ProviderNotFoundError):

@@ -23,12 +23,13 @@ def _runtime_dependencies(settings: Settings | None = None) -> tuple[object, obj
     else:
         raise RuntimeError("a shared cache is required outside local and test environments")
 
-    if not settings.marketstack_api_key:
+    marketstack_api_key = settings.marketstack_api_key.get_secret_value()
+    if not marketstack_api_key:
         if not settings.is_local_environment:
             raise RuntimeError("MARKETSTACK_API_KEY is required")
         return settings, object(), cache
     provider = MarketstackProvider(
-        settings.marketstack_api_key,
+        marketstack_api_key,
         base_url=settings.marketstack_base_url,
         timeout_seconds=settings.marketstack_timeout_seconds,
     )

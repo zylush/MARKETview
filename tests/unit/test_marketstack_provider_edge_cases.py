@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 from typing import Any
 
@@ -7,6 +8,7 @@ import httpx
 import pytest
 
 from app.errors import (
+    ProviderAccessRestrictedError,
     ProviderAuthenticationError,
     ProviderError,
     ProviderNotFoundError,
@@ -27,27 +29,69 @@ def test_provider_requires_an_access_key() -> None:
         MarketstackProvider("")
 
 
+@pytest.mark.parametrize(
+    "access_key",
+    [
+        "   ",
+        "<your-marketstack-api-key>",
+        '"<your-marketstack-api-key>"',
+        "replace-me",
+        "key\nwith-control",
+        "key\n",
+    ],
+)
+def test_provider_rejects_invalid_access_keys_before_network(access_key: str) -> None:
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"data": []})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(ValueError, match="access key") as caught:
+            MarketstackProvider(access_key, client=client)
+    finally:
+        asyncio.run(client.aclose())
+
+    assert access_key not in str(caught.value)
+    assert calls == 0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "code", "expected"),
+    ("status", "error", "expected"),
     [
-        (403, "", ProviderAuthenticationError),
-        (404, "", ProviderNotFoundError),
-        (400, "", ProviderValidationError),
-        (500, "", ProviderUnavailableError),
-        (418, "", ProviderError),
-        (200, "invalid_access_key", ProviderAuthenticationError),
-        (200, "usage_limit_reached", ProviderRateLimitError),
-        (200, "invalid_api_function", ProviderNotFoundError),
-        (200, "validation_error", ProviderValidationError),
-        (200, "internal_error", ProviderUnavailableError),
+        (401, {}, ProviderAuthenticationError),
+        (403, {}, ProviderAccessRestrictedError),
+        (404, {}, ProviderUnavailableError),
+        (400, {}, ProviderUnavailableError),
+        (500, {}, ProviderUnavailableError),
+        (418, {}, ProviderError),
+        (200, {"code": "missing_access_key"}, ProviderAuthenticationError),
+        (200, {"code": "invalid_access_key"}, ProviderAuthenticationError),
+        (200, {"type": "inactive_user"}, ProviderAuthenticationError),
+        (200, {"code": "usage_limit_reached"}, ProviderRateLimitError),
+        (200, {"type": "rate_limit_reached"}, ProviderRateLimitError),
+        (200, {"type": "too_many_requests"}, ProviderRateLimitError),
+        (
+            403,
+            {"code": 104, "type": "function_access_restricted"},
+            ProviderAccessRestrictedError,
+        ),
+        (200, {"type": "https_access_restricted"}, ProviderAccessRestrictedError),
+        (200, {"code": "invalid_api_function"}, ProviderUnavailableError),
+        (200, {"code": "404_not_found"}, ProviderUnavailableError),
+        (200, {"code": "validation_error"}, ProviderValidationError),
+        (200, {"code": "internal_error"}, ProviderUnavailableError),
     ],
 )
 async def test_provider_maps_http_and_payload_error_taxonomy(
-    status: int, code: str, expected: type[Exception]
+    status: int, error: dict[str, object], expected: type[ProviderError]
 ) -> None:
     def handler(_: httpx.Request) -> httpx.Response:
-        payload = {"error": {"code": code, "message": "secret details"}}
+        payload = {"error": {**error, "message": "secret details"}}
         return httpx.Response(status, json=payload)
 
     provider, client = await _provider_for(handler)
@@ -58,6 +102,95 @@ async def test_provider_maps_http_and_payload_error_taxonomy(
         await client.aclose()
 
     assert "secret details" not in str(caught.value)
+    assert isinstance(caught.value, ProviderError)
+    assert caught.value.upstream_status == status
+    assert caught.value.status_code == expected.status_code
+    assert caught.value.semantic_code not in {"secret", "secret details"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "response_kwargs", "expected"),
+    [
+        (401, {"content": b"<html>private</html>"}, ProviderAuthenticationError),
+        (429, {"json": ["private"]}, ProviderRateLimitError),
+        (422, {"content": b""}, ProviderValidationError),
+    ],
+)
+async def test_http_status_taxonomy_survives_malformed_error_bodies(
+    status: int,
+    response_kwargs: dict[str, object],
+    expected: type[ProviderError],
+) -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, **response_kwargs)
+
+    provider, client = await _provider_for(handler)
+    try:
+        with pytest.raises(expected) as caught:
+            await provider.latest_eod("MSFT")
+    finally:
+        await client.aclose()
+
+    assert caught.value.status_code == expected.status_code
+    assert caught.value.upstream_status == status
+    assert "private" not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_known_validation_semantic_wins_over_generic_http_400_fallback() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"error": {"type": "validation_error", "message": "private details"}},
+        )
+
+    provider, client = await _provider_for(handler)
+    try:
+        with pytest.raises(ProviderValidationError) as caught:
+            await provider.latest_eod("MSFT")
+    finally:
+        await client.aclose()
+
+    assert caught.value.upstream_status == 400
+    assert caught.value.semantic_code == "validation_error"
+
+
+@pytest.mark.asyncio
+async def test_unknown_upstream_semantic_is_not_exposed_for_runtime_logging() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={"error": {"type": "private_semantic_sentinel"}},
+        )
+
+    provider, client = await _provider_for(handler)
+    try:
+        with pytest.raises(ProviderUnavailableError) as caught:
+            await provider.latest_eod("MSFT")
+    finally:
+        await client.aclose()
+
+    assert caught.value.semantic_code == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_provider_does_not_retry_transport_failures() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise httpx.ConnectError("private endpoint", request=request)
+
+    provider, client = await _provider_for(handler)
+    try:
+        with pytest.raises(ProviderUnavailableError):
+            await provider.latest_eod("MSFT")
+    finally:
+        await client.aclose()
+
+    assert calls == 1
 
 
 @pytest.mark.asyncio
