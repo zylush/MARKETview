@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import math
 from dataclasses import replace
@@ -8,7 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from app.research.control import AccessionLease, GenerationStageRecord
+from app.research.control import (
+    AccessionLease,
+    GenerationStageRecord,
+    IngestionFailureStage,
+    IngestionStageError,
+)
 from app.research.deadline import RequestDeadline
 from app.research.domain import (
     CorpusDescriptor,
@@ -113,6 +119,18 @@ class RecordingDocumentEmbedder(DeterministicEmbedder):
     ) -> tuple[EmbeddingVector, ...]:
         self.calls = (*self.calls, texts)
         return await super().embed_documents(texts, deadline=deadline)
+
+
+class FailingDocumentEmbedder(DeterministicEmbedder):
+    async def embed_documents(
+        self,
+        texts: tuple[str, ...],
+        *,
+        deadline: RequestDeadline,
+    ) -> tuple[EmbeddingVector, ...]:
+        del texts
+        deadline.raise_if_expired()
+        raise RuntimeError("private filing text and provider response")
 
 
 class PublishDuringLeaseAcquisitionControl(InMemoryResearchControlPlane):
@@ -299,6 +317,22 @@ class FailFirstAbortedCleanControl(InMemoryResearchControlPlane):
         )
 
 
+class ReleaseFailingControl(InMemoryResearchControlPlane):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_release = False
+
+    async def release_generation_lease(
+        self,
+        *,
+        lease: AccessionLease,
+        deadline: RequestDeadline,
+    ) -> bool:
+        if self.fail_release:
+            raise RuntimeError("private release credential and provider response")
+        return await super().release_generation_lease(lease=lease, deadline=deadline)
+
+
 def filing(
     *,
     symbol: str = "AAPL",
@@ -416,6 +450,110 @@ async def test_ingestion_is_idempotent_and_publishes_verified_manifest() -> None
 
 
 @pytest.mark.asyncio
+async def test_embedding_failure_is_stage_typed_and_never_stages_partial_vectors() -> None:
+    store = InMemoryVectorStore()
+    document = filing(text="private filing text")
+
+    with pytest.raises(IngestionStageError) as caught:
+        await service(store=store, embedder=FailingDocumentEmbedder()).ingest(document)
+
+    assert caught.value.stage is IngestionFailureStage.EMBEDDING
+    assert store.chunks == ()
+    rendered = repr(caught.value) + str(caught.value)
+    pending: list[BaseException] = [caught.value]
+    while pending:
+        current = pending.pop()
+        traceback = current.__traceback__
+        while traceback is not None:
+            if traceback.tb_frame.f_code.co_filename.endswith("service.py"):
+                for value in traceback.tb_frame.f_locals.values():
+                    if not inspect.iscoroutine(value):
+                        rendered += repr(value)
+            traceback = traceback.tb_next
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    assert "private filing text" not in rendered
+    assert "provider response" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_failed", [False, True])
+async def test_release_failure_never_masks_embedding_stage_or_leaks_traceback_locals(
+    retry_failed: bool,
+) -> None:
+    control = ReleaseFailingControl()
+    store = InMemoryVectorStore()
+    document = filing(text="private filing body for release precedence")
+    if retry_failed:
+        with pytest.raises(IngestionStageError):
+            await service(
+                store=store,
+                control=control,
+                embedder=FailingDocumentEmbedder(),
+            ).ingest(document)
+    control.fail_release = True
+
+    with pytest.raises(IngestionStageError) as caught:
+        await service(
+            store=store,
+            control=control,
+            embedder=FailingDocumentEmbedder(),
+        ).ingest(document, retry_failed=retry_failed)
+
+    assert caught.value.stage is IngestionFailureStage.EMBEDDING
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    rendered = repr(caught.value) + str(caught.value)
+    traceback = caught.value.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_filename.endswith("service.py"):
+            rendered += "".join(
+                repr(value)
+                for value in traceback.tb_frame.f_locals.values()
+                if not inspect.iscoroutine(value)
+            )
+        traceback = traceback.tb_next
+    assert "private filing body" not in rendered
+    assert "private release credential" not in rendered
+    assert "provider response" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_failed_retry_requires_cleaned_control_and_absent_vector_generation() -> None:
+    control = InMemoryResearchControlPlane()
+    store = InMemoryVectorStore()
+    document = filing(text="recoverable filing")
+
+    with pytest.raises(IngestionStageError):
+        await service(
+            store=store,
+            control=control,
+            embedder=FailingDocumentEmbedder(),
+        ).ingest(document)
+
+    recovered = await service(store=store, control=control).ingest(
+        document,
+        retry_failed=True,
+    )
+
+    assert recovered.outcome == "created"
+    assert recovered.inserted_count == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_retry_fails_closed_when_no_cleaned_generation_exists() -> None:
+    embedder = RecordingDocumentEmbedder()
+
+    with pytest.raises(IngestionStageError) as caught:
+        await service(embedder=embedder).ingest(filing(), retry_failed=True)
+
+    assert caught.value.stage is IngestionFailureStage.REDIS_PUBLICATION
+    assert embedder.calls == ()
+
+
+@pytest.mark.asyncio
 async def test_unchanged_ingestion_replay_skips_document_embedding() -> None:
     store = InMemoryVectorStore()
     control = InMemoryResearchControlPlane()
@@ -448,9 +586,10 @@ async def test_lease_denied_ingestion_skips_document_embedding() -> None:
     assert held_lease is not None
     embedder = RecordingDocumentEmbedder()
 
-    with pytest.raises(RuntimeError, match="already being ingested"):
+    with pytest.raises(IngestionStageError) as caught:
         await service(control=control, embedder=embedder).ingest(document)
 
+    assert caught.value.stage is IngestionFailureStage.REDIS_PUBLICATION
     assert embedder.calls == ()
 
 
@@ -529,8 +668,9 @@ async def test_retry_recovers_aborted_generation_after_vector_abort_interruption
     old_active = control.manifests
     store.arm_failure()
 
-    with pytest.raises(RuntimeError, match="vector abort interruption"):
+    with pytest.raises(IngestionStageError) as caught:
         await core.ingest(revised)
+    assert caught.value.stage is IngestionFailureStage.CLEANUP
 
     assert control.manifests == old_active
     recovered = await core.ingest(revised)
@@ -560,8 +700,9 @@ async def test_retry_recovers_aborted_generation_after_clean_marker_interruption
         return await original_verify(manifest, deadline=deadline)
 
     store.verify_generation = verify_once  # type: ignore[method-assign]
-    with pytest.raises(ValueError, match="failed verification"):
+    with pytest.raises(IngestionStageError) as caught:
         await core.ingest(document)
+    assert caught.value.stage is IngestionFailureStage.VECTOR_VERIFICATION
 
     recovered = await core.ingest(document)
     assert recovered.outcome == "created"
@@ -582,8 +723,9 @@ async def test_query_only_core_does_not_construct_or_access_an_ingestion_chunker
     with pytest.raises(ResearchCorpusUnavailableError):
         await core.query_research("AAPL", "What supply risk was disclosed?")
 
-    with pytest.raises(ValueError, match="ingestion chunker is not configured"):
+    with pytest.raises(IngestionStageError) as caught:
         await core.ingest(filing())
+    assert caught.value.stage is IngestionFailureStage.PARSING_CHUNKING
 
 
 @pytest.mark.asyncio

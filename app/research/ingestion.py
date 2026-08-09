@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import secrets
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Protocol
 
+from app.research.control import (
+    IngestionFailureStage,
+    IngestionRetryClaim,
+    IngestionRetryResult,
+    IngestionRetryState,
+    IngestionStageError,
+)
 from app.research.deadline import RequestDeadline
 from app.research.domain import (
     FilingDiscoveryRequest,
@@ -29,6 +38,7 @@ class CoreIngestor(Protocol):
         document: FilingDocument,
         *,
         deadline: RequestDeadline | None = None,
+        retry_failed: bool = False,
     ) -> IngestOutcome: ...
 
 
@@ -38,8 +48,29 @@ _ACCESSION = re.compile(r"^\d{10}-\d{2}-\d{6}$")
 _ALLOWED_FORMS = frozenset({"10-K", "10-K/A", "10-Q", "10-Q/A", "8-K", "8-K/A"})
 
 
+class ResearchIngestionRetryError(RuntimeError):
+    """Sanitized refusal for unavailable, stale, or conflicting retry state."""
+
+    def __init__(self) -> None:
+        super().__init__("research ingestion retry state is unavailable")
+
+
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _checkpoint_json(record: IngestionCheckpointStore.Record) -> str:
+    return json.dumps(
+        {
+            "complete": record.complete,
+            "cursor_digest": record.cursor_digest,
+            "failed_count": record.failed_count,
+            "job_digest": record.job_digest,
+            "processed_count": record.processed_count,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _validate_symbol(value: object) -> str:
@@ -74,6 +105,7 @@ class ResearchIngestionRequest:
     date_to: date
     limit: int
     apply: bool = False
+    retry_failed: bool = False
 
     def __post_init__(self) -> None:
         symbol = _validate_symbol(self.symbol)
@@ -87,6 +119,8 @@ class ResearchIngestionRequest:
             raise ValueError("count allowlist is invalid")
         if type(self.apply) is not bool:
             raise ValueError("apply flag is invalid")
+        if type(self.retry_failed) is not bool or (self.retry_failed and not self.apply):
+            raise ValueError("failed retry requires apply")
         object.__setattr__(self, "symbol", symbol)
         object.__setattr__(self, "cik", cik)
         object.__setattr__(self, "filing_types", forms)
@@ -180,6 +214,56 @@ class IngestionCheckpointStore(Protocol):
 
     async def load(self, job_digest: str, *, deadline: RequestDeadline) -> Record | None: ...
     async def save(self, record: Record, *, deadline: RequestDeadline) -> None: ...
+    async def load_retry_snapshot(
+        self, job_digest: str, *, deadline: RequestDeadline
+    ) -> RetryCheckpointSnapshot: ...
+    async def claim_failed_retry(
+        self,
+        checkpoint: Record,
+        claim: IngestionRetryClaim,
+        *,
+        deadline: RequestDeadline,
+    ) -> bool: ...
+    async def finish_failed_retry(
+        self,
+        claim: IngestionRetryClaim,
+        result: IngestionRetryResult,
+        *,
+        deadline: RequestDeadline,
+    ) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RetryCheckpointSnapshot:
+    checkpoint: IngestionCheckpointStore.Record | None
+    claim: IngestionRetryClaim | None
+    result: IngestionRetryResult | None
+
+    def __post_init__(self) -> None:
+        if self.result is not None and self.claim is None:
+            raise ValueError("retry result requires its immutable claim")
+        if self.claim is not None and self.checkpoint is None:
+            raise ValueError("retry claim requires its immutable checkpoint")
+        records = tuple(
+            item for item in (self.checkpoint, self.claim, self.result) if item is not None
+        )
+        if records and len({item.job_digest for item in records}) != 1:
+            raise ValueError("retry snapshot job digests do not match")
+        if (
+            self.claim is not None
+            and self.result is not None
+            and self.claim.attempt_digest != self.result.attempt_digest
+        ):
+            raise ValueError("retry snapshot attempt digests do not match")
+        if (
+            self.claim is not None
+            and self.checkpoint is not None
+            and (
+                self.claim.checkpoint_digest != _digest(_checkpoint_json(self.checkpoint))
+                or self.claim.cursor_digest != self.checkpoint.cursor_digest
+            )
+        ):
+            raise ValueError("retry claim does not match its immutable checkpoint")
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +277,7 @@ class ResearchIngestionResult:
     inserted_count: int
     removed_count: int
     errors: tuple[str, ...] = ()
+    failure_stages: tuple[IngestionFailureStage, ...] = ()
 
     @property
     def opaque_job_id(self) -> str:
@@ -201,6 +286,36 @@ class ResearchIngestionResult:
     @property
     def opaque_accession_ids(self) -> tuple[str, ...]:
         return tuple(_digest(item.accession_number) for item in self.job.references)
+
+
+@dataclass(frozen=True, slots=True)
+class _RunnerOutcome:
+    result: ResearchIngestionResult | None = None
+    failure_stage: IngestionFailureStage | None = None
+    timeout: bool = False
+    retry_conflict: bool = False
+
+    def __post_init__(self) -> None:
+        present = sum(
+            (
+                self.result is not None,
+                self.failure_stage is not None,
+                self.timeout,
+                self.retry_conflict,
+            )
+        )
+        if present != 1:
+            raise ValueError("runner outcome must contain exactly one result")
+
+
+def _resolve_runner_outcome(outcome: _RunnerOutcome) -> ResearchIngestionResult:
+    if outcome.result is not None:
+        return outcome.result
+    if outcome.failure_stage is not None:
+        raise IngestionStageError(outcome.failure_stage) from None
+    if outcome.timeout:
+        raise TimeoutError("research request deadline expired") from None
+    raise ResearchIngestionRetryError() from None
 
 
 class ResearchIngestionRunner:
@@ -223,10 +338,45 @@ class ResearchIngestionRunner:
         *,
         deadline: RequestDeadline,
     ) -> ResearchIngestionResult:
+        outcome = await self._run_outcome(request, deadline=deadline)
+        request = None  # type: ignore[assignment]
+        return _resolve_runner_outcome(outcome)
+
+    async def _run_outcome(
+        self,
+        request: ResearchIngestionRequest,
+        *,
+        deadline: RequestDeadline,
+    ) -> _RunnerOutcome:
+        try:
+            result = await self._run_impl(request, deadline=deadline)
+            return _RunnerOutcome(result=result)
+        except IngestionStageError as error:
+            return _RunnerOutcome(failure_stage=error.stage)
+        except TimeoutError:
+            return _RunnerOutcome(timeout=True)
+        except ResearchIngestionRetryError:
+            return _RunnerOutcome(retry_conflict=True)
+        except RuntimeError:
+            return _RunnerOutcome(failure_stage=IngestionFailureStage.CHECKPOINTING)
+        except Exception:
+            return _RunnerOutcome(failure_stage=IngestionFailureStage.CHECKPOINTING)
+
+    async def _run_impl(
+        self,
+        request: ResearchIngestionRequest,
+        *,
+        deadline: RequestDeadline,
+    ) -> ResearchIngestionResult:
         if not isinstance(request, ResearchIngestionRequest):
             raise ValueError("ingestion request is invalid")
         deadline.raise_if_expired()
-        page = await self._source.discover(request.discovery_request(), deadline=deadline)
+        try:
+            page = await self._source.discover(request.discovery_request(), deadline=deadline)
+        except TimeoutError:
+            raise
+        except Exception:
+            raise IngestionStageError(IngestionFailureStage.SEC_FETCH) from None
         job = ResearchIngestionJob.from_plan(request, tuple(page.references))
         if not request.apply:
             return ResearchIngestionResult(
@@ -240,38 +390,105 @@ class ResearchIngestionRunner:
                 removed_count=0,
             )
         checkpoint = await self._load_checkpoint(job.job_digest, deadline=deadline)
+        retry_claim: IngestionRetryClaim | None = None
+        if request.retry_failed:
+            retry_claim, prior_result = await self._claim_retry(
+                job,
+                checkpoint,
+                deadline=deadline,
+            )
+            if prior_result is not None:
+                return ResearchIngestionResult(
+                    dry_run=False,
+                    job=job,
+                    planned_count=len(job.references),
+                    processed_count=0,
+                    skipped_count=len(job.references),
+                    failed_count=0,
+                    inserted_count=0,
+                    removed_count=0,
+                )
         resume_index = job.cursor_index(checkpoint.cursor_digest) if checkpoint is not None else 0
+        if retry_claim is not None:
+            resume_index = 0
         failed_count = checkpoint.failed_count if checkpoint is not None else 0
         total_success_count = checkpoint.processed_count if checkpoint is not None else 0
+        if retry_claim is not None:
+            failed_count = 0
+            total_success_count = 0
         processed_count = 0
         inserted_count = 0
         removed_count = 0
         errors: tuple[str, ...] = ()
+        failure_stages: tuple[IngestionFailureStage, ...] = ()
         cursor_digest = checkpoint.cursor_digest if checkpoint is not None else None
         for index, reference in enumerate(job.references):
             if index < resume_index:
                 continue
+            failure_stage = IngestionFailureStage.SEC_FETCH
             try:
                 raw = await self._source.fetch(reference, deadline=deadline)
+                failure_stage = IngestionFailureStage.PARSING_CHUNKING
                 document = self._parser.parse(raw)
-                result = await self._core.ingest(document, deadline=deadline)
+                if retry_claim is None:
+                    result = await self._core.ingest(document, deadline=deadline)
+                else:
+                    result = await self._core.ingest(
+                        document,
+                        deadline=deadline,
+                        retry_failed=True,
+                    )
                 inserted_count += result.inserted_count
                 removed_count += result.removed_count
                 processed_count += 1
                 total_success_count += 1
+            except IngestionStageError as error:
+                failure_stage = error.stage
+                failed_count += 1
+                failure_stages = (*failure_stages, failure_stage)
+                errors = (*errors, f"ingestion failed during {failure_stage.value}")
             except Exception:
                 failed_count += 1
-                errors = (*errors, "ingestion failed for one filing")
+                failure_stages = (*failure_stages, failure_stage)
+                errors = (*errors, f"ingestion failed during {failure_stage.value}")
             cursor_digest = job.cursor_for(reference.accession_number)
-            await self._save_checkpoint(
-                IngestionCheckpointStore.Record(
-                    job_digest=job.job_digest,
-                    cursor_digest=cursor_digest,
-                    processed_count=total_success_count,
-                    failed_count=failed_count,
-                    complete=False,
+            if retry_claim is None:
+                await self._save_checkpoint(
+                    IngestionCheckpointStore.Record(
+                        job_digest=job.job_digest,
+                        cursor_digest=cursor_digest,
+                        processed_count=total_success_count,
+                        failed_count=failed_count,
+                        complete=False,
+                    ),
+                    deadline=deadline,
+                )
+            break_if_retry = retry_claim is not None
+            if break_if_retry:
+                break
+        if retry_claim is not None:
+            terminal = IngestionRetryResult(
+                job_digest=job.job_digest,
+                attempt_digest=retry_claim.attempt_digest,
+                state=(
+                    IngestionRetryState.FAILED if failed_count else IngestionRetryState.SUCCEEDED
                 ),
-                deadline=deadline,
+                failure_stage=failure_stages[0] if failure_stages else None,
+                inserted_count=0 if failed_count else inserted_count,
+                removed_count=0 if failed_count else removed_count,
+            )
+            await self._finish_retry(retry_claim, terminal, deadline=deadline)
+            return ResearchIngestionResult(
+                dry_run=False,
+                job=job,
+                planned_count=len(job.references),
+                processed_count=processed_count,
+                skipped_count=0,
+                failed_count=failed_count,
+                inserted_count=inserted_count,
+                removed_count=removed_count,
+                errors=tuple(dict.fromkeys(errors)),
+                failure_stages=tuple(dict.fromkeys(failure_stages)),
             )
         new_failure_count = failed_count - (
             checkpoint.failed_count if checkpoint is not None else 0
@@ -297,7 +514,79 @@ class ResearchIngestionRunner:
             inserted_count=inserted_count,
             removed_count=removed_count,
             errors=tuple(dict.fromkeys(errors)),
+            failure_stages=tuple(dict.fromkeys(failure_stages)),
         )
+
+    async def _claim_retry(
+        self,
+        job: ResearchIngestionJob,
+        checkpoint: IngestionCheckpointStore.Record | None,
+        *,
+        deadline: RequestDeadline,
+    ) -> tuple[IngestionRetryClaim | None, IngestionRetryResult | None]:
+        if self._checkpoints is None:
+            raise ResearchIngestionRetryError()
+        try:
+            snapshot = await self._checkpoints.load_retry_snapshot(
+                job.job_digest,
+                deadline=deadline,
+            )
+        except Exception:
+            raise IngestionStageError(IngestionFailureStage.CHECKPOINTING) from None
+        if snapshot.checkpoint != checkpoint:
+            raise ResearchIngestionRetryError()
+        if snapshot.result is not None:
+            if snapshot.result.state is IngestionRetryState.SUCCEEDED:
+                return None, snapshot.result
+            raise ResearchIngestionRetryError()
+        if snapshot.claim is not None:
+            raise ResearchIngestionRetryError()
+        if (
+            checkpoint is None
+            or len(job.references) != 1
+            or not checkpoint.complete
+            or checkpoint.processed_count != 0
+            or checkpoint.failed_count != 1
+            or checkpoint.cursor_digest != job.cursor_for(job.references[0].accession_number)
+        ):
+            raise ResearchIngestionRetryError()
+        claim = IngestionRetryClaim(
+            job_digest=job.job_digest,
+            attempt_digest=secrets.token_hex(32),
+            checkpoint_digest=_digest(_checkpoint_json(checkpoint)),
+            cursor_digest=checkpoint.cursor_digest,
+        )
+        try:
+            claimed = await self._checkpoints.claim_failed_retry(
+                checkpoint,
+                claim,
+                deadline=deadline,
+            )
+        except Exception:
+            raise IngestionStageError(IngestionFailureStage.CHECKPOINTING) from None
+        if not claimed:
+            raise ResearchIngestionRetryError()
+        return claim, None
+
+    async def _finish_retry(
+        self,
+        claim: IngestionRetryClaim,
+        result: IngestionRetryResult,
+        *,
+        deadline: RequestDeadline,
+    ) -> None:
+        if self._checkpoints is None:
+            raise IngestionStageError(IngestionFailureStage.CHECKPOINTING) from None
+        try:
+            finished = await self._checkpoints.finish_failed_retry(
+                claim,
+                result,
+                deadline=deadline,
+            )
+        except Exception:
+            raise IngestionStageError(IngestionFailureStage.CHECKPOINTING) from None
+        if not finished:
+            raise IngestionStageError(IngestionFailureStage.CHECKPOINTING) from None
 
     async def _load_checkpoint(
         self,
@@ -307,7 +596,10 @@ class ResearchIngestionRunner:
     ) -> IngestionCheckpointStore.Record | None:
         if self._checkpoints is None:
             return None
-        return await self._checkpoints.load(job_digest, deadline=deadline)
+        try:
+            return await self._checkpoints.load(job_digest, deadline=deadline)
+        except Exception:
+            raise IngestionStageError(IngestionFailureStage.CHECKPOINTING) from None
 
     async def _save_checkpoint(
         self,
@@ -316,4 +608,7 @@ class ResearchIngestionRunner:
         deadline: RequestDeadline,
     ) -> None:
         if self._checkpoints is not None:
-            await self._checkpoints.save(record, deadline=deadline)
+            try:
+                await self._checkpoints.save(record, deadline=deadline)
+            except Exception:
+                raise IngestionStageError(IngestionFailureStage.CHECKPOINTING) from None

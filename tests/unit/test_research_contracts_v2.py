@@ -9,6 +9,7 @@ import pytest
 from app.research.deadline import RequestDeadline
 from app.research.domain import (
     CorpusDescriptor,
+    EmbeddedChunk,
     EmbeddingDescriptor,
     EmbeddingVector,
     EvidenceChunk,
@@ -17,8 +18,11 @@ from app.research.domain import (
     FilingDiscoveryRequest,
     FilingDocument,
     FilingReference,
+    GenerationManifest,
     RawFiling,
 )
+from app.research.memory import InMemoryResearchControlPlane, InMemoryVectorStore
+from app.research.ports import GenerationInspection, GenerationInspectionState
 
 
 def reference() -> FilingReference:
@@ -174,3 +178,135 @@ def test_request_deadline_caps_children_and_fails_when_expired() -> None:
     assert deadline.remaining_seconds() == 0.0
     with pytest.raises(TimeoutError, match="deadline"):
         deadline.raise_if_expired()
+
+
+def test_generation_inspection_is_immutable_and_contains_only_safe_aggregate_state() -> None:
+    inspection = GenerationInspection(
+        state=GenerationInspectionState.PARTIAL,
+        expected_point_count=128,
+        observed_point_count=96,
+    )
+
+    assert inspection.state is GenerationInspectionState.PARTIAL
+    assert inspection.expected_point_count == 128
+    assert inspection.observed_point_count == 96
+    assert not hasattr(inspection, "point_ids")
+    assert not hasattr(inspection, "vectors")
+    assert not hasattr(inspection, "data")
+    with pytest.raises(FrozenInstanceError):
+        inspection.observed_point_count = 128  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("state", "expected", "observed"),
+    [
+        (GenerationInspectionState.ABSENT, 2, 1),
+        (GenerationInspectionState.EXACT, 2, 1),
+        (GenerationInspectionState.PARTIAL, 2, 0),
+        (GenerationInspectionState.PARTIAL, 2, 2),
+    ],
+)
+def test_generation_inspection_rejects_impossible_state_counts(
+    state: GenerationInspectionState,
+    expected: int,
+    observed: int,
+) -> None:
+    with pytest.raises(ValueError, match="inspection"):
+        GenerationInspection(
+            state=state,
+            expected_point_count=expected,
+            observed_point_count=observed,
+        )
+
+
+def _inspection_fixture() -> tuple[GenerationManifest, tuple[EmbeddedChunk, ...]]:
+    configured = corpus()
+    evidence = tuple(
+        EvidenceChunk.from_document(
+            document(),
+            corpus=configured,
+            ordinal=ordinal,
+            text=text,
+        )
+        for ordinal, text in enumerate(("First disclosure.", "Second disclosure."))
+    )
+    chunks = tuple(
+        EmbeddedChunk(
+            evidence=item,
+            embedding=EmbeddingVector(
+                descriptor=configured.embedding,
+                values=(1.0, 0.0) if index == 0 else (0.0, 1.0),
+            ),
+        )
+        for index, item in enumerate(evidence)
+    )
+    first = evidence[0]
+    return (
+        GenerationManifest(
+            corpus=configured,
+            symbol=first.symbol,
+            accession_number=first.accession_number,
+            generation_id=first.generation_id,
+            content_hash=first.content_hash,
+            chunk_ids=tuple(item.chunk_id for item in evidence),
+        ),
+        chunks,
+    )
+
+
+@pytest.mark.asyncio
+async def test_in_memory_vector_inspection_distinguishes_absent_exact_and_partial() -> None:
+    filing_manifest, chunks = _inspection_fixture()
+    vector_store = InMemoryVectorStore()
+    deadline = RequestDeadline.after(1)
+
+    absent = await vector_store.inspect_generation(filing_manifest, deadline=deadline)
+    await vector_store.stage_generation(filing_manifest, chunks, deadline=deadline)
+    exact = await vector_store.inspect_generation(filing_manifest, deadline=deadline)
+    vector_store._generations = ((filing_manifest, chunks[:1]),)
+    partial = await vector_store.inspect_generation(filing_manifest, deadline=deadline)
+
+    assert absent.state is GenerationInspectionState.ABSENT
+    assert exact.state is GenerationInspectionState.EXACT
+    assert partial.state is GenerationInspectionState.PARTIAL
+    assert partial.observed_point_count == 1
+
+
+@pytest.mark.asyncio
+async def test_in_memory_vector_inspection_fails_closed_for_inconsistent_state() -> None:
+    filing_manifest, chunks = _inspection_fixture()
+    vector_store = InMemoryVectorStore()
+    vector_store._generations = ((filing_manifest, (chunks[1], chunks[0])),)
+
+    inspection = await vector_store.inspect_generation(
+        filing_manifest,
+        deadline=RequestDeadline.after(1),
+    )
+
+    assert inspection.state is GenerationInspectionState.INCONSISTENT
+
+
+@pytest.mark.asyncio
+async def test_in_memory_control_reads_only_the_exact_generation_stage() -> None:
+    filing_manifest, _ = _inspection_fixture()
+    control = InMemoryResearchControlPlane()
+    deadline = RequestDeadline.after(1)
+    lease = await control.acquire_generation_lease(
+        manifest=filing_manifest,
+        owner_digest="a" * 64,
+        ttl_seconds=60,
+        deadline=deadline,
+    )
+    assert lease is not None
+    staged = await control.stage_generation(
+        lease=lease,
+        manifest=filing_manifest,
+        deadline=deadline,
+    )
+
+    observed = await control.get_generation_stage(
+        manifest=filing_manifest,
+        deadline=deadline,
+    )
+
+    assert observed == staged

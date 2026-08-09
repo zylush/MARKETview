@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, replace
@@ -18,6 +19,29 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 class ResearchControlUnavailableError(RuntimeError):
     """A sanitized, fail-closed control-plane failure."""
+
+
+class IngestionFailureStage(StrEnum):
+    """Fixed, non-sensitive stages allowed in ingestion diagnostics."""
+
+    SEC_FETCH = "sec_fetch"
+    PARSING_CHUNKING = "parsing_chunking"
+    EMBEDDING = "embedding"
+    VECTOR_STAGING = "vector_staging"
+    VECTOR_VERIFICATION = "vector_verification"
+    REDIS_PUBLICATION = "redis_publication"
+    CLEANUP = "cleanup"
+    CHECKPOINTING = "checkpointing"
+
+
+class IngestionStageError(RuntimeError):
+    """Sanitized ingestion failure detached from provider exception graphs."""
+
+    def __init__(self, stage: IngestionFailureStage) -> None:
+        if not isinstance(stage, IngestionFailureStage):
+            raise ValueError("ingestion failure stage is invalid")
+        self.stage = stage
+        super().__init__(f"research ingestion failed during {stage.value}")
 
 
 def require_public_digest(value: object, name: str = "digest") -> str:
@@ -322,6 +346,151 @@ class IngestionCheckpoint:
             )
         except (TypeError, ValueError):
             raise ValueError("control record has invalid checkpoint data") from None
+
+
+@dataclass(frozen=True, slots=True)
+class IngestionRetryClaim:
+    job_digest: str
+    attempt_digest: str
+    checkpoint_digest: str
+    cursor_digest: str
+
+    _KEYS = frozenset({"attempt_digest", "checkpoint_digest", "cursor_digest", "job_digest"})
+
+    def __post_init__(self) -> None:
+        require_public_digest(self.job_digest, "job digest")
+        require_public_digest(self.attempt_digest, "attempt digest")
+        require_public_digest(self.checkpoint_digest, "checkpoint digest")
+        require_public_digest(self.cursor_digest, "cursor digest")
+
+    def to_json(self) -> str:
+        return _dump_record(
+            {
+                "attempt_digest": self.attempt_digest,
+                "checkpoint_digest": self.checkpoint_digest,
+                "cursor_digest": self.cursor_digest,
+                "job_digest": self.job_digest,
+            }
+        )
+
+    @classmethod
+    def from_json(cls, raw: object) -> Self:
+        value = _load_record(raw, cls._KEYS)
+        try:
+            return cls(
+                job_digest=value["job_digest"],
+                attempt_digest=value["attempt_digest"],
+                checkpoint_digest=value["checkpoint_digest"],
+                cursor_digest=value["cursor_digest"],
+            )
+        except (TypeError, ValueError):
+            raise ValueError("control record has invalid retry claim data") from None
+
+
+class IngestionRetryState(StrEnum):
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True, slots=True)
+class IngestionRetryResult:
+    job_digest: str
+    attempt_digest: str
+    state: IngestionRetryState
+    failure_stage: IngestionFailureStage | None
+    inserted_count: int
+    removed_count: int
+
+    _KEYS = frozenset(
+        {
+            "attempt_digest",
+            "failure_stage",
+            "inserted_count",
+            "job_digest",
+            "removed_count",
+            "state",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        require_public_digest(self.job_digest, "job digest")
+        require_public_digest(self.attempt_digest, "attempt digest")
+        if not isinstance(self.state, IngestionRetryState):
+            raise ValueError("retry result state is invalid")
+        if self.failure_stage is not None and not isinstance(
+            self.failure_stage, IngestionFailureStage
+        ):
+            raise ValueError("retry failure stage is invalid")
+        _require_count(self.inserted_count, "inserted count")
+        _require_count(self.removed_count, "removed count")
+        if (self.state is IngestionRetryState.FAILED) != (self.failure_stage is not None):
+            raise ValueError("retry result failure stage is inconsistent")
+        if self.state is IngestionRetryState.FAILED and (self.inserted_count or self.removed_count):
+            raise ValueError("failed retry result must not report mutations")
+
+    def to_json(self) -> str:
+        return _dump_record(
+            {
+                "attempt_digest": self.attempt_digest,
+                "failure_stage": (None if self.failure_stage is None else self.failure_stage.value),
+                "inserted_count": self.inserted_count,
+                "job_digest": self.job_digest,
+                "removed_count": self.removed_count,
+                "state": self.state.value,
+            }
+        )
+
+    @classmethod
+    def from_json(cls, raw: object) -> Self:
+        value = _load_record(raw, cls._KEYS)
+        try:
+            return cls(
+                job_digest=value["job_digest"],
+                attempt_digest=value["attempt_digest"],
+                state=IngestionRetryState(value["state"]),
+                failure_stage=(
+                    None
+                    if value["failure_stage"] is None
+                    else IngestionFailureStage(value["failure_stage"])
+                ),
+                inserted_count=value["inserted_count"],
+                removed_count=value["removed_count"],
+            )
+        except (TypeError, ValueError):
+            raise ValueError("control record has invalid retry result data") from None
+
+
+@dataclass(frozen=True, slots=True)
+class IngestionRetrySnapshot:
+    checkpoint: IngestionCheckpoint | None
+    claim: IngestionRetryClaim | None
+    result: IngestionRetryResult | None
+
+    def __post_init__(self) -> None:
+        if self.result is not None and self.claim is None:
+            raise ValueError("retry result requires its immutable claim")
+        if self.claim is not None and self.checkpoint is None:
+            raise ValueError("retry claim requires its immutable checkpoint")
+        records = tuple(
+            item for item in (self.checkpoint, self.claim, self.result) if item is not None
+        )
+        if records and len({item.job_digest for item in records}) != 1:
+            raise ValueError("retry snapshot job digests do not match")
+        if (
+            self.claim is not None
+            and self.result is not None
+            and self.claim.attempt_digest != self.result.attempt_digest
+        ):
+            raise ValueError("retry snapshot attempt digests do not match")
+        if self.claim is not None and self.checkpoint is not None:
+            checkpoint_digest = hashlib.sha256(
+                self.checkpoint.to_json().encode("utf-8")
+            ).hexdigest()
+            if (
+                self.claim.checkpoint_digest != checkpoint_digest
+                or self.claim.cursor_digest != self.checkpoint.cursor_digest
+            ):
+                raise ValueError("retry claim does not match its immutable checkpoint")
 
 
 class ReservationState(StrEnum):

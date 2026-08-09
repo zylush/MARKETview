@@ -9,6 +9,9 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
+from app.research.control import IngestionFailureStage, IngestionStageError
+from app.research.ingestion import ResearchIngestionRetryError
+
 
 def test_cli_import_does_not_construct_live_adapters(monkeypatch: pytest.MonkeyPatch) -> None:
     def fail(*_: object, **__: object) -> object:
@@ -67,6 +70,7 @@ async def test_cli_defaults_to_dry_run_and_outputs_sanitized_json(
         "applied": False,
         "dry_run": True,
         "errors": [],
+        "failure_stages": [],
         "failed_count": 0,
         "inserted_count": 0,
         "job_id": "j" * 64,
@@ -124,6 +128,57 @@ async def test_cli_requires_apply_for_mutation_and_maps_partial_failure_to_exit_
     assert output["applied"] is True
     assert output["errors"] == ["ingestion failed for one filing"]
     assert "sec.gov" not in json.dumps(output).lower()
+
+
+@pytest.mark.asyncio
+async def test_cli_retry_failed_is_explicit_and_requires_apply() -> None:
+    import app.ingest_research as cli
+
+    seen: dict[str, bool] = {}
+
+    async def fake_run(request: Any, *, deadline: Any) -> SimpleNamespace:
+        deadline.raise_if_expired()
+        seen["retry_failed"] = request.retry_failed
+        return SimpleNamespace(
+            dry_run=False,
+            planned_count=1,
+            processed_count=1,
+            skipped_count=0,
+            failed_count=0,
+            inserted_count=128,
+            removed_count=0,
+            opaque_job_id="b" * 64,
+            errors=(),
+            failure_stages=(),
+        )
+
+    base = [
+        "--symbol",
+        "AAPL",
+        "--cik",
+        "0000320193",
+        "--forms",
+        "10-K",
+        "--from",
+        "2025-01-01",
+        "--to",
+        "2025-12-31",
+        "--limit",
+        "1",
+        "--retry-failed",
+    ]
+    with pytest.raises(SystemExit) as caught:
+        await cli.async_main(base, runner_factory=lambda _: SimpleNamespace(run=fake_run))
+    assert caught.value.code == 2
+
+    assert (
+        await cli.async_main(
+            [*base, "--apply"],
+            runner_factory=lambda _: SimpleNamespace(run=fake_run),
+        )
+        == 0
+    )
+    assert seen == {"retry_failed": True}
 
 
 def test_cli_rejects_invalid_allowlist_arguments_before_factory_call() -> None:
@@ -209,6 +264,80 @@ async def test_cli_maps_sanitized_configuration_failure_to_distinct_exit(
 
 
 @pytest.mark.asyncio
+async def test_cli_propagates_only_fixed_ingestion_failure_stage(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import app.ingest_research as cli
+
+    sensitive_sentinel = "private filing text and credential"
+
+    async def fake_run(request: Any, *, deadline: Any) -> object:
+        del request
+        deadline.raise_if_expired()
+        try:
+            raise RuntimeError(sensitive_sentinel)
+        except RuntimeError:
+            raise IngestionStageError(IngestionFailureStage.EMBEDDING) from None
+
+    exit_code = await cli.async_main(
+        [
+            "--symbol",
+            "AAPL",
+            "--cik",
+            "0000320193",
+            "--forms",
+            "10-K",
+            "--from",
+            "2025-01-01",
+            "--to",
+            "2025-12-31",
+            "--apply",
+        ],
+        runner_factory=lambda _: SimpleNamespace(run=fake_run),
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert exit_code == cli.EXIT_PROVIDER
+    assert output["failure_stages"] == ["embedding"]
+    assert sensitive_sentinel not in json.dumps(output)
+
+
+@pytest.mark.asyncio
+async def test_cli_uses_typed_retry_error_for_lock_recovery_without_message_sniffing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import app.ingest_research as cli
+
+    async def fake_run(request: Any, *, deadline: Any) -> object:
+        del request
+        deadline.raise_if_expired()
+        raise ResearchIngestionRetryError()
+
+    exit_code = await cli.async_main(
+        [
+            "--symbol",
+            "AAPL",
+            "--cik",
+            "0000320193",
+            "--forms",
+            "10-K",
+            "--from",
+            "2025-01-01",
+            "--to",
+            "2025-12-31",
+            "--apply",
+            "--retry-failed",
+        ],
+        runner_factory=lambda _: SimpleNamespace(run=fake_run),
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert exit_code == cli.EXIT_LOCK_RECOVERY
+    assert output["error_category"] == "lock_recovery"
+    assert output["failure_stages"] == []
+
+
+@pytest.mark.asyncio
 async def test_cli_maps_checkpoint_recovery_failure_to_distinct_exit(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -217,7 +346,7 @@ async def test_cli_maps_checkpoint_recovery_failure_to_distinct_exit(
     async def fake_run(request: Any, *, deadline: Any) -> object:
         del request
         deadline.raise_if_expired()
-        raise RuntimeError("research ingestion checkpoint conflict")
+        raise ResearchIngestionRetryError()
 
     exit_code = await cli.async_main(
         [

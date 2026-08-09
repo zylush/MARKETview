@@ -17,6 +17,9 @@ from app.research.control import (
     GenerationStageRecord,
     GenerationState,
     IngestionCheckpoint,
+    IngestionRetryClaim,
+    IngestionRetryResult,
+    IngestionRetrySnapshot,
     ResearchControlUnavailableError,
     Reservation,
     ReservationState,
@@ -82,6 +85,17 @@ _CHECKPOINT_SCRIPT = (
     "if ARGV[1]=='' then if current then return 0 end "
     "elseif current~=ARGV[1] then return 0 end; "
     "redis.call('set',KEYS[1],ARGV[2]); return 1"
+)
+_CLAIM_RETRY_SCRIPT = (
+    "if redis.call('get',KEYS[1])~=ARGV[1] then return -1 end; "
+    "if redis.call('exists',KEYS[2])==1 or redis.call('exists',KEYS[3])==1 "
+    "then return 0 end; redis.call('set',KEYS[2],ARGV[2]); return 1"
+)
+_FINISH_RETRY_SCRIPT = (
+    "if redis.call('get',KEYS[1])~=ARGV[1] then return -1 end; "
+    "local current=redis.call('get',KEYS[2]); "
+    "if current==ARGV[2] then return 1 end; "
+    "if current then return -2 end; redis.call('set',KEYS[2],ARGV[2]); return 1"
 )
 _AUTHORIZE_RESERVATION_SCRIPT = (
     "if redis.call('exists',KEYS[1])==1 then return 0 end; "
@@ -337,6 +351,14 @@ class RedisResearchControl:
     @staticmethod
     def _checkpoint_key(job_digest: str) -> str:
         return f"{_KEY_PREFIX}:checkpoint:{require_public_digest(job_digest)}"
+
+    @staticmethod
+    def _retry_claim_key(job_digest: str) -> str:
+        return f"{_KEY_PREFIX}:checkpoint-retry:{require_public_digest(job_digest)}"
+
+    @staticmethod
+    def _retry_result_key(job_digest: str) -> str:
+        return f"{_KEY_PREFIX}:checkpoint-retry-result:{require_public_digest(job_digest)}"
 
     @staticmethod
     def _reservation_key(reservation_digest: str) -> str:
@@ -611,6 +633,24 @@ class RedisResearchControl:
             _raise_unavailable()
         return record.manifest
 
+    async def get_generation_stage(
+        self,
+        *,
+        manifest: GenerationManifest,
+        deadline: RequestDeadline,
+    ) -> GenerationStageRecord | None:
+        accession_digest = _accession_digest(manifest)
+        raw = await self._command(
+            ["GET", self._generation_key(accession_digest, manifest.generation_id)],
+            deadline=deadline,
+        )
+        if raw is None:
+            return None
+        record = self._parse_stage(raw)
+        if record.manifest != manifest:
+            _raise_unavailable()
+        return record
+
     async def list_active_generations(
         self,
         *,
@@ -842,6 +882,79 @@ class RedisResearchControl:
         if failed or checkpoint is None or checkpoint.job_digest != job_digest:
             _raise_unavailable()
         return checkpoint
+
+    async def load_retry_snapshot(
+        self, *, job_digest: str, deadline: RequestDeadline
+    ) -> IngestionRetrySnapshot:
+        checked = require_public_digest(job_digest, "job digest")
+        raw = await self._command(
+            [
+                "MGET",
+                self._checkpoint_key(checked),
+                self._retry_claim_key(checked),
+                self._retry_result_key(checked),
+            ],
+            deadline=deadline,
+        )
+        if not isinstance(raw, list) or len(raw) != 3:
+            _raise_unavailable()
+        try:
+            checkpoint = None if raw[0] is None else IngestionCheckpoint.from_json(raw[0])
+            claim = None if raw[1] is None else IngestionRetryClaim.from_json(raw[1])
+            result = None if raw[2] is None else IngestionRetryResult.from_json(raw[2])
+            snapshot = IngestionRetrySnapshot(checkpoint, claim, result)
+        except ValueError:
+            _raise_unavailable()
+        if any(item.job_digest != checked for item in (checkpoint, claim, result) if item):
+            _raise_unavailable()
+        return snapshot
+
+    async def claim_failed_retry(
+        self,
+        *,
+        checkpoint: IngestionCheckpoint,
+        claim: IngestionRetryClaim,
+        deadline: RequestDeadline,
+    ) -> bool:
+        if checkpoint.job_digest != claim.job_digest:
+            raise ValueError("retry claim and checkpoint job digests must match")
+        result = await self._command(
+            [
+                "EVAL",
+                _CLAIM_RETRY_SCRIPT,
+                3,
+                self._checkpoint_key(claim.job_digest),
+                self._retry_claim_key(claim.job_digest),
+                self._retry_result_key(claim.job_digest),
+                checkpoint.to_json(),
+                claim.to_json(),
+            ],
+            deadline=deadline,
+        )
+        return self._cas_result(result)
+
+    async def finish_failed_retry(
+        self,
+        *,
+        claim: IngestionRetryClaim,
+        result: IngestionRetryResult,
+        deadline: RequestDeadline,
+    ) -> bool:
+        if claim.job_digest != result.job_digest or claim.attempt_digest != result.attempt_digest:
+            raise ValueError("retry claim and result do not match")
+        saved = await self._command(
+            [
+                "EVAL",
+                _FINISH_RETRY_SCRIPT,
+                2,
+                self._retry_claim_key(claim.job_digest),
+                self._retry_result_key(claim.job_digest),
+                claim.to_json(),
+                result.to_json(),
+            ],
+            deadline=deadline,
+        )
+        return self._cas_result(saved)
 
     async def authorize_reservation(
         self,

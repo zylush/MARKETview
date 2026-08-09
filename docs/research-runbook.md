@@ -144,9 +144,37 @@ python -m app.ingest_research `
 
 Apply downloads the one planned filing, parses and chunks it, purchases embeddings, stages immutable
 Vector points, verifies their IDs/count, compare-and-swaps the Redis active manifest, checkpoints
-completion, and only then removes a superseded generation. Repeating the same bounded command is
-idempotent. If interrupted before publication, the prior generation stays active. If interrupted
-after publication, the new generation stays active and cleanup resumes on the next approved run.
+completion, and only then removes a superseded generation. Document embeddings are prevalidated and
+sent as immutable batches of at most 96 inputs under one absolute operation deadline; batches are
+never retried automatically. Repeating a successful bounded command is idempotent. If interrupted
+before publication, the prior generation stays active. If interrupted after publication, the new
+generation stays active and cleanup resumes on the next approved run.
+
+A completed failed checkpoint is different from a successful replay: the ordinary command does not
+retry it. After a separate read-only diagnosis and explicit recovery approval, the exact one-filing
+pilot may be retried once by adding `--retry-failed` together with `--apply`:
+
+```powershell
+python -m app.ingest_research `
+  --symbol AAPL `
+  --cik 0000320193 `
+  --forms 10-K `
+  --from 2025-01-01 `
+  --to 2025-12-31 `
+  --limit 1 `
+  --timeout-seconds 300 `
+  --apply `
+  --retry-failed
+```
+
+Recovery preserves the original failed checkpoint byte-for-byte. Redis atomically creates a separate
+one-attempt claim and immutable terminal result. Concurrent claims, stale claims, ambiguous or
+multi-filing legacy checkpoints, an active generation, a non-cleaned generation, pending cleanup, or
+any existing/partial/inconsistent Vector state fail closed before paid embedding. A failed recovery
+is not eligible for another automatic attempt. A crash after the claim remains permanently
+fail-closed for this single-owner pilot; do not delete its keys or reclaim it automatically. A future
+append-only recovery-ledger change requires separate design and approval. CLI diagnostics expose only
+fixed failure-stage codes.
 
 Expected exit behavior is deterministic: zero for a successful dry-run/apply or no-op; nonzero for
 argument/configuration, partial filing failure, provider/vector, or control-state failure. Do not

@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+import inspect
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
 import pytest
 
+from app.research.control import (
+    IngestionFailureStage,
+    IngestionRetryClaim,
+    IngestionRetryResult,
+    IngestionRetryState,
+    IngestionStageError,
+)
 from app.research.deadline import RequestDeadline
 from app.research.domain import (
     FilingDiscoveryPage,
@@ -20,7 +28,9 @@ from app.research.ingestion import (
     IngestionCheckpointStore,
     ResearchIngestionJob,
     ResearchIngestionRequest,
+    ResearchIngestionRetryError,
     ResearchIngestionRunner,
+    RetryCheckpointSnapshot,
 )
 
 
@@ -89,6 +99,7 @@ class FakeCore:
         document: FilingDocument,
         *,
         deadline: RequestDeadline | None = None,
+        retry_failed: bool = False,
     ) -> IngestionResult:
         if deadline is not None:
             deadline.raise_if_expired()
@@ -105,6 +116,8 @@ class MemoryCheckpoints:
     Record = IngestionCheckpointStore.Record
 
     values: dict[str, IngestionCheckpointStore.Record]
+    claims: dict[str, IngestionRetryClaim] = field(default_factory=dict)
+    results: dict[str, IngestionRetryResult] = field(default_factory=dict)
 
     async def load(
         self,
@@ -124,6 +137,52 @@ class MemoryCheckpoints:
         deadline.raise_if_expired()
         self.values[record.job_digest] = record
 
+    async def load_retry_snapshot(
+        self,
+        job_digest: str,
+        *,
+        deadline: RequestDeadline,
+    ) -> RetryCheckpointSnapshot:
+        deadline.raise_if_expired()
+        return RetryCheckpointSnapshot(
+            checkpoint=self.values.get(job_digest),
+            claim=self.claims.get(job_digest),
+            result=self.results.get(job_digest),
+        )
+
+    async def claim_failed_retry(
+        self,
+        checkpoint: IngestionCheckpointStore.Record,
+        claim: IngestionRetryClaim,
+        *,
+        deadline: RequestDeadline,
+    ) -> bool:
+        deadline.raise_if_expired()
+        if (
+            self.values.get(checkpoint.job_digest) != checkpoint
+            or checkpoint.job_digest in self.claims
+            or checkpoint.job_digest in self.results
+        ):
+            return False
+        self.claims[checkpoint.job_digest] = claim
+        return True
+
+    async def finish_failed_retry(
+        self,
+        claim: IngestionRetryClaim,
+        result: IngestionRetryResult,
+        *,
+        deadline: RequestDeadline,
+    ) -> bool:
+        deadline.raise_if_expired()
+        if self.claims.get(claim.job_digest) != claim:
+            return False
+        existing = self.results.get(claim.job_digest)
+        if existing is not None:
+            return existing == result
+        self.results[claim.job_digest] = result
+        return True
+
 
 def request(**overrides: Any) -> ResearchIngestionRequest:
     values = {
@@ -136,6 +195,33 @@ def request(**overrides: Any) -> ResearchIngestionRequest:
         "apply": False,
     }
     return ResearchIngestionRequest(**{**values, **overrides})
+
+
+def exception_graph_text(error: BaseException) -> str:
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    rendered: list[str] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        rendered.extend((repr(current), str(current)))
+        traceback = current.__traceback__
+        while traceback is not None:
+            filename = traceback.tb_frame.f_code.co_filename.replace("\\", "/")
+            if filename.endswith("app/research/ingestion.py"):
+                rendered.extend(
+                    repr(value)
+                    for value in traceback.tb_frame.f_locals.values()
+                    if not inspect.iscoroutine(value)
+                )
+            traceback = traceback.tb_next
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return "".join(rendered)
 
 
 @pytest.mark.asyncio
@@ -278,9 +364,179 @@ async def test_failure_records_checkpoint_without_leaking_bodies_urls_or_traceba
     result = await runner.run(request(limit=1, apply=True), deadline=RequestDeadline.after(30.0))
 
     assert result.failed_count == 1
-    assert result.errors == ("ingestion failed for one filing",)
+    assert result.errors == ("ingestion failed during parsing_chunking",)
+    assert result.failure_stages == (IngestionFailureStage.PARSING_CHUNKING,)
     rendered = repr(result) + str(result)
     assert "private body" not in rendered
     assert "sec.gov" not in rendered
     saved = next(iter(checkpoints.values.values()))
     assert saved.failed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_exact_legacy_failure_requires_explicit_retry_and_recovers_once() -> None:
+    item = reference()
+    checkpoints = MemoryCheckpoints({})
+    source = FakeSource((item,))
+    core = FakeCore()
+    runner = ResearchIngestionRunner(
+        source=source,
+        parser=FakeParser(),
+        core=core,
+        checkpoints=checkpoints,
+    )
+    dry = await runner.run(request(limit=1), deadline=RequestDeadline.after(30.0))
+    legacy = IngestionCheckpointStore.Record(
+        job_digest=dry.opaque_job_id,
+        cursor_digest=dry.job.cursor_for(item.accession_number),
+        processed_count=0,
+        failed_count=1,
+        complete=True,
+    )
+    checkpoints.values[dry.opaque_job_id] = legacy
+
+    skipped = await runner.run(request(limit=1, apply=True), deadline=RequestDeadline.after(30.0))
+    recovered = await runner.run(
+        request(limit=1, apply=True, retry_failed=True),
+        deadline=RequestDeadline.after(30.0),
+    )
+    replayed = await runner.run(
+        request(limit=1, apply=True, retry_failed=True),
+        deadline=RequestDeadline.after(30.0),
+    )
+
+    assert skipped.processed_count == 0
+    assert skipped.skipped_count == 1
+    assert recovered.processed_count == 1
+    assert recovered.failed_count == 0
+    assert replayed.processed_count == 0
+    assert replayed.skipped_count == 1
+    assert core.ingested == (item.accession_number,)
+    assert checkpoints.values[dry.opaque_job_id] == legacy
+    assert checkpoints.results[dry.opaque_job_id].state is IngestionRetryState.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_rejects_ambiguous_or_claimed_checkpoint_before_fetch() -> None:
+    refs = (reference("0000320193-25-000001"), reference("0000320193-25-000002"))
+    checkpoints = MemoryCheckpoints({})
+    source = FakeSource(refs)
+    runner = ResearchIngestionRunner(
+        source=source,
+        parser=FakeParser(),
+        core=FakeCore(),
+        checkpoints=checkpoints,
+    )
+    dry = await runner.run(request(limit=2), deadline=RequestDeadline.after(30.0))
+    checkpoints.values[dry.opaque_job_id] = IngestionCheckpointStore.Record(
+        job_digest=dry.opaque_job_id,
+        cursor_digest=dry.job.cursor_for(refs[-1].accession_number),
+        processed_count=0,
+        failed_count=1,
+        complete=True,
+    )
+
+    with pytest.raises(ResearchIngestionRetryError) as caught:
+        await runner.run(
+            request(limit=2, apply=True, retry_failed=True),
+            deadline=RequestDeadline.after(30.0),
+        )
+
+    assert source.fetches == ()
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert refs[0].source_url not in exception_graph_text(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_retry_failure_records_only_fixed_stage_without_sensitive_exception_graph() -> None:
+    sensitive_sentinel = "private filing content https://sec.invalid secret-token"
+
+    class FailingCore(FakeCore):
+        async def ingest(self, document, *, deadline=None, retry_failed=False):
+            del document, retry_failed
+            if deadline is not None:
+                deadline.raise_if_expired()
+            try:
+                raise RuntimeError(sensitive_sentinel)
+            except RuntimeError:
+                raise IngestionStageError(IngestionFailureStage.EMBEDDING) from None
+
+    item = reference()
+    checkpoints = MemoryCheckpoints({})
+    runner = ResearchIngestionRunner(
+        source=FakeSource((item,)),
+        parser=FakeParser(),
+        core=FailingCore(),
+        checkpoints=checkpoints,
+    )
+    dry = await runner.run(request(limit=1), deadline=RequestDeadline.after(30.0))
+    checkpoints.values[dry.opaque_job_id] = IngestionCheckpointStore.Record(
+        job_digest=dry.opaque_job_id,
+        cursor_digest=dry.job.cursor_for(item.accession_number),
+        processed_count=0,
+        failed_count=1,
+        complete=True,
+    )
+
+    failed = await runner.run(
+        request(limit=1, apply=True, retry_failed=True),
+        deadline=RequestDeadline.after(30.0),
+    )
+
+    assert failed.failure_stages == (IngestionFailureStage.EMBEDDING,)
+    assert failed.errors == ("ingestion failed during embedding",)
+    rendered = repr(failed) + repr(checkpoints.results[dry.opaque_job_id])
+    assert sensitive_sentinel not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["load", "claim", "finish"])
+async def test_checkpoint_failures_detach_sensitive_traceback_locals(operation: str) -> None:
+    sensitive_sentinel = "private-checkpoint-token-and-filing-text"
+
+    class FailingCheckpoints(MemoryCheckpoints):
+        async def load(self, job_digest, *, deadline):
+            if operation == "load":
+                raise RuntimeError(sensitive_sentinel)
+            return await super().load(job_digest, deadline=deadline)
+
+        async def claim_failed_retry(self, checkpoint, claim, *, deadline):
+            if operation == "claim":
+                raise RuntimeError(sensitive_sentinel)
+            return await super().claim_failed_retry(checkpoint, claim, deadline=deadline)
+
+        async def finish_failed_retry(self, claim, result, *, deadline):
+            if operation == "finish":
+                raise RuntimeError(sensitive_sentinel)
+            return await super().finish_failed_retry(claim, result, deadline=deadline)
+
+    item = reference()
+    checkpoints = FailingCheckpoints({})
+    runner = ResearchIngestionRunner(
+        source=FakeSource((item,)),
+        parser=FakeParser(),
+        core=FakeCore(),
+        checkpoints=checkpoints,
+    )
+    dry = await ResearchIngestionRunner(
+        source=FakeSource((item,)),
+        parser=FakeParser(),
+        core=FakeCore(),
+    ).run(request(limit=1), deadline=RequestDeadline.after(30.0))
+    checkpoints.values[dry.opaque_job_id] = IngestionCheckpointStore.Record(
+        job_digest=dry.opaque_job_id,
+        cursor_digest=dry.job.cursor_for(item.accession_number),
+        processed_count=0,
+        failed_count=1,
+        complete=True,
+    )
+
+    with pytest.raises(IngestionStageError) as caught:
+        await runner.run(
+            request(limit=1, apply=True, retry_failed=operation != "load"),
+            deadline=RequestDeadline.after(30.0),
+        )
+
+    assert caught.value.stage is IngestionFailureStage.CHECKPOINTING
+    assert sensitive_sentinel not in exception_graph_text(caught.value)

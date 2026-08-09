@@ -11,11 +11,20 @@ from datetime import date
 from typing import Protocol, cast
 
 from app.config import Settings, get_settings
-from app.research.control import IngestionCheckpoint
+from app.research.control import (
+    IngestionCheckpoint,
+    IngestionFailureStage,
+    IngestionRetryClaim,
+    IngestionRetryResult,
+    IngestionRetrySnapshot,
+    IngestionStageError,
+)
 from app.research.deadline import RequestDeadline
 from app.research.ingestion import (
     IngestionCheckpointStore,
     ResearchIngestionRequest,
+    ResearchIngestionRetryError,
+    RetryCheckpointSnapshot,
 )
 
 EXIT_SUCCESS = 0
@@ -98,6 +107,29 @@ class ControlCheckpointBackend(Protocol):
         deadline: RequestDeadline,
     ) -> bool: ...
 
+    async def load_retry_snapshot(
+        self,
+        *,
+        job_digest: str,
+        deadline: RequestDeadline,
+    ) -> IngestionRetrySnapshot: ...
+
+    async def claim_failed_retry(
+        self,
+        *,
+        checkpoint: IngestionCheckpoint,
+        claim: IngestionRetryClaim,
+        deadline: RequestDeadline,
+    ) -> bool: ...
+
+    async def finish_failed_retry(
+        self,
+        *,
+        claim: IngestionRetryClaim,
+        result: IngestionRetryResult,
+        deadline: RequestDeadline,
+    ) -> bool: ...
+
 
 @dataclass(frozen=True, slots=True)
 class RunnerConfig:
@@ -161,8 +193,65 @@ class ControlCheckpointStore:
             deadline=deadline,
         )
         if not saved:
-            raise RuntimeError("research ingestion checkpoint conflict")
+            raise ResearchIngestionRetryError()
         self._previous[record.job_digest] = checkpoint
+
+    async def load_retry_snapshot(
+        self,
+        job_digest: str,
+        *,
+        deadline: RequestDeadline,
+    ) -> RetryCheckpointSnapshot:
+        snapshot = await self._control.load_retry_snapshot(
+            job_digest=job_digest,
+            deadline=deadline,
+        )
+        checkpoint = snapshot.checkpoint
+        record = (
+            None
+            if checkpoint is None
+            else IngestionCheckpointStore.Record(
+                job_digest=checkpoint.job_digest,
+                cursor_digest=checkpoint.cursor_digest,
+                processed_count=checkpoint.processed_count,
+                failed_count=checkpoint.failed_count,
+                complete=checkpoint.complete,
+            )
+        )
+        return RetryCheckpointSnapshot(record, snapshot.claim, snapshot.result)
+
+    async def claim_failed_retry(
+        self,
+        checkpoint: IngestionCheckpointStore.Record,
+        claim: IngestionRetryClaim,
+        *,
+        deadline: RequestDeadline,
+    ) -> bool:
+        baseline = IngestionCheckpoint(
+            job_digest=checkpoint.job_digest,
+            cursor_digest=checkpoint.cursor_digest,
+            processed_count=checkpoint.processed_count,
+            failed_count=checkpoint.failed_count,
+            complete=checkpoint.complete,
+        )
+        return await self._control.claim_failed_retry(
+            checkpoint=baseline,
+            claim=claim,
+            deadline=deadline,
+        )
+
+    async def finish_failed_retry(
+        self,
+        claim: IngestionRetryClaim,
+        result: IngestionRetryResult,
+        *,
+        deadline: RequestDeadline,
+    ) -> bool:
+        return await self._control.finish_failed_retry(
+            claim=claim,
+            result=result,
+            deadline=deadline,
+        )
 
 
 def parse_iso_date(value: str) -> date:
@@ -182,6 +271,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--to", dest="date_to", required=True)
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
     return parser
 
@@ -195,6 +285,7 @@ def _request_from_args(args: argparse.Namespace) -> ResearchIngestionRequest:
         date_to=parse_iso_date(args.date_to),
         limit=args.limit,
         apply=bool(args.apply),
+        retry_failed=bool(args.retry_failed),
     )
 
 
@@ -310,6 +401,7 @@ def _result_payload(result: ResultLike) -> dict[str, object]:
         "applied": not result.dry_run,
         "dry_run": result.dry_run,
         "errors": list(result.errors),
+        "failure_stages": [item.value for item in getattr(result, "failure_stages", ())],
         "failed_count": result.failed_count,
         "inserted_count": result.inserted_count,
         "job_id": result.opaque_job_id,
@@ -322,12 +414,21 @@ def _result_payload(result: ResultLike) -> dict[str, object]:
 
 def _failure_category(error: Exception) -> str:
     name = type(error).__name__
-    message = str(error).lower()
+    if isinstance(error, ResearchIngestionRetryError):
+        return "lock_recovery"
+    if isinstance(error, IngestionStageError):
+        if error.stage in {
+            IngestionFailureStage.REDIS_PUBLICATION,
+            IngestionFailureStage.CLEANUP,
+            IngestionFailureStage.CHECKPOINTING,
+        }:
+            return "lock_recovery"
+        return "provider"
     if isinstance(error, TimeoutError):
         return "timeout"
     if isinstance(error, ValueError):
         return "configuration"
-    if "checkpoint" in message or "control" in name.lower() or "lock" in message:
+    if "control" in name.lower():
         return "lock_recovery"
     if (
         "provider" in name.lower()
@@ -348,12 +449,17 @@ def _failure_exit_code(category: str) -> int:
     }.get(category, EXIT_UNEXPECTED)
 
 
-def _failure_payload(request: ResearchIngestionRequest, category: str) -> dict[str, object]:
+def _failure_payload(
+    request: ResearchIngestionRequest,
+    category: str,
+    failure_stage: IngestionFailureStage | None = None,
+) -> dict[str, object]:
     return {
         "applied": bool(request.apply),
         "dry_run": not request.apply,
         "error_category": category,
         "errors": [f"research ingestion {category} failure"],
+        "failure_stages": [] if failure_stage is None else [failure_stage.value],
         "failed_count": 1,
         "inserted_count": 0,
         "job_id": None,
@@ -403,7 +509,13 @@ async def async_main(
             )
     except Exception as error:
         category = _failure_category(error)
-        print(json.dumps(_failure_payload(request, category), sort_keys=True))
+        failure_stage = error.stage if isinstance(error, IngestionStageError) else None
+        print(
+            json.dumps(
+                _failure_payload(request, category, failure_stage),
+                sort_keys=True,
+            )
+        )
         return _failure_exit_code(category)
     payload = _result_payload(result)
     print(json.dumps(payload, sort_keys=True))

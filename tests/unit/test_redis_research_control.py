@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 import traceback
@@ -15,8 +16,10 @@ from app.providers.redis_research import (
     _ABORT_SCRIPT,
     _AUTHORIZE_RESERVATION_SCRIPT,
     _CHECKPOINT_SCRIPT,
+    _CLAIM_RETRY_SCRIPT,
     _CLEAN_SCRIPT,
     _CLEAN_SUPERSEDED_SCRIPT,
+    _FINISH_RETRY_SCRIPT,
     _LEASE_RELEASE_SCRIPT,
     _PUBLISH_SCRIPT,
     _RELEASE_RESERVATION_SCRIPT,
@@ -33,6 +36,10 @@ from app.research.control import (
     GenerationStageRecord,
     GenerationState,
     IngestionCheckpoint,
+    IngestionFailureStage,
+    IngestionRetryClaim,
+    IngestionRetryResult,
+    IngestionRetryState,
     ResearchControlUnavailableError,
     Reservation,
     ReservationState,
@@ -593,6 +600,125 @@ async def test_checkpoint_compare_and_swap_and_load() -> None:
         ["EVAL", _CHECKPOINT_SCRIPT, 1, key, "", initial.to_json()],
         ["EVAL", _CHECKPOINT_SCRIPT, 1, key, initial.to_json(), advanced.to_json()],
         ["GET", key],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generation_stage_read_is_exact_and_fail_closed() -> None:
+    manifest = _manifest()
+    cleaned = GenerationStageRecord(manifest, GenerationState.CLEANED)
+    commands: list[list[Any]] = []
+    replies: Any = iter([cleaned.to_json(), None])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        commands.append(_decode_request(request))
+        return httpx.Response(200, json={"result": next(replies)})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        control = RedisResearchControl("https://redis.example", SecretStr("token"), client=client)
+        assert (
+            await control.get_generation_stage(manifest=manifest, deadline=_deadline()) == cleaned
+        )
+        assert await control.get_generation_stage(manifest=manifest, deadline=_deadline()) is None
+
+    key = (
+        f"rag:v1:generation:{_accession_digest(manifest)}:"
+        f"{manifest.generation_id.removeprefix('gen-')}"
+    )
+    assert commands == [["GET", key], ["GET", key]]
+
+
+@pytest.mark.asyncio
+async def test_failed_checkpoint_retry_claim_and_terminal_result_are_atomic_and_immutable() -> None:
+    checkpoint = IngestionCheckpoint(_D, _E, 0, 1, True)
+    checkpoint_digest = hashlib.sha256(checkpoint.to_json().encode("utf-8")).hexdigest()
+    claim = IngestionRetryClaim(_D, _A, checkpoint_digest, _E)
+    terminal = IngestionRetryResult(
+        _D,
+        _A,
+        IngestionRetryState.FAILED,
+        IngestionFailureStage.EMBEDDING,
+        0,
+        0,
+    )
+    commands: list[list[Any]] = []
+    replies: Any = iter(
+        [
+            [checkpoint.to_json(), None, None],
+            1,
+            0,
+            1,
+            1,
+            [checkpoint.to_json(), claim.to_json(), terminal.to_json()],
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        commands.append(_decode_request(request))
+        return httpx.Response(200, json={"result": next(replies)})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        control = RedisResearchControl("https://redis.example", SecretStr("token"), client=client)
+        empty = await control.load_retry_snapshot(job_digest=_D, deadline=_deadline())
+        assert empty.checkpoint == checkpoint
+        assert empty.claim is None
+        assert empty.result is None
+        assert await control.claim_failed_retry(
+            checkpoint=checkpoint, claim=claim, deadline=_deadline()
+        )
+        assert not await control.claim_failed_retry(
+            checkpoint=checkpoint, claim=claim, deadline=_deadline()
+        )
+        assert await control.finish_failed_retry(claim=claim, result=terminal, deadline=_deadline())
+        assert await control.finish_failed_retry(claim=claim, result=terminal, deadline=_deadline())
+        final = await control.load_retry_snapshot(job_digest=_D, deadline=_deadline())
+        assert final.claim == claim
+        assert final.result == terminal
+
+    checkpoint_key = f"rag:v1:checkpoint:{_D}"
+    claim_key = f"rag:v1:checkpoint-retry:{_D}"
+    result_key = f"rag:v1:checkpoint-retry-result:{_D}"
+    assert commands == [
+        ["MGET", checkpoint_key, claim_key, result_key],
+        [
+            "EVAL",
+            _CLAIM_RETRY_SCRIPT,
+            3,
+            checkpoint_key,
+            claim_key,
+            result_key,
+            checkpoint.to_json(),
+            claim.to_json(),
+        ],
+        [
+            "EVAL",
+            _CLAIM_RETRY_SCRIPT,
+            3,
+            checkpoint_key,
+            claim_key,
+            result_key,
+            checkpoint.to_json(),
+            claim.to_json(),
+        ],
+        [
+            "EVAL",
+            _FINISH_RETRY_SCRIPT,
+            2,
+            claim_key,
+            result_key,
+            claim.to_json(),
+            terminal.to_json(),
+        ],
+        [
+            "EVAL",
+            _FINISH_RETRY_SCRIPT,
+            2,
+            claim_key,
+            result_key,
+            claim.to_json(),
+            terminal.to_json(),
+        ],
+        ["MGET", checkpoint_key, claim_key, result_key],
     ]
 
 
