@@ -114,6 +114,16 @@ Long-running SEC discovery and ingestion are operator processes outside the Verc
 Operational rollout and every live action remain separately approval-gated; see
 [the research runbook](research-runbook.md).
 
+Failed one-filing ingestion recovery uses append-only Redis audit records. The original checkpoint
+and first retry claim/result are immutable. A separately authorized second attempt is eligible only
+after an exact terminal `vector_verification` failure and creates new attempt-two claim/result keys
+with atomic compare-and-set checks against all legacy bytes. Claim authorization requires both the
+opaque job digest and the non-public first retry attempt digest, preventing public plan inputs from
+consuming the one allowed attempt. The claim is won before SEC discovery;
+concurrent, stale, ambiguous, active-generation, cleanup-pending, or inconsistent Vector/control
+state fails closed. A claim without a result is never reclaimed automatically, terminal replays make
+zero provider calls, and no third attempt exists.
+
 ## API, cache, and credential boundaries
 
 | Boundary | Value | Purpose |

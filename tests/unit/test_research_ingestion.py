@@ -10,6 +10,7 @@ import pytest
 
 from app.research.control import (
     IngestionFailureStage,
+    IngestionRetryAttemptTwoClaim,
     IngestionRetryClaim,
     IngestionRetryResult,
     IngestionRetryState,
@@ -34,6 +35,7 @@ from app.research.ingestion import (
     ResearchIngestionResult,
     ResearchIngestionRetryError,
     ResearchIngestionRunner,
+    RetryAttemptTwoCheckpointSnapshot,
     RetryCheckpointSnapshot,
 )
 
@@ -122,6 +124,8 @@ class MemoryCheckpoints:
     values: dict[str, IngestionCheckpointStore.Record]
     claims: dict[str, IngestionRetryClaim] = field(default_factory=dict)
     results: dict[str, IngestionRetryResult] = field(default_factory=dict)
+    attempt_two_claims: dict[str, IngestionRetryAttemptTwoClaim] = field(default_factory=dict)
+    attempt_two_results: dict[str, IngestionRetryResult] = field(default_factory=dict)
 
     async def load(
         self,
@@ -187,6 +191,66 @@ class MemoryCheckpoints:
         self.results[claim.job_digest] = result
         return True
 
+    async def load_retry_attempt_two_snapshot(
+        self,
+        job_digest: str,
+        *,
+        deadline: RequestDeadline,
+    ) -> RetryAttemptTwoCheckpointSnapshot:
+        deadline.raise_if_expired()
+        return RetryAttemptTwoCheckpointSnapshot(
+            checkpoint=self.values.get(job_digest),
+            first_claim=self.claims.get(job_digest),
+            first_result=self.results.get(job_digest),
+            claim=self.attempt_two_claims.get(job_digest),
+            result=self.attempt_two_results.get(job_digest),
+        )
+
+    async def claim_failed_retry_attempt_two(
+        self,
+        checkpoint: IngestionCheckpointStore.Record,
+        first_claim: IngestionRetryClaim,
+        first_result: IngestionRetryResult,
+        claim: IngestionRetryAttemptTwoClaim,
+        *,
+        deadline: RequestDeadline,
+    ) -> bool:
+        deadline.raise_if_expired()
+        if (
+            self.values.get(checkpoint.job_digest) != checkpoint
+            or self.claims.get(checkpoint.job_digest) != first_claim
+            or self.results.get(checkpoint.job_digest) != first_result
+            or checkpoint.job_digest in self.attempt_two_claims
+            or checkpoint.job_digest in self.attempt_two_results
+        ):
+            return False
+        self.attempt_two_claims[checkpoint.job_digest] = claim
+        return True
+
+    async def finish_failed_retry_attempt_two(
+        self,
+        checkpoint: IngestionCheckpointStore.Record,
+        first_claim: IngestionRetryClaim,
+        first_result: IngestionRetryResult,
+        claim: IngestionRetryAttemptTwoClaim,
+        result: IngestionRetryResult,
+        *,
+        deadline: RequestDeadline,
+    ) -> bool:
+        deadline.raise_if_expired()
+        if (
+            self.values.get(claim.job_digest) != checkpoint
+            or self.claims.get(claim.job_digest) != first_claim
+            or self.results.get(claim.job_digest) != first_result
+            or self.attempt_two_claims.get(claim.job_digest) != claim
+        ):
+            return False
+        existing = self.attempt_two_results.get(claim.job_digest)
+        if existing is not None:
+            return existing == result
+        self.attempt_two_results[claim.job_digest] = result
+        return True
+
 
 def request(**overrides: Any) -> ResearchIngestionRequest:
     values = {
@@ -226,6 +290,50 @@ def exception_graph_text(error: BaseException) -> str:
         if current.__context__ is not None:
             pending.append(current.__context__)
     return "".join(rendered)
+
+
+def seed_attempt_two_legacy(
+    checkpoints: MemoryCheckpoints,
+    item: FilingReference,
+    *,
+    request_value: ResearchIngestionRequest | None = None,
+    failure_stage: IngestionFailureStage = IngestionFailureStage.VECTOR_VERIFICATION,
+) -> tuple[ResearchIngestionJob, IngestionCheckpointStore.Record]:
+    selected_request = request_value or request(limit=1, apply=True)
+    job = ResearchIngestionJob.from_plan(selected_request, (item,))
+    checkpoint = IngestionCheckpointStore.Record(
+        job_digest=job.job_digest,
+        cursor_digest=job.cursor_for(item.accession_number),
+        processed_count=0,
+        failed_count=1,
+        complete=True,
+    )
+    first_claim = IngestionRetryClaim(
+        job_digest=job.job_digest,
+        attempt_digest="1" * 64,
+        checkpoint_digest=hashlib.sha256(
+            (
+                '{"complete":true,"cursor_digest":"'
+                + checkpoint.cursor_digest
+                + '","failed_count":1,"job_digest":"'
+                + checkpoint.job_digest
+                + '","processed_count":0}'
+            ).encode()
+        ).hexdigest(),
+        cursor_digest=checkpoint.cursor_digest,
+    )
+    first_result = IngestionRetryResult(
+        job_digest=job.job_digest,
+        attempt_digest=first_claim.attempt_digest,
+        state=IngestionRetryState.FAILED,
+        failure_stage=failure_stage,
+        inserted_count=0,
+        removed_count=0,
+    )
+    checkpoints.values[job.job_digest] = checkpoint
+    checkpoints.claims[job.job_digest] = first_claim
+    checkpoints.results[job.job_digest] = first_result
+    return job, checkpoint
 
 
 @pytest.mark.asyncio
@@ -418,6 +526,317 @@ async def test_exact_legacy_failure_requires_explicit_retry_and_recovers_once() 
     assert core.ingested == (item.accession_number,)
     assert checkpoints.values[dry.opaque_job_id] == legacy
     assert checkpoints.results[dry.opaque_job_id].state is IngestionRetryState.SUCCEEDED
+
+
+def test_attempt_two_request_requires_apply_opaque_job_and_excludes_first_retry() -> None:
+    with pytest.raises(ValueError, match="attempt two"):
+        request(retry_failed_attempt_two="a" * 64)
+    with pytest.raises(ValueError, match="attempt two"):
+        request(apply=True, retry_failed_attempt_two="not-a-job")
+    with pytest.raises(ValueError, match="attempt two"):
+        request(
+            apply=True,
+            retry_failed=True,
+            retry_failed_attempt_two="a" * 64,
+        )
+
+    with pytest.raises(ValueError, match="authorization"):
+        request(limit=1, apply=True, retry_failed_attempt_two="a" * 64)
+    with pytest.raises(ValueError, match="authorization"):
+        request(
+            limit=1,
+            apply=True,
+            retry_failed_attempt_two="a" * 64,
+            retry_failed_attempt_two_authorization="not-a-digest",
+        )
+    with pytest.raises(ValueError, match="authorization"):
+        request(
+            retry_failed_attempt_two_authorization="b" * 64,
+        )
+
+    accepted = request(
+        limit=1,
+        apply=True,
+        retry_failed_attempt_two="a" * 64,
+        retry_failed_attempt_two_authorization="b" * 64,
+    )
+    assert accepted.retry_failed_attempt_two == "a" * 64
+    assert accepted.retry_failed_attempt_two_authorization == "b" * 64
+    assert "b" * 64 not in repr(accepted)
+
+
+@pytest.mark.asyncio
+async def test_attempt_two_wrong_authorization_makes_zero_claim_or_provider_calls() -> None:
+    item = reference()
+    checkpoints = MemoryCheckpoints({})
+    job, _ = seed_attempt_two_legacy(checkpoints, item)
+    source = FakeSource((item,))
+
+    with pytest.raises(ResearchIngestionRetryError) as caught:
+        await ResearchIngestionRunner(
+            source=source,
+            parser=FakeParser(),
+            core=FakeCore(),
+            checkpoints=checkpoints,
+        ).run(
+            request(
+                limit=1,
+                apply=True,
+                retry_failed_attempt_two=job.job_digest,
+                retry_failed_attempt_two_authorization="f" * 64,
+            ),
+            deadline=RequestDeadline.after(30.0),
+        )
+
+    assert checkpoints.attempt_two_claims == {}
+    assert source.discoveries == ()
+    assert source.fetches == ()
+    assert "f" * 64 not in exception_graph_text(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_attempt_two_claims_before_discovery_and_preserves_legacy_bytes() -> None:
+    item = reference()
+    checkpoints = MemoryCheckpoints({})
+    request_value = request(limit=1, apply=True)
+    job, checkpoint = seed_attempt_two_legacy(
+        checkpoints,
+        item,
+        request_value=request_value,
+    )
+    legacy_bytes = (
+        repr(checkpoint),
+        checkpoints.claims[job.job_digest].to_json(),
+        checkpoints.results[job.job_digest].to_json(),
+    )
+
+    class ClaimAwareSource(FakeSource):
+        async def discover(self, discovery_request, *, deadline):
+            assert job.job_digest in checkpoints.attempt_two_claims
+            return await super().discover(discovery_request, deadline=deadline)
+
+    core = FakeCore()
+    runner = ResearchIngestionRunner(
+        source=ClaimAwareSource((item,)),
+        parser=FakeParser(),
+        core=core,
+        checkpoints=checkpoints,
+    )
+    result = await runner.run(
+        request(
+            limit=1,
+            apply=True,
+            retry_failed_attempt_two=job.job_digest,
+            retry_failed_attempt_two_authorization=checkpoints.claims[
+                job.job_digest
+            ].attempt_digest,
+        ),
+        deadline=RequestDeadline.after(30.0),
+    )
+
+    assert result.processed_count == 1
+    assert result.failed_count == 0
+    assert checkpoints.attempt_two_results[job.job_digest].state is IngestionRetryState.SUCCEEDED
+    assert (
+        repr(checkpoints.values[job.job_digest]),
+        checkpoints.claims[job.job_digest].to_json(),
+        checkpoints.results[job.job_digest].to_json(),
+    ) == legacy_bytes
+
+
+@pytest.mark.asyncio
+async def test_attempt_two_terminal_success_is_idempotent_with_zero_provider_calls() -> None:
+    item = reference()
+    checkpoints = MemoryCheckpoints({})
+    job, _ = seed_attempt_two_legacy(checkpoints, item)
+    source = FakeSource((item,))
+    core = FakeCore()
+    runner = ResearchIngestionRunner(
+        source=source,
+        parser=FakeParser(),
+        core=core,
+        checkpoints=checkpoints,
+    )
+    selected = request(
+        limit=1,
+        apply=True,
+        retry_failed_attempt_two=job.job_digest,
+        retry_failed_attempt_two_authorization=checkpoints.claims[job.job_digest].attempt_digest,
+    )
+    first = await runner.run(selected, deadline=RequestDeadline.after(30.0))
+    discoveries_after_first = source.discoveries
+    fetches_after_first = source.fetches
+    ingested_after_first = core.ingested
+
+    repeated = await runner.run(selected, deadline=RequestDeadline.after(30.0))
+
+    assert first.processed_count == 1
+    assert repeated.opaque_job_id == job.job_digest
+    assert repeated.processed_count == 0
+    assert repeated.skipped_count == 1
+    assert source.discoveries == discoveries_after_first
+    assert source.fetches == fetches_after_first
+    assert core.ingested == ingested_after_first
+
+
+@pytest.mark.asyncio
+async def test_attempt_two_failed_terminal_and_stale_claim_never_call_providers() -> None:
+    sensitive_sentinel = "private vector payload https://vector.invalid secret-token"
+
+    class FailingCore(FakeCore):
+        async def ingest(self, document, *, deadline=None, retry_failed=False):
+            del document, retry_failed
+            if deadline is not None:
+                deadline.raise_if_expired()
+            try:
+                raise RuntimeError(sensitive_sentinel)
+            except RuntimeError:
+                raise IngestionStageError(IngestionFailureStage.VECTOR_VERIFICATION) from None
+
+    item = reference()
+    checkpoints = MemoryCheckpoints({})
+    job, _ = seed_attempt_two_legacy(checkpoints, item)
+    source = FakeSource((item,))
+    runner = ResearchIngestionRunner(
+        source=source,
+        parser=FakeParser(),
+        core=FailingCore(),
+        checkpoints=checkpoints,
+    )
+    selected = request(
+        limit=1,
+        apply=True,
+        retry_failed_attempt_two=job.job_digest,
+        retry_failed_attempt_two_authorization=checkpoints.claims[job.job_digest].attempt_digest,
+    )
+
+    failed = await runner.run(selected, deadline=RequestDeadline.after(30.0))
+    calls_after_failure = (source.discoveries, source.fetches)
+    replayed = await runner.run(selected, deadline=RequestDeadline.after(30.0))
+
+    assert failed.failure_stages == (IngestionFailureStage.VECTOR_VERIFICATION,)
+    assert replayed.failed_count == 1
+    assert replayed.recovery_state.value == "attempt_two_already_failed"
+    assert checkpoints.attempt_two_results[job.job_digest].state is IngestionRetryState.FAILED
+    assert (source.discoveries, source.fetches) == calls_after_failure
+    assert sensitive_sentinel not in repr(replayed)
+
+    checkpoints.attempt_two_results.clear()
+    with pytest.raises(ResearchIngestionRetryError):
+        await runner.run(selected, deadline=RequestDeadline.after(30.0))
+    assert (source.discoveries, source.fetches) == calls_after_failure
+
+
+@pytest.mark.asyncio
+async def test_attempt_two_rejects_concurrent_claim_and_discovery_ambiguity_before_fetch() -> None:
+    item = reference()
+    checkpoints = MemoryCheckpoints({})
+    job, _ = seed_attempt_two_legacy(checkpoints, item)
+
+    class LosingCheckpoints(MemoryCheckpoints):
+        async def claim_failed_retry_attempt_two(self, *args, **kwargs):
+            del args, kwargs
+            return False
+
+    losing = LosingCheckpoints(
+        checkpoints.values,
+        checkpoints.claims,
+        checkpoints.results,
+    )
+    losing_source = FakeSource((item,))
+    selected = request(
+        limit=1,
+        apply=True,
+        retry_failed_attempt_two=job.job_digest,
+        retry_failed_attempt_two_authorization=checkpoints.claims[job.job_digest].attempt_digest,
+    )
+    with pytest.raises(ResearchIngestionRetryError):
+        await ResearchIngestionRunner(
+            source=losing_source,
+            parser=FakeParser(),
+            core=FakeCore(),
+            checkpoints=losing,
+        ).run(selected, deadline=RequestDeadline.after(30.0))
+    assert losing_source.discoveries == ()
+
+    ambiguous_source = FakeSource((reference("0000320193-25-000002"),))
+    with pytest.raises(IngestionStageError) as caught:
+        await ResearchIngestionRunner(
+            source=ambiguous_source,
+            parser=FakeParser(),
+            core=FakeCore(),
+            checkpoints=checkpoints,
+        ).run(selected, deadline=RequestDeadline.after(30.0))
+    assert caught.value.stage is IngestionFailureStage.CHECKPOINTING
+    assert len(ambiguous_source.discoveries) == 1
+    assert ambiguous_source.fetches == ()
+
+
+@pytest.mark.asyncio
+async def test_attempt_two_discovery_timeout_terminalizes_when_deadline_remains() -> None:
+    item = reference()
+    checkpoints = MemoryCheckpoints({})
+    job, _ = seed_attempt_two_legacy(checkpoints, item)
+
+    class TimingOutSource(FakeSource):
+        async def discover(self, discovery_request, *, deadline):
+            del discovery_request, deadline
+            raise TimeoutError("private upstream timeout detail")
+
+    with pytest.raises(TimeoutError):
+        await ResearchIngestionRunner(
+            source=TimingOutSource((item,)),
+            parser=FakeParser(),
+            core=FakeCore(),
+            checkpoints=checkpoints,
+        ).run(
+            request(
+                limit=1,
+                apply=True,
+                retry_failed_attempt_two=job.job_digest,
+                retry_failed_attempt_two_authorization=checkpoints.claims[
+                    job.job_digest
+                ].attempt_digest,
+            ),
+            deadline=RequestDeadline.after(30.0),
+        )
+
+    terminal = checkpoints.attempt_two_results[job.job_digest]
+    assert terminal.state is IngestionRetryState.FAILED
+    assert terminal.failure_stage is IngestionFailureStage.SEC_FETCH
+
+
+@pytest.mark.asyncio
+async def test_attempt_two_publication_before_finalization_is_not_eligible() -> None:
+    item = reference()
+    checkpoints = MemoryCheckpoints({})
+    job, _ = seed_attempt_two_legacy(
+        checkpoints,
+        item,
+        failure_stage=IngestionFailureStage.REDIS_PUBLICATION,
+    )
+    source = FakeSource((item,))
+
+    with pytest.raises(IngestionStageError) as caught:
+        await ResearchIngestionRunner(
+            source=source,
+            parser=FakeParser(),
+            core=FakeCore(),
+            checkpoints=checkpoints,
+        ).run(
+            request(
+                limit=1,
+                apply=True,
+                retry_failed_attempt_two=job.job_digest,
+                retry_failed_attempt_two_authorization=checkpoints.claims[
+                    job.job_digest
+                ].attempt_digest,
+            ),
+            deadline=RequestDeadline.after(30.0),
+        )
+
+    assert caught.value.stage is IngestionFailureStage.CHECKPOINTING
+    assert source.discoveries == ()
 
 
 @pytest.mark.asyncio

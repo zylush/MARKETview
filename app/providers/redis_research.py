@@ -17,6 +17,8 @@ from app.research.control import (
     GenerationStageRecord,
     GenerationState,
     IngestionCheckpoint,
+    IngestionRetryAttemptTwoClaim,
+    IngestionRetryAttemptTwoSnapshot,
     IngestionRetryClaim,
     IngestionRetryResult,
     IngestionRetrySnapshot,
@@ -96,6 +98,22 @@ _FINISH_RETRY_SCRIPT = (
     "local current=redis.call('get',KEYS[2]); "
     "if current==ARGV[2] then return 1 end; "
     "if current then return -2 end; redis.call('set',KEYS[2],ARGV[2]); return 1"
+)
+_CLAIM_RETRY_ATTEMPT_TWO_SCRIPT = (
+    "if redis.call('get',KEYS[1])~=ARGV[1] then return -1 end; "
+    "if redis.call('get',KEYS[2])~=ARGV[2] then return -2 end; "
+    "if redis.call('get',KEYS[3])~=ARGV[3] then return -3 end; "
+    "if redis.call('exists',KEYS[4])==1 or redis.call('exists',KEYS[5])==1 "
+    "then return 0 end; redis.call('set',KEYS[4],ARGV[4]); return 1"
+)
+_FINISH_RETRY_ATTEMPT_TWO_SCRIPT = (
+    "if redis.call('get',KEYS[1])~=ARGV[1] then return -1 end; "
+    "if redis.call('get',KEYS[2])~=ARGV[2] then return -2 end; "
+    "if redis.call('get',KEYS[3])~=ARGV[3] then return -3 end; "
+    "if redis.call('get',KEYS[4])~=ARGV[4] then return -4 end; "
+    "local current=redis.call('get',KEYS[5]); "
+    "if current==ARGV[5] then return 1 end; "
+    "if current then return 0 end; redis.call('set',KEYS[5],ARGV[5]); return 1"
 )
 _AUTHORIZE_RESERVATION_SCRIPT = (
     "if redis.call('exists',KEYS[1])==1 then return 0 end; "
@@ -359,6 +377,16 @@ class RedisResearchControl:
     @staticmethod
     def _retry_result_key(job_digest: str) -> str:
         return f"{_KEY_PREFIX}:checkpoint-retry-result:{require_public_digest(job_digest)}"
+
+    @staticmethod
+    def _retry_attempt_two_claim_key(job_digest: str) -> str:
+        return f"{_KEY_PREFIX}:checkpoint-retry-attempt-2:{require_public_digest(job_digest)}"
+
+    @staticmethod
+    def _retry_attempt_two_result_key(job_digest: str) -> str:
+        return (
+            f"{_KEY_PREFIX}:checkpoint-retry-attempt-2-result:{require_public_digest(job_digest)}"
+        )
 
     @staticmethod
     def _reservation_key(reservation_digest: str) -> str:
@@ -949,6 +977,104 @@ class RedisResearchControl:
                 2,
                 self._retry_claim_key(claim.job_digest),
                 self._retry_result_key(claim.job_digest),
+                claim.to_json(),
+                result.to_json(),
+            ],
+            deadline=deadline,
+        )
+        return self._cas_result(saved)
+
+    async def load_retry_attempt_two_snapshot(
+        self, *, job_digest: str, deadline: RequestDeadline
+    ) -> IngestionRetryAttemptTwoSnapshot:
+        checked = require_public_digest(job_digest, "job digest")
+        raw = await self._command(
+            [
+                "MGET",
+                self._checkpoint_key(checked),
+                self._retry_claim_key(checked),
+                self._retry_result_key(checked),
+                self._retry_attempt_two_claim_key(checked),
+                self._retry_attempt_two_result_key(checked),
+            ],
+            deadline=deadline,
+        )
+        if not isinstance(raw, list) or len(raw) != 5:
+            _raise_unavailable()
+        try:
+            checkpoint = None if raw[0] is None else IngestionCheckpoint.from_json(raw[0])
+            first_claim = None if raw[1] is None else IngestionRetryClaim.from_json(raw[1])
+            first_result = None if raw[2] is None else IngestionRetryResult.from_json(raw[2])
+            claim = None if raw[3] is None else IngestionRetryAttemptTwoClaim.from_json(raw[3])
+            result = None if raw[4] is None else IngestionRetryResult.from_json(raw[4])
+            if checkpoint is None or first_claim is None or first_result is None:
+                raise ValueError("attempt-two snapshot is missing its legacy records")
+            snapshot = IngestionRetryAttemptTwoSnapshot(
+                checkpoint,
+                first_claim,
+                first_result,
+                claim,
+                result,
+            )
+        except ValueError:
+            _raise_unavailable()
+        if snapshot.checkpoint.job_digest != checked:
+            _raise_unavailable()
+        return snapshot
+
+    async def claim_failed_retry_attempt_two(
+        self,
+        *,
+        checkpoint: IngestionCheckpoint,
+        first_claim: IngestionRetryClaim,
+        first_result: IngestionRetryResult,
+        claim: IngestionRetryAttemptTwoClaim,
+        deadline: RequestDeadline,
+    ) -> bool:
+        IngestionRetryAttemptTwoSnapshot(checkpoint, first_claim, first_result, claim, None)
+        saved = await self._command(
+            [
+                "EVAL",
+                _CLAIM_RETRY_ATTEMPT_TWO_SCRIPT,
+                5,
+                self._checkpoint_key(claim.job_digest),
+                self._retry_claim_key(claim.job_digest),
+                self._retry_result_key(claim.job_digest),
+                self._retry_attempt_two_claim_key(claim.job_digest),
+                self._retry_attempt_two_result_key(claim.job_digest),
+                checkpoint.to_json(),
+                first_claim.to_json(),
+                first_result.to_json(),
+                claim.to_json(),
+            ],
+            deadline=deadline,
+        )
+        return self._cas_result(saved)
+
+    async def finish_failed_retry_attempt_two(
+        self,
+        *,
+        checkpoint: IngestionCheckpoint,
+        first_claim: IngestionRetryClaim,
+        first_result: IngestionRetryResult,
+        claim: IngestionRetryAttemptTwoClaim,
+        result: IngestionRetryResult,
+        deadline: RequestDeadline,
+    ) -> bool:
+        IngestionRetryAttemptTwoSnapshot(checkpoint, first_claim, first_result, claim, result)
+        saved = await self._command(
+            [
+                "EVAL",
+                _FINISH_RETRY_ATTEMPT_TWO_SCRIPT,
+                5,
+                self._checkpoint_key(claim.job_digest),
+                self._retry_claim_key(claim.job_digest),
+                self._retry_result_key(claim.job_digest),
+                self._retry_attempt_two_claim_key(claim.job_digest),
+                self._retry_attempt_two_result_key(claim.job_digest),
+                checkpoint.to_json(),
+                first_claim.to_json(),
+                first_result.to_json(),
                 claim.to_json(),
                 result.to_json(),
             ],

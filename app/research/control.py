@@ -508,6 +508,121 @@ class IngestionRetrySnapshot:
                 raise ValueError("retry claim does not match its immutable checkpoint")
 
 
+@dataclass(frozen=True, slots=True)
+class IngestionRetryAttemptTwoClaim:
+    """Append-only authorization chained to the exact first retry ledger."""
+
+    job_digest: str
+    attempt_digest: str
+    checkpoint_digest: str
+    cursor_digest: str
+    first_claim_digest: str
+    first_result_digest: str
+
+    _KEYS = frozenset(
+        {
+            "attempt_digest",
+            "checkpoint_digest",
+            "cursor_digest",
+            "first_claim_digest",
+            "first_result_digest",
+            "job_digest",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        require_public_digest(self.job_digest, "job digest")
+        require_public_digest(self.attempt_digest, "attempt digest")
+        require_public_digest(self.checkpoint_digest, "checkpoint digest")
+        require_public_digest(self.cursor_digest, "cursor digest")
+        require_public_digest(self.first_claim_digest, "first claim digest")
+        require_public_digest(self.first_result_digest, "first result digest")
+
+    def to_json(self) -> str:
+        return _dump_record(
+            {
+                "attempt_digest": self.attempt_digest,
+                "checkpoint_digest": self.checkpoint_digest,
+                "cursor_digest": self.cursor_digest,
+                "first_claim_digest": self.first_claim_digest,
+                "first_result_digest": self.first_result_digest,
+                "job_digest": self.job_digest,
+            }
+        )
+
+    @classmethod
+    def from_json(cls, raw: object) -> Self:
+        value = _load_record(raw, cls._KEYS)
+        try:
+            return cls(
+                job_digest=value["job_digest"],
+                attempt_digest=value["attempt_digest"],
+                checkpoint_digest=value["checkpoint_digest"],
+                cursor_digest=value["cursor_digest"],
+                first_claim_digest=value["first_claim_digest"],
+                first_result_digest=value["first_result_digest"],
+            )
+        except (TypeError, ValueError):
+            raise ValueError("control record has invalid attempt-two claim data") from None
+
+
+@dataclass(frozen=True, slots=True)
+class IngestionRetryAttemptTwoSnapshot:
+    """Exact legacy failure plus its optional immutable second-attempt records."""
+
+    checkpoint: IngestionCheckpoint
+    first_claim: IngestionRetryClaim
+    first_result: IngestionRetryResult
+    claim: IngestionRetryAttemptTwoClaim | None
+    result: IngestionRetryResult | None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.checkpoint, IngestionCheckpoint)
+            or not isinstance(self.first_claim, IngestionRetryClaim)
+            or not isinstance(self.first_result, IngestionRetryResult)
+        ):
+            raise ValueError("attempt-two snapshot requires its exact legacy records")
+        IngestionRetrySnapshot(self.checkpoint, self.first_claim, self.first_result)
+        if (
+            not self.checkpoint.complete
+            or self.checkpoint.processed_count != 0
+            or self.checkpoint.failed_count != 1
+            or self.checkpoint.cursor_digest is None
+            or self.first_result.state is not IngestionRetryState.FAILED
+            or self.first_result.failure_stage is not IngestionFailureStage.VECTOR_VERIFICATION
+        ):
+            raise ValueError("legacy retry is not eligible for attempt two")
+        if self.claim is None:
+            if self.result is not None:
+                raise ValueError("attempt-two result requires its immutable claim")
+            return
+        if not isinstance(self.claim, IngestionRetryAttemptTwoClaim):
+            raise ValueError("attempt-two claim is invalid")
+        if self.claim.job_digest != self.checkpoint.job_digest:
+            raise ValueError("attempt-two snapshot job digests do not match")
+        if self.claim.attempt_digest == self.first_claim.attempt_digest:
+            raise ValueError("attempt-two claim must use a new attempt digest")
+        expected_digests = (
+            hashlib.sha256(self.checkpoint.to_json().encode("utf-8")).hexdigest(),
+            hashlib.sha256(self.first_claim.to_json().encode("utf-8")).hexdigest(),
+            hashlib.sha256(self.first_result.to_json().encode("utf-8")).hexdigest(),
+        )
+        if (
+            self.claim.checkpoint_digest != expected_digests[0]
+            or self.claim.cursor_digest != self.checkpoint.cursor_digest
+            or self.claim.first_claim_digest != expected_digests[1]
+            or self.claim.first_result_digest != expected_digests[2]
+        ):
+            raise ValueError("attempt-two claim does not match its immutable legacy records")
+        if self.result is not None and (
+            not isinstance(self.result, IngestionRetryResult)
+            or self.result.job_digest != self.claim.job_digest
+            or self.result.attempt_digest != self.claim.attempt_digest
+        ):
+            raise ValueError("attempt-two snapshot attempt records do not match")
+
+
 class ReservationState(StrEnum):
     AUTHORIZED = "AUTHORIZED"
     COMMITTED = "COMMITTED"

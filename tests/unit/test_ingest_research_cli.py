@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 from datetime import date
@@ -9,7 +10,16 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
-from app.research.control import IngestionFailureStage, IngestionStageError
+from app.research.control import (
+    IngestionCheckpoint,
+    IngestionFailureStage,
+    IngestionRetryAttemptTwoClaim,
+    IngestionRetryAttemptTwoSnapshot,
+    IngestionRetryClaim,
+    IngestionRetryResult,
+    IngestionRetryState,
+    IngestionStageError,
+)
 from app.research.domain import (
     GenerationVerificationOutcome,
     GenerationVerificationReason,
@@ -30,13 +40,21 @@ def test_cli_import_does_not_construct_live_adapters(monkeypatch: pytest.MonkeyP
 
 @pytest.mark.asyncio
 async def test_cli_defaults_to_dry_run_and_outputs_sanitized_json(
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     import app.ingest_research as cli
 
+    ignored_authorization = "e" * 64
+    monkeypatch.setenv(
+        "RESEARCH_RETRY_ATTEMPT_TWO_AUTHORIZATION",
+        ignored_authorization,
+    )
+
     async def fake_run(request: Any, *, deadline: Any) -> SimpleNamespace:
         deadline.raise_if_expired()
         assert request.apply is False
+        assert request.retry_failed_attempt_two_authorization is None
         return SimpleNamespace(
             dry_run=True,
             planned_count=1,
@@ -81,9 +99,11 @@ async def test_cli_defaults_to_dry_run_and_outputs_sanitized_json(
         "planned_count": 1,
         "processed_count": 0,
         "removed_count": 0,
+        "recovery_state": "not_requested",
         "skipped_count": 0,
     }
     assert "AAPL" not in capsys.readouterr().err
+    assert ignored_authorization not in json.dumps(output)
 
 
 @pytest.mark.asyncio
@@ -185,6 +205,161 @@ async def test_cli_retry_failed_is_explicit_and_requires_apply() -> None:
     assert seen == {"retry_failed": True}
 
 
+@pytest.mark.asyncio
+async def test_cli_attempt_two_requires_apply_job_digest_and_excludes_first_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import app.ingest_research as cli
+
+    seen: dict[str, object] = {}
+
+    async def fake_run(request: Any, *, deadline: Any) -> SimpleNamespace:
+        deadline.raise_if_expired()
+        seen["job_id"] = request.retry_failed_attempt_two
+        seen["authorization"] = request.retry_failed_attempt_two_authorization
+        return SimpleNamespace(
+            dry_run=False,
+            planned_count=1,
+            processed_count=0,
+            skipped_count=1,
+            failed_count=0,
+            inserted_count=0,
+            removed_count=0,
+            opaque_job_id="a" * 64,
+            errors=(),
+            failure_stages=(),
+            recovery_state=cli.ResearchIngestionRecoveryState.ATTEMPT_TWO_ALREADY_SUCCEEDED,
+        )
+
+    base = [
+        "--symbol",
+        "AAPL",
+        "--cik",
+        "0000320193",
+        "--forms",
+        "10-K",
+        "--from",
+        "2025-01-01",
+        "--to",
+        "2025-12-31",
+        "--limit",
+        "1",
+        "--retry-failed-attempt-two",
+        "a" * 64,
+    ]
+    for invalid in (
+        base,
+        [*base[:-1], "not-a-digest", "--apply"],
+        [*base, "--apply", "--retry-failed"],
+        [*base, "--apply"],
+    ):
+        with pytest.raises(SystemExit) as caught:
+            await cli.async_main(invalid, runner_factory=lambda _: SimpleNamespace(run=fake_run))
+        assert caught.value.code == 2
+
+    literal = "b" * 64
+    with pytest.raises(SystemExit) as caught:
+        await cli.async_main(
+            [
+                *base,
+                "--apply",
+                "--retry-failed-attempt-two-authorization",
+                literal,
+            ],
+            runner_factory=lambda _: SimpleNamespace(run=fake_run),
+        )
+    assert caught.value.code == 2
+    rejected = capsys.readouterr()
+    assert literal not in rejected.out + rejected.err
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "app.ingest_research",
+            *base,
+            "--apply",
+            "--retry-failed-attempt-two-authorization",
+            literal,
+        ],
+    )
+    with pytest.raises(SystemExit) as caught:
+        await cli.async_main(None, runner_factory=lambda _: SimpleNamespace(run=fake_run))
+    assert caught.value.code == 2
+    rejected = capsys.readouterr()
+    assert literal not in rejected.out + rejected.err
+
+    parsed = cli._parser().parse_args([*base, "--apply"])
+    assert not hasattr(parsed, "retry_failed_attempt_two_authorization")
+    monkeypatch.setenv("RESEARCH_RETRY_ATTEMPT_TWO_AUTHORIZATION", literal)
+
+    exit_code = await cli.async_main(
+        [*base, "--apply"],
+        runner_factory=lambda _: SimpleNamespace(run=fake_run),
+    )
+    output = json.loads(capsys.readouterr().out)
+    assert exit_code == cli.EXIT_SUCCESS
+    assert seen == {"job_id": "a" * 64, "authorization": literal}
+    assert output["job_id"] == "a" * 64
+    assert output["recovery_state"] == "attempt_two_already_succeeded"
+    assert literal not in json.dumps(output)
+
+
+@pytest.mark.asyncio
+async def test_cli_attempt_two_failure_output_is_fixed_and_private(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import app.ingest_research as cli
+
+    sensitive_sentinel = "private filing content and secret-token"
+
+    async def fake_run(request: Any, *, deadline: Any) -> SimpleNamespace:
+        del request
+        deadline.raise_if_expired()
+        return SimpleNamespace(
+            dry_run=False,
+            planned_count=1,
+            processed_count=0,
+            skipped_count=0,
+            failed_count=1,
+            inserted_count=0,
+            removed_count=0,
+            opaque_job_id="a" * 64,
+            errors=("ingestion failed during vector_verification",),
+            failure_stages=(IngestionFailureStage.VECTOR_VERIFICATION,),
+            recovery_state=cli.ResearchIngestionRecoveryState.ATTEMPT_TWO_FAILED,
+        )
+
+    monkeypatch.setenv("RESEARCH_RETRY_ATTEMPT_TWO_AUTHORIZATION", "b" * 64)
+    exit_code = await cli.async_main(
+        [
+            "--symbol",
+            "AAPL",
+            "--cik",
+            "0000320193",
+            "--forms",
+            "10-K",
+            "--from",
+            "2025-01-01",
+            "--to",
+            "2025-12-31",
+            "--limit",
+            "1",
+            "--apply",
+            "--retry-failed-attempt-two",
+            "a" * 64,
+        ],
+        runner_factory=lambda _: SimpleNamespace(run=fake_run),
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert exit_code == cli.EXIT_PARTIAL
+    assert output["failure_stages"] == ["vector_verification"]
+    assert output["recovery_state"] == "attempt_two_failed"
+    assert sensitive_sentinel not in json.dumps(output)
+
+
 def test_cli_rejects_invalid_allowlist_arguments_before_factory_call() -> None:
     import app.ingest_research as cli
 
@@ -234,6 +409,97 @@ def test_cli_timeout_is_operator_bounded() -> None:
     assert cli.RunnerConfig(timeout_seconds=900).timeout_seconds == 900.0
     with pytest.raises(ValueError, match="timeout"):
         cli.RunnerConfig(timeout_seconds=901)
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_adapter_preserves_exact_legacy_attempt_two_contract() -> None:
+    import app.ingest_research as cli
+
+    checkpoint = IngestionCheckpoint(
+        job_digest="a" * 64,
+        cursor_digest="b" * 64,
+        processed_count=0,
+        failed_count=1,
+        complete=True,
+    )
+    first_claim = IngestionRetryClaim(
+        job_digest=checkpoint.job_digest,
+        attempt_digest="c" * 64,
+        checkpoint_digest=hashlib.sha256(checkpoint.to_json().encode()).hexdigest(),
+        cursor_digest=checkpoint.cursor_digest,
+    )
+    first_result = IngestionRetryResult(
+        job_digest=checkpoint.job_digest,
+        attempt_digest=first_claim.attempt_digest,
+        state=IngestionRetryState.FAILED,
+        failure_stage=IngestionFailureStage.VECTOR_VERIFICATION,
+        inserted_count=0,
+        removed_count=0,
+    )
+    snapshot = IngestionRetryAttemptTwoSnapshot(
+        checkpoint=checkpoint,
+        first_claim=first_claim,
+        first_result=first_result,
+        claim=None,
+        result=None,
+    )
+    seen: dict[str, object] = {}
+
+    class Backend:
+        async def load_retry_attempt_two_snapshot(self, **kwargs):
+            seen["load"] = kwargs
+            return snapshot
+
+        async def claim_failed_retry_attempt_two(self, **kwargs):
+            seen["claim"] = kwargs
+            return True
+
+        async def finish_failed_retry_attempt_two(self, **kwargs):
+            seen["finish"] = kwargs
+            return True
+
+    deadline = object()
+    store = cli.ControlCheckpointStore(Backend())
+    loaded = await store.load_retry_attempt_two_snapshot(
+        checkpoint.job_digest,
+        deadline=deadline,
+    )
+    claim = IngestionRetryAttemptTwoClaim(
+        job_digest=checkpoint.job_digest,
+        attempt_digest="d" * 64,
+        checkpoint_digest=hashlib.sha256(checkpoint.to_json().encode()).hexdigest(),
+        cursor_digest=checkpoint.cursor_digest,
+        first_claim_digest=hashlib.sha256(first_claim.to_json().encode()).hexdigest(),
+        first_result_digest=hashlib.sha256(first_result.to_json().encode()).hexdigest(),
+    )
+    terminal = IngestionRetryResult(
+        job_digest=checkpoint.job_digest,
+        attempt_digest=claim.attempt_digest,
+        state=IngestionRetryState.SUCCEEDED,
+        failure_stage=None,
+        inserted_count=1,
+        removed_count=0,
+    )
+    assert await store.claim_failed_retry_attempt_two(
+        loaded.checkpoint,
+        loaded.first_claim,
+        loaded.first_result,
+        claim,
+        deadline=deadline,
+    )
+    assert await store.finish_failed_retry_attempt_two(
+        loaded.checkpoint,
+        loaded.first_claim,
+        loaded.first_result,
+        claim,
+        terminal,
+        deadline=deadline,
+    )
+
+    assert seen["load"]["job_digest"] == checkpoint.job_digest
+    assert seen["claim"]["checkpoint"].to_json() == checkpoint.to_json()
+    assert seen["finish"]["first_claim"].to_json() == first_claim.to_json()
+    assert seen["finish"]["first_result"].to_json() == first_result.to_json()
 
 
 @pytest.mark.asyncio

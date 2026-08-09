@@ -172,9 +172,43 @@ one-attempt claim and immutable terminal result. Concurrent claims, stale claims
 multi-filing legacy checkpoints, an active generation, a non-cleaned generation, pending cleanup, or
 any existing/partial/inconsistent Vector state fail closed before paid embedding. A failed recovery
 is not eligible for another automatic attempt. A crash after the claim remains permanently
-fail-closed for this single-owner pilot; do not delete its keys or reclaim it automatically. A future
-append-only recovery-ledger change requires separate design and approval. CLI diagnostics expose only
-fixed failure-stage codes.
+fail-closed for this single-owner pilot; do not delete its keys or reclaim it automatically. CLI
+diagnostics expose only fixed failure-stage codes.
+
+After the first recovery has a terminal `vector_verification` failure and a separately approved
+isolated Vector smoke has passed, an operator may authorize exactly one append-only second attempt.
+The command requires the exact opaque job digest as the value of
+`--retry-failed-attempt-two`:
+
+```powershell
+python -m app.ingest_research `
+  --symbol AAPL `
+  --cik 0000320193 `
+  --forms 10-K `
+  --from 2025-01-01 `
+  --to 2025-12-31 `
+  --limit 1 `
+  --timeout-seconds 300 `
+  --apply `
+  --retry-failed-attempt-two <EXACT_64_HEX_JOB_DIGEST>
+```
+
+This command is documentation, not permission to execute it. Attempt two must receive a separate
+one-time live approval. The authorization digest is the random, non-public attempt digest from the
+immutable first retry claim. Obtain it only through an approved read-only control-plane operation,
+inject it into that single operator process as
+`RESEARCH_RETRY_ATTEMPT_TWO_AUTHORIZATION`, and clear it afterward. The CLI reads this variable only
+when `--retry-failed-attempt-two` is present; it does not accept the authorization value as an
+argument. Never paste, print, log, report, or persist its literal value in shell history.
+The deterministic job digest alone cannot claim attempt two. Before SEC discovery, Redis atomically
+compares the exact original checkpoint, first claim, and first terminal result, then creates only a
+new immutable attempt-two claim. Its terminal result is written to a separate append-only key.
+Neither operation rewrites,
+expires, or deletes the three original records. A concurrent claim loses before any provider call;
+a claim without a terminal result remains permanently fail-closed; and a repeated terminal command
+returns a fixed sanitized replay with zero SEC, OpenAI, or Vector calls. A prior stage other than
+`vector_verification`, an active generation, pending cleanup, or inconsistent control/Vector state
+is ineligible. There is no automatic retry and no third attempt.
 
 Expected exit behavior is deterministic: zero for a successful dry-run/apply or no-op; nonzero for
 argument/configuration, partial filing failure, provider/vector, or control-state failure. Do not
@@ -208,7 +242,7 @@ verification. It never constructs or calls SEC, OpenAI, or Redis providers and n
 write. A result is successful only when the point was verified and its deletion was also verified.
 Do not run it against a Production index without a separate Production-specific approval.
 Even a recorded successful smoke does not authorize another ingestion attempt: an append-only second
-recovery-attempt ledger requires a separate design and approval after the smoke passes.
+recovery attempt requires a separate one-time approval after the smoke passes.
 
 ## Preview-first rollout and bounded smoke test
 
