@@ -41,7 +41,9 @@ from app.errors import (
     ProviderUnavailableError,
     ProviderValidationError,
     QuotaExceededError,
+    SymbolDirectoryUnavailableError,
 )
+from app.services.research import ResearchUnavailableError
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CSRF_COOKIE = "marketdata_csrf"
@@ -67,15 +69,22 @@ def _request_id(value: str | None) -> str:
         return str(uuid.uuid4())
 
 
-def _error_code(status_code: int) -> str:
+def _error_code(status_code: int, message: str = "") -> str:
+    if status_code == 503:
+        return (
+            "rate_limiter_unavailable"
+            if message == "rate limiter unavailable"
+            else "service_unavailable"
+        )
     return {
         401: "unauthorized",
         403: "forbidden",
         404: "not_found",
+        413: "request_too_large",
         422: "VALIDATION_ERROR",
         429: "rate_limit_exceeded",
+        504: "RESEARCH_TIMEOUT" if message == "the research request timed out" else "timeout",
         501: "not_implemented",
-        503: "rate_limiter_unavailable",
     }.get(status_code, "request_error")
 
 
@@ -242,7 +251,7 @@ def create_app(
         allow_origins=[allowed_origin] if allowed_origin else [],
         allow_credentials=True,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type", "X-App-Key", "X-Request-ID"],
+        allow_headers=["Content-Type", "X-App-Key", "X-CSRF-Token", "X-Request-ID"],
         expose_headers=["X-Request-ID"],
     )
     application.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
@@ -251,7 +260,41 @@ def create_app(
     async def request_context(request: Request, call_next: Any) -> Response:
         request.state.request_id = _request_id(request.headers.get("X-Request-ID"))
         request.state.csp_nonce = secrets.token_urlsafe(18)
-        response = cast(Response, await call_next(request))
+        response: Response | None = None
+        if request.method == "POST" and request.url.path == "/api/v1/research/query":
+            maximum_bytes = int(setting(settings, "research_max_request_bytes", 4096))
+            content_length = request.headers.get("Content-Length")
+            try:
+                declared_bytes = int(content_length) if content_length is not None else None
+            except ValueError:
+                declared_bytes = maximum_bytes + 1
+            if declared_bytes is not None and (
+                declared_bytes < 0 or declared_bytes > maximum_bytes
+            ):
+                response = _error_response(
+                    request,
+                    413,
+                    "request_too_large",
+                    "research request body is too large",
+                )
+            else:
+                chunks: tuple[bytes, ...] = ()
+                received_bytes = 0
+                async for chunk in request.stream():
+                    received_bytes += len(chunk)
+                    if received_bytes > maximum_bytes:
+                        response = _error_response(
+                            request,
+                            413,
+                            "request_too_large",
+                            "research request body is too large",
+                        )
+                        break
+                    chunks = (*chunks, chunk)
+                if response is None:
+                    request._body = b"".join(chunks)
+        if response is None:
+            response = cast(Response, await call_next(request))
         response.headers["X-Request-ID"] = request.state.request_id
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
@@ -273,12 +316,43 @@ def create_app(
     @application.exception_handler(HTTPException)
     async def http_exception(request: Request, exc: HTTPException) -> JSONResponse:
         message = str(exc.detail) if isinstance(exc.detail, str) else "request failed"
-        return _error_response(request, exc.status_code, _error_code(exc.status_code), message)
+        return _error_response(
+            request,
+            exc.status_code,
+            _error_code(exc.status_code, message),
+            message,
+        )
 
     @application.exception_handler(RequestValidationError)
     async def validation_exception(request: Request, exc: RequestValidationError) -> JSONResponse:
         del exc
         return _error_response(request, 422, "VALIDATION_ERROR", "request validation failed")
+
+    @application.exception_handler(ResearchUnavailableError)
+    async def research_unavailable(
+        request: Request,
+        exc: ResearchUnavailableError,
+    ) -> JSONResponse:
+        del exc
+        return _error_response(
+            request,
+            503,
+            "RESEARCH_UNAVAILABLE",
+            "research is not configured",
+        )
+
+    @application.exception_handler(SymbolDirectoryUnavailableError)
+    async def symbol_directory_unavailable(
+        request: Request,
+        exc: SymbolDirectoryUnavailableError,
+    ) -> JSONResponse:
+        del exc
+        return _error_response(
+            request,
+            503,
+            "SYMBOL_DIRECTORY_UNAVAILABLE",
+            "the symbol directory is unavailable",
+        )
 
     @application.exception_handler(MarketDataError)
     async def market_data_exception(request: Request, exc: MarketDataError) -> JSONResponse:
@@ -477,6 +551,7 @@ def create_app(
             service,
             cache,
             session_authorizer=lambda request: bool(_session_subject(request, signer, cookie_name)),
+            csrf_validator=validate_csrf,
         )
     )
     return application

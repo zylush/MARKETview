@@ -4,17 +4,25 @@
 
 This read-only Market Data facade is constrained by a small daily allowance and Vercel's
 stateless functions. Redis controls are therefore correctness requirements, not optional speedups.
-The public v1 surface covers latest daily EOD, historical daily EOD, and local usage. Ticker and
-exchange discovery, company metadata, splits, and dividends are intentionally absent.
+The public v1 surface covers latest daily EOD, historical daily EOD, local usage, and cached SEC
+company-ticker search. Exchange resources, company-detail resources, splits, and dividends are
+intentionally absent. An opt-in, citation-grounded SEC-filings research path is implemented for a
+one-owner pilot and remains disabled unless its complete approved provider stack is configured.
 
 ```text
 Browser / API client
         |
 Vercel rewrite -> api/index.py -> FastAPI routes/security
                                       |
-                              market data service
-                                /           \
-                         Upstash Redis   Market Data /v1
+                    dashboard service composition
+                       /              |             \
+             market data       symbol search       SEC research
+               /    \               |              /    |    \
+      Upstash Redis  Market Data /v1 |       OpenAI  Vector  Redis control
+                                     +-- Upstash Redis prefix index
+
+Operator-only command -> SEC ticker directory -> validate/bucket -> Upstash manifest switch
+Operator-only ingestion -> SEC filings -> parse/chunk/embed -> stage/verify/publish/cleanup
 ```
 
 `api/index.py` is the ASGI entry. `app/` owns settings, validation, security, adapters, and
@@ -23,12 +31,100 @@ in a signed Secure, HttpOnly, SameSite=Strict cookie. Upstash holds cache entrie
 distributed locks, and daily UTC credit accounting. Nothing depends on writable local storage,
 background workers, shared process memory, or instance-local locks.
 
+## Symbol-directory boundary
+
+`GET /api/v1/symbols/search` validates two-to-32-character queries, caps results at eight, applies
+a separate Redis rate limit, and reads only the active manifest plus relevant two-character
+prefix buckets. Ranking puts ticker-prefix matches before company-name token-prefix matches and is
+deterministic. Results include SEC source, as-of time, and stale status. External text is validated
+server-side and inserted into the browser with `textContent` only.
+
+The request path has no directory source and cannot refresh. `python -m app.refresh_symbols` is the
+separate control plane: it requires a descriptive contact `SEC_USER_AGENT`, makes one bounded
+non-retrying request to the fixed
+[SEC directory URL](https://www.sec.gov/files/company_tickers_exchange.json), validates at most
+100,000 rows, writes an
+immutable generation, and publishes its manifest last. Failed source or bucket writes preserve
+the previous generation. SEC does not guarantee ticker-association accuracy or coverage; the UI
+therefore preserves exact-symbol submission. This flow costs no Market Data credits.
+
+## Research/RAG boundary
+
+The approved implementation uses [SEC EDGAR submissions and Archives](https://www.sec.gov/search-filings/edgar-application-programming-interfaces),
+OpenAI `text-embedding-3-small` at exactly 1536 dimensions, OpenAI `gpt-5.6-luna`, a separate
+Upstash Vector index, and the existing Upstash Redis instance as the research control plane.
+`RESEARCH_ENABLED=false` is the safe default. The OpenAI key, Vector URL, and Vector token form an
+all-or-none group; partial credentials or a non-approved provider/model/dimension fail settings
+validation. Redis and Vector credentials are distinct and are never interchangeable.
+
+```text
+Operator CLI (never web/startup/CI)
+  -> validate symbol + CIK + forms + inclusive dates + count
+  -> fixed SEC submissions/Archives origins (descriptive User-Agent, <=5 requests/s)
+  -> safe HTML/Inline XBRL visible-text parser (no DTD/entity/network loading)
+  -> deterministic bounded overlapping chunks
+  -> OpenAI embeddings
+  -> stage immutable Vector generation
+  -> verify expected IDs/count
+  -> compare-and-swap the Redis active-generation manifest
+  -> checkpoint completion, then clean the superseded Vector generation
+
+Authenticated query
+  -> validate/authenticate/CSRF/rate-limit/reserve global budget
+  -> embed bounded question
+  -> read active manifests from Redis
+  -> Vector provider filter by symbol + corpus/model
+  -> defensive active-generation/metadata/symbol/score filtering
+  -> OpenAI strict structured generation (store=false, no tools)
+  -> verify evidence IDs/quotes and construct canonical SEC citations
+```
+
+Immutable metadata binds each evidence chunk to symbol, CIK, accession, form, filing date,
+canonical SEC Archives URL, parsed-content hash, corpus/chunker/embedding versions, active
+generation, ordinal, and deterministic chunk ID. Embedding vectors are separated from evidence
+objects and are never sent to answer generation. Raw downloaded filings are held only in bounded
+ingestion memory and are not persisted. Normalized public filing chunks live in Vector; Redis
+stores only control data such as manifests, checkpoints, locks, and budget counters.
+
+Generation replacement is fail-safe. New points are staged under immutable IDs, verified, and
+published through a compare-and-swap Redis control manifest before old points are eligible for
+cleanup. An interruption before publication leaves the old generation active; an interruption after
+publication leaves the verified new generation active and cleanup resumable. Content hashes and
+accessions make reruns idempotent. Neither ingestion nor SEC discovery can execute from an
+interactive request, application lifespan hook, Vercel deployment hook, browser, or normal CI.
+
+Retrieved filing text is always untrusted data. The vector query restricts symbol and active
+versions, and the core repeats those checks after retrieval. Generated claims must reference
+retrieved chunk IDs and verified evidence. URLs are never accepted from the model; citations are
+derived from validated SEC metadata and must use canonical Archives HTTPS paths. Weak, absent,
+conflicting, cross-symbol, malformed, or unsupported evidence yields `insufficient_evidence`.
+Personalized buy/sell/hold requests are refused before paid retrieval. Research is isolated from
+deterministic market-price generation, Market Data cache keys, and Market Data credit accounting.
+
+Interactive research uses the existing authenticated POST, same-origin double-submit CSRF for
+sessions, a 4 KB body ceiling, a 500-character question ceiling, separate per-client rate limiting,
+and an atomic UTC global daily reservation. A reservation is released only when failure is known to
+occur before a paid call may have started; timeouts or downstream failures after that marker remain
+charged conservatively. The current shared dashboard subject is not a real user identity, so this
+is a one-owner pilot with a global budget, not a per-user spending system.
+
+Vercel allows 10 seconds for `api/index.py`; the application deadline defaults to eight seconds and
+is shared across embedding, Vector retrieval, and generation. Interactive adapters make no retry.
+Long-running SEC discovery and ingestion are operator processes outside the Vercel function.
+Operational rollout and every live action remain separately approval-gated; see
+[the research runbook](research-runbook.md).
+
 ## API, cache, and credential boundaries
 
 | Boundary | Value | Purpose |
 | --- | --- | --- |
 | Application API | `/api/v1/*` | Stable client-facing routes owned by this service. |
 | Provider API | `https://api.marketdata.app/v1` | Exact production root for server-only Market Data requests. |
+| SEC discovery | `https://data.sec.gov/submissions/*` | Fixed operator-only filing metadata source. |
+| SEC documents | `https://www.sec.gov/Archives/edgar/data/*` | Fixed canonical filing-document source. |
+| OpenAI API | `https://api.openai.com/v1` | Fixed server-only embeddings and Responses API root. |
+| Vector data | Separate Upstash Vector HTTPS root | Public normalized chunks and immutable generation metadata. |
+| Research control | Existing Upstash Redis HTTPS root | Locks, checkpoints, manifests, active pointers, and budgets. |
 | Cache schema | `cache_schema_version = "v2"` | Internal Redis compatibility marker, independent of both HTTP APIs. |
 
 `MARKETDATA_TOKEN` is the outbound provider credential. It is unwrapped only at the provider
@@ -110,6 +206,11 @@ Provider logging is restricted to fixed safe fields such as request ID, failure 
 upstream status, and a whitelisted semantic code. It excludes credentials, authorization headers,
 provider URLs, parameters, payloads, symbols, dates, and raw exceptions.
 
+Research observability follows the stricter rule: log only request ID, sanitized stage/category,
+duration/count buckets, outcome, and whether a cost reservation remains charged. Never log complete
+questions, prompts, generated output, filing bodies, chunk text, embeddings, vector payloads,
+authorization headers, credentials, raw provider responses, or exceptions retaining requests.
+
 JSON uses a consistent `success`, `data`, `meta`, and `error` envelope. Successful market-data
 metadata contains `request_id`, `source`, `as_of`, `cached`, `stale`, and `pagination`. Validation
 is `422`; application authentication/authorization is `401`/`403`; local budget and provider
@@ -124,13 +225,15 @@ The supported routes are:
 - `GET /api/v1/eod/latest/{symbol}`
 - `GET /api/v1/eod/history/{symbol}`
 - `GET /api/v1/usage`
+- `GET /api/v1/symbols/search`
+- `POST /api/v1/research/query` (fail-closed unless the complete approved stack is enabled)
 - `POST /auth/login` and `POST /auth/logout`
 - Authenticated `/docs`, `/redoc`, and `/openapi.json`
 - Public `GET /health`
 
-Removed ticker, exchange, split, and dividend routes return `404` and do not call the service or
-provider. The dashboard submits a direct symbol and initially requests only latest, history, and
-local usage.
+Removed legacy ticker-resource, exchange, split, and dividend routes return `404` and do not call
+the service or provider. The dashboard offers SEC-backed autocomplete while preserving direct
+symbol submission; selecting a suggestion loads only latest, history, and local usage.
 
 Production requires `MARKETDATA_TOKEN` and an upstream root that normalizes to exactly
 `https://api.marketdata.app/v1`. HTTP, alternate hosts, ports, userinfo, queries, fragments,

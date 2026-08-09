@@ -32,20 +32,16 @@ def setting(settings: object, name: str, default: Any = None, *aliases: str) -> 
 
 def rate_limit_identity(request: Request, settings: object) -> str:
     platform = str(setting(settings, "deployment_platform", "", "platform")).lower()
-    trust_forwarded = bool(setting(settings, "trust_proxy_headers", False, "is_vercel"))
-    trust_forwarded = (
-        trust_forwarded
-        or platform in {"vercel", "deployed"}
-        or os.getenv("VERCEL", "").lower() in {"1", "true"}
-    )
-    if trust_forwarded:
-        for header in ("X-Vercel-Forwarded-For", "X-Forwarded-For"):
-            for value in request.headers.get(header, "").split(","):
-                candidate = value.strip()
-                try:
-                    return ipaddress.ip_address(candidate).compressed
-                except ValueError:
-                    continue
+    is_deployed = platform in {"vercel", "deployed"} or os.getenv("VERCEL", "").lower() in {
+        "1",
+        "true",
+    }
+    if is_deployed:
+        candidate = request.headers.get("X-Forwarded-For", "").strip()
+        try:
+            return ipaddress.ip_address(candidate).compressed
+        except ValueError:
+            pass
     return request.client.host if request.client else "unknown"
 
 

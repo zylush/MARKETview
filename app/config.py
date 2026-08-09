@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import secrets
 from functools import lru_cache
 from typing import Annotated, Any, cast
@@ -17,7 +18,9 @@ from pydantic_core import InitErrorDetails
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 _INVALID_MARKETDATA_TOKEN = "__invalid_marketdata_token__"  # noqa: S105
+_INVALID_RESEARCH_SECRET = "__invalid_research_secret__"  # noqa: S105
 _PRODUCTION_MARKETDATA_BASE_URL = "https://api.marketdata.app/v1"
+_SEC_CONTACT_EMAIL = re.compile(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
 _TOKEN_PLACEHOLDERS = frozenset(
     {
         "<your-marketdata-token>",
@@ -50,6 +53,25 @@ def _normalized_token_secret(value: object) -> SecretStr:
         or (placeholder.startswith("<") and placeholder.endswith(">"))
     ):
         return SecretStr(_INVALID_MARKETDATA_TOKEN)
+    return SecretStr(normalized)
+
+
+def _normalized_research_secret(value: object) -> SecretStr:
+    if not isinstance(value, (str, SecretStr)):
+        return SecretStr(_INVALID_RESEARCH_SECRET)
+    raw = value.get_secret_value() if isinstance(value, SecretStr) else value
+    normalized = raw.strip()
+    placeholder = normalized.lower()
+    if (
+        not normalized
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw)
+        or (
+            len(normalized) >= 2 and normalized[0] in {"'", '"'} and normalized[-1] == normalized[0]
+        )
+        or placeholder in _TOKEN_PLACEHOLDERS
+        or (placeholder.startswith("<") and placeholder.endswith(">"))
+    ):
+        return SecretStr(_INVALID_RESEARCH_SECRET)
     return SecretStr(normalized)
 
 
@@ -88,6 +110,133 @@ class Settings(BaseSettings):
         validation_alias="MARKETDATA_DAILY_CREDIT_BUDGET",
     )
     cache_schema_version: str = "v2"
+
+    sec_user_agent: str = Field(default="", validation_alias="SEC_USER_AGENT", max_length=200)
+    symbol_index_schema_version: str = Field(
+        default="v1",
+        validation_alias="SYMBOL_INDEX_SCHEMA_VERSION",
+        pattern=r"^v[1-9][0-9]{0,5}$",
+    )
+    symbol_directory_max_age_seconds: int = Field(
+        default=24 * 3600,
+        gt=0,
+        le=30 * 24 * 3600,
+        validation_alias="SYMBOL_DIRECTORY_MAX_AGE_SECONDS",
+    )
+    symbol_search_rate_limit: int = Field(
+        default=30,
+        gt=0,
+        validation_alias="SYMBOL_SEARCH_RATE_LIMIT",
+    )
+    research_enabled: bool = Field(default=False, validation_alias="RESEARCH_ENABLED")
+    research_max_question_chars: int = Field(
+        default=500,
+        ge=50,
+        le=500,
+        validation_alias="RESEARCH_MAX_QUESTION_CHARS",
+    )
+    research_max_request_bytes: int = Field(
+        default=4096,
+        ge=1024,
+        le=65536,
+        validation_alias="RESEARCH_MAX_REQUEST_BYTES",
+    )
+    research_timeout_seconds: float = Field(
+        default=8.0,
+        gt=0,
+        le=10,
+        validation_alias="RESEARCH_TIMEOUT_SECONDS",
+    )
+    research_rate_limit: int = Field(
+        default=10,
+        gt=0,
+        validation_alias="RESEARCH_RATE_LIMIT",
+    )
+    research_daily_global_limit: int = Field(
+        default=100,
+        gt=0,
+        validation_alias="RESEARCH_DAILY_GLOBAL_LIMIT",
+    )
+    openai_api_key: SecretStr | None = Field(default=None, validation_alias="OPENAI_API_KEY")
+    upstash_vector_rest_url: str | None = Field(
+        default=None,
+        validation_alias="UPSTASH_VECTOR_REST_URL",
+    )
+    upstash_vector_rest_token: SecretStr | None = Field(
+        default=None,
+        validation_alias="UPSTASH_VECTOR_REST_TOKEN",
+    )
+    research_embedding_provider: str = Field(
+        default="openai",
+        validation_alias="RESEARCH_EMBEDDING_PROVIDER",
+    )
+    research_embedding_model: str = Field(
+        default="text-embedding-3-small",
+        validation_alias="RESEARCH_EMBEDDING_MODEL",
+    )
+    research_embedding_dimensions: int = Field(
+        default=1536,
+        ge=1,
+        le=65_536,
+        validation_alias="RESEARCH_EMBEDDING_DIMENSIONS",
+    )
+    research_generation_provider: str = Field(
+        default="openai",
+        validation_alias="RESEARCH_GENERATION_PROVIDER",
+    )
+    research_generation_model: str = Field(
+        default="gpt-5.6-luna",
+        validation_alias="RESEARCH_GENERATION_MODEL",
+    )
+    research_generation_max_output_tokens: int = Field(
+        default=700,
+        ge=128,
+        le=4096,
+        validation_alias="RESEARCH_GENERATION_MAX_OUTPUT_TOKENS",
+    )
+    research_vector_provider: str = Field(
+        default="upstash",
+        validation_alias="RESEARCH_VECTOR_PROVIDER",
+    )
+    research_vector_namespace: str = Field(
+        default="sec-filings-v1",
+        validation_alias="RESEARCH_VECTOR_NAMESPACE",
+    )
+    research_index_schema_version: str = Field(
+        default="v1",
+        pattern=r"^v[1-9][0-9]{0,5}$",
+        validation_alias="RESEARCH_INDEX_SCHEMA_VERSION",
+    )
+    research_chunk_tokens: int = Field(
+        default=800,
+        ge=100,
+        le=4000,
+        validation_alias="RESEARCH_CHUNK_TOKENS",
+    )
+    research_chunk_overlap_tokens: int = Field(
+        default=100,
+        ge=0,
+        le=1000,
+        validation_alias="RESEARCH_CHUNK_OVERLAP_TOKENS",
+    )
+    research_max_results: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        validation_alias="RESEARCH_MAX_RESULTS",
+    )
+    research_vector_overfetch: int = Field(
+        default=4,
+        ge=1,
+        le=10,
+        validation_alias="RESEARCH_VECTOR_OVERFETCH",
+    )
+    research_minimum_score: float = Field(
+        default=0.70,
+        ge=0,
+        le=1,
+        validation_alias="RESEARCH_MINIMUM_SCORE",
+    )
 
     upstash_redis_rest_url: str | None = None
     upstash_redis_rest_token: SecretStr | None = None
@@ -138,9 +287,17 @@ class Settings(BaseSettings):
             "upstash_redis_rest_token",
             "UPSTASH_REDIS_REST_TOKEN",
         }
+        research_secret_keys = {
+            "openai_api_key",
+            "OPENAI_API_KEY",
+            "upstash_vector_rest_token",
+            "UPSTASH_VECTOR_REST_TOKEN",
+        }
         protected = {
             key: _normalized_token_secret(value)
             if key in token_keys
+            else _normalized_research_secret(value)
+            if key in research_secret_keys
             else SecretStr(value)
             if key in other_secret_keys and isinstance(value, str)
             else value
@@ -159,6 +316,13 @@ class Settings(BaseSettings):
     def reject_invalid_marketdata_token(cls, value: SecretStr) -> SecretStr:
         if value.get_secret_value() == _INVALID_MARKETDATA_TOKEN:
             raise ValueError("MARKETDATA_TOKEN is invalid")
+        return value
+
+    @field_validator("openai_api_key", "upstash_vector_rest_token")
+    @classmethod
+    def reject_invalid_research_secret(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and value.get_secret_value() == _INVALID_RESEARCH_SECRET:
+            raise ValueError("research provider credential is invalid")
         return value
 
     @field_validator("marketdata_base_url", mode="before")
@@ -190,6 +354,54 @@ class Settings(BaseSettings):
     def strip_trailing_slash(cls, value: object) -> object:
         return value.rstrip("/") if isinstance(value, str) else value
 
+    @field_validator("upstash_vector_rest_url", mode="before")
+    @classmethod
+    def normalize_upstash_vector_url(cls, value: object) -> object:
+        if value is None:
+            return value
+        if not isinstance(value, str):
+            raise ValueError("UPSTASH_VECTOR_REST_URL must be an Upstash HTTPS root")
+        normalized = value.strip().rstrip("/")
+        try:
+            parsed = urlsplit(normalized)
+            port = parsed.port
+        except ValueError:
+            raise ValueError("UPSTASH_VECTOR_REST_URL must be an Upstash HTTPS root") from None
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or not parsed.hostname.lower().endswith(".upstash.io")
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("UPSTASH_VECTOR_REST_URL must be an Upstash HTTPS root")
+        return normalized
+
+    @field_validator("research_vector_namespace")
+    @classmethod
+    def validate_research_vector_namespace(cls, value: str) -> str:
+        if re.fullmatch(r"sec-filings-v[1-9][0-9]{0,5}", value) is None:
+            raise ValueError("RESEARCH_VECTOR_NAMESPACE is invalid")
+        return value
+
+    @field_validator("sec_user_agent", mode="before")
+    @classmethod
+    def validate_sec_user_agent(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip()
+        if normalized and (
+            len(normalized) < 8
+            or _SEC_CONTACT_EMAIL.search(normalized) is None
+            or any(ord(character) < 32 or ord(character) == 127 for character in normalized)
+        ):
+            raise ValueError("SEC_USER_AGENT must identify the application and contact email")
+        return normalized
+
     @field_validator("allowed_hosts", mode="before")
     @classmethod
     def parse_allowed_hosts(cls, value: object) -> object:
@@ -210,6 +422,7 @@ class Settings(BaseSettings):
         }
         if self.environment.lower() not in allowed_environments:
             raise ValueError("ENVIRONMENT must be an explicit supported value")
+        self._validate_research_configuration()
         if not self.is_deployed:
             return self
 
@@ -253,6 +466,55 @@ class Settings(BaseSettings):
                 "production settings are incomplete or insecure: " + ", ".join(missing)
             )
         return self
+
+    def _validate_research_configuration(self) -> None:
+        credentials = (
+            self.openai_api_key,
+            self.upstash_vector_rest_url,
+            self.upstash_vector_rest_token,
+        )
+        configured_count = sum(value is not None for value in credentials)
+        if self.research_enabled or configured_count:
+            missing = (
+                "OPENAI_API_KEY"
+                if self.openai_api_key is None
+                else "UPSTASH_VECTOR_REST_URL"
+                if self.upstash_vector_rest_url is None
+                else "UPSTASH_VECTOR_REST_TOKEN"
+                if self.upstash_vector_rest_token is None
+                else None
+            )
+            if missing is not None:
+                raise ValueError(f"research configuration is incomplete: {missing}")
+        expected = (
+            (self.research_embedding_provider, "openai", "RESEARCH_EMBEDDING_PROVIDER"),
+            (
+                self.research_embedding_model,
+                "text-embedding-3-small",
+                "RESEARCH_EMBEDDING_MODEL",
+            ),
+            (self.research_embedding_dimensions, 1536, "RESEARCH_EMBEDDING_DIMENSIONS"),
+            (self.research_generation_provider, "openai", "RESEARCH_GENERATION_PROVIDER"),
+            (self.research_generation_model, "gpt-5.6-luna", "RESEARCH_GENERATION_MODEL"),
+            (self.research_vector_provider, "upstash", "RESEARCH_VECTOR_PROVIDER"),
+        )
+        if (self.research_enabled or configured_count) and any(
+            actual != required for actual, required, _ in expected
+        ):
+            invalid = next(name for actual, required, name in expected if actual != required)
+            raise ValueError(f"{invalid} is not supported by the configured research stack")
+        if self.research_chunk_overlap_tokens >= self.research_chunk_tokens:
+            raise ValueError(
+                "RESEARCH_CHUNK_OVERLAP_TOKENS must be smaller than RESEARCH_CHUNK_TOKENS"
+            )
+        if self.research_generation_max_output_tokens > 2000:
+            raise ValueError("RESEARCH_GENERATION_MAX_OUTPUT_TOKENS must not exceed 2000")
+        if (self.research_enabled or configured_count) and self.research_max_results > 8:
+            raise ValueError("RESEARCH_MAX_RESULTS must not exceed 8")
+        if self.research_max_results * self.research_vector_overfetch > 20:
+            raise ValueError(
+                "RESEARCH_MAX_RESULTS multiplied by RESEARCH_VECTOR_OVERFETCH must not exceed 20"
+            )
 
     @staticmethod
     def _valid_https_url(

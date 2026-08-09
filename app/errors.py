@@ -70,6 +70,10 @@ class CacheUnavailableError(CacheError):
     code = "cache_unavailable"
 
 
+class SymbolDirectoryUnavailableError(CacheUnavailableError):
+    code = "symbol_directory_unavailable"
+
+
 class QuotaExceededError(MarketDataError):
     code = "quota_exceeded"
     status_code = 429

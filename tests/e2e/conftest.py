@@ -16,6 +16,14 @@ import pytest
 import uvicorn
 
 from app.main import create_app
+from app.research.control import Reservation, ReservationState
+from app.research.deadline import RequestDeadline
+from app.research.domain import (
+    EvidenceQuote,
+    GeneratedClaim,
+    ResearchAnswer,
+    ResearchCitation,
+)
 
 try:
     from playwright.sync_api import Error as PlaywrightError
@@ -40,6 +48,12 @@ class E2ESettings:
     login_rate_limit: int
     api_rate_limit: int
     rate_limit_window_seconds: int
+    research_enabled: bool
+    research_max_question_chars: int
+    research_max_request_bytes: int
+    research_timeout_seconds: float
+    research_rate_limit: int
+    research_daily_global_limit: int
 
 
 @dataclass(frozen=True)
@@ -55,6 +69,25 @@ class FakeCache:
     async def increment(self, key: str, ttl: int) -> int:
         del ttl
         next_count = self._counts.get(key, 0) + 1
+        self._counts = {**self._counts, key: next_count}
+        return next_count
+
+    async def reserve_quota(
+        self,
+        key: str,
+        *,
+        limit: int,
+        window_seconds: int,
+    ) -> int | None:
+        del window_seconds
+        next_count = self._counts.get(key, 0) + 1
+        if next_count > limit:
+            return None
+        self._counts = {**self._counts, key: next_count}
+        return next_count
+
+    async def release_quota(self, key: str) -> int:
+        next_count = max(0, self._counts.get(key, 0) - 1)
         self._counts = {**self._counts, key: next_count}
         return next_count
 
@@ -112,6 +145,93 @@ class FakeMarketService:
             "reset_at": "2026-08-09T00:00:00Z",
         }
 
+    async def search_symbols(self, query: str, *, limit: int = 8) -> dict[str, Any]:
+        records = (
+            {"symbol": "AAPL", "name": "Apple Inc.", "exchange": "Nasdaq"},
+            {"symbol": "APP", "name": "Applovin Corporation", "exchange": "Nasdaq"},
+            {"symbol": "MSFT", "name": "Microsoft Corporation", "exchange": "Nasdaq"},
+        )
+        normalized = query.upper()
+        items = [
+            record
+            for record in records
+            if record["symbol"].startswith(normalized) or normalized in record["name"].upper()
+        ][:limit]
+        return {
+            "items": items,
+            "next_cursor": None,
+            "total": len(items),
+            "limit": limit,
+            "source": "e2e-fixture",
+            "as_of": "2026-08-09T00:00:00Z",
+        }
+
+    async def authorize_research_reservation(
+        self,
+        principal_digest: str,
+        *,
+        daily_limit: int,
+        window_seconds: int,
+        deadline: RequestDeadline | None = None,
+    ) -> Reservation | None:
+        del daily_limit, window_seconds
+        if deadline is not None:
+            deadline.raise_if_expired()
+        return Reservation(
+            reservation_digest="1" * 64,
+            budget_digest="2" * 64,
+            principal_digest=principal_digest,
+            units=1,
+            state=ReservationState.AUTHORIZED,
+        )
+
+    async def query_research(
+        self,
+        symbol: str,
+        question: str,
+        *,
+        reservation: Reservation | None = None,
+        deadline: RequestDeadline | None = None,
+    ) -> ResearchAnswer:
+        if reservation is None or reservation.state is not ReservationState.AUTHORIZED:
+            raise RuntimeError("research reservation is required")
+        if deadline is not None:
+            deadline.raise_if_expired()
+        if "buy" in question.lower() or "sell" in question.lower():
+            return ResearchAnswer.refusal(symbol)
+        if symbol == "AAPL" and "risk" in question.lower():
+            chunk_id = "chunk-" + "a" * 64
+            quote = EvidenceQuote(
+                chunk_id=chunk_id,
+                quote="supply constraints could affect results",
+            )
+            claim = GeneratedClaim(
+                text="Apple identifies supply constraints as a risk.",
+                supporting_chunk_ids=(chunk_id,),
+                evidence_quotes=(quote,),
+            )
+            citation = ResearchCitation(
+                chunk_id=chunk_id,
+                title="Apple 2025 Form 10-K",
+                url=("https://www.sec.gov/Archives/edgar/data/320193/000032019325000001/aapl.htm"),
+                filed_date=date(2025, 10, 31),
+                filing_type="10-K",
+                accession_number="0000320193-25-000001",
+                snippet="supply constraints could affect results",
+            )
+            return ResearchAnswer.answered(symbol, (claim,), (citation,))
+        return ResearchAnswer.insufficient(symbol)
+
+    async def release_research_reservation(
+        self,
+        reservation: Reservation,
+        *,
+        deadline: RequestDeadline | None = None,
+    ) -> bool:
+        if deadline is not None:
+            deadline.raise_if_expired()
+        return reservation.state is ReservationState.AUTHORIZED
+
 
 def _wait_until_ready(base_url: str, thread: threading.Thread) -> None:
     deadline = time.monotonic() + 10
@@ -147,6 +267,12 @@ def e2e_server() -> Iterator[RunningServer]:
         login_rate_limit=20,
         api_rate_limit=100,
         rate_limit_window_seconds=60,
+        research_enabled=True,
+        research_max_question_chars=500,
+        research_max_request_bytes=4096,
+        research_timeout_seconds=2.0,
+        research_rate_limit=100,
+        research_daily_global_limit=100,
     )
     application = create_app(
         settings=settings,

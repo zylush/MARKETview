@@ -1,19 +1,41 @@
 from __future__ import annotations
 
 # mypy: disallow_untyped_decorators=False
+import asyncio
+import hashlib
 import inspect
 from collections.abc import Callable
-from datetime import date
-from typing import Any
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from typing import Any, cast
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.auth import verify_app_key
 from app.dependencies import increment_rate, rate_limit_identity, setting
+from app.research.deadline import RequestDeadline
+from app.research.domain import ResearchAnswer
+from app.services.research import ResearchUnavailableError
+from app.validation import (
+    validate_research_question,
+    validate_symbol,
+    validate_symbol_query,
+)
 
 MAX_RANGE_DAYS = 365
 SYMBOL_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9.\-]{0,31}$"
+DEFAULT_RESEARCH_REQUEST_BYTES = 4096
+DEFAULT_RESEARCH_RATE_LIMIT = 10
+DEFAULT_RESEARCH_DAILY_BUDGET = 100
+
+
+@dataclass(frozen=True, slots=True)
+class RequestAuthorization:
+    using_session: bool
+    principal_digest: str
 
 
 def envelope(
@@ -36,7 +58,17 @@ def envelope(
         }
         if "limit" in encoded_data:
             pagination = {**pagination, "limit": encoded_data["limit"]}
-    meta: dict[str, Any] = {
+        meta = {
+            **{
+                key: value
+                for key, value in encoded_data.items()
+                if key not in {"items", "next_cursor", "total", "limit"}
+            }
+        }
+    else:
+        meta = {}
+    meta = {
+        **meta,
         "request_id": request.state.request_id,
         "pagination": pagination,
     }
@@ -65,6 +97,23 @@ def pagination_params(limit: int, cursor: str | None, offset: int) -> dict[str, 
     return params
 
 
+class ResearchQueryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    symbol: str = Field(min_length=1, max_length=32)
+    question: str = Field(min_length=1, max_length=500)
+
+    @field_validator("symbol")
+    @classmethod
+    def normalize_symbol(cls, value: str) -> str:
+        return validate_symbol(value)
+
+    @field_validator("question")
+    @classmethod
+    def normalize_question(cls, value: str) -> str:
+        return validate_research_question(value)
+
+
 def validate_range(date_from: date | None, date_to: date | None) -> None:
     if (date_from is None) != (date_to is None):
         raise HTTPException(422, detail="date_from and date_to must be provided together")
@@ -84,22 +133,42 @@ async def call_service(service: object, names: tuple[str, ...], *args: Any, **kw
     return await result if inspect.isawaitable(result) else result
 
 
+def optional_service_method(
+    service: object,
+    name: str,
+    *,
+    unavailable_message: str,
+    enabled: bool = True,
+) -> Callable[..., Any]:
+    method = getattr(service, name, None)
+    if not enabled or method is None or not callable(method):
+        raise HTTPException(503, detail=unavailable_message)
+    return cast(Callable[..., Any], method)
+
+
+async def invoke(method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    result = method(*args, **kwargs)
+    return await result if inspect.isawaitable(result) else result
+
+
 def build_api_router(
     settings: object,
     service: object,
     cache: object | None,
     *,
     session_authorizer: Callable[[Request], bool] | None = None,
+    csrf_validator: Callable[[Request, str | None], None] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1")
 
     async def authorize(
         request: Request,
         x_app_key: str | None = Header(default=None, alias="X-App-Key"),
-    ) -> None:
+    ) -> RequestAuthorization:
         digest = setting(settings, "app_access_key_sha256", "")
         has_session = bool(session_authorizer and session_authorizer(request))
-        if not has_session and not verify_app_key(x_app_key, digest):
+        has_app_key = verify_app_key(x_app_key, digest)
+        if not has_app_key and not has_session:
             raise HTTPException(401, detail="invalid application key")
         window = int(setting(settings, "rate_limit_window_seconds", 60))
         limit = int(setting(settings, "api_rate_limit", 60))
@@ -110,6 +179,60 @@ def build_api_router(
             raise HTTPException(503, detail="rate limiter unavailable") from exc
         if count > limit:
             raise HTTPException(429, detail="rate limit exceeded")
+        principal_digest = hashlib.sha256(client.encode("utf-8")).hexdigest()
+        return RequestAuthorization(
+            using_session=has_session and not has_app_key,
+            principal_digest=principal_digest,
+        )
+
+    async def enforce_research_rate_limit(request: Request) -> None:
+        window = int(setting(settings, "rate_limit_window_seconds", 60))
+        client_limit = int(setting(settings, "research_rate_limit", DEFAULT_RESEARCH_RATE_LIMIT))
+        client = rate_limit_identity(request, settings)
+        try:
+            client_count = await increment_rate(
+                cache,
+                f"rate:research:{client}",
+                window,
+            )
+        except Exception as exc:
+            raise HTTPException(503, detail="rate limiter unavailable") from exc
+        if client_count > client_limit:
+            raise HTTPException(429, detail="research rate limit exceeded")
+
+    def research_daily_window_seconds() -> int:
+        now = datetime.now(UTC)
+        next_day = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), UTC)
+        return max(1, int((next_day - now).total_seconds()))
+
+    async def release_research_reservation(
+        method: Callable[..., Any],
+        reservation: object,
+    ) -> None:
+        try:
+            cleanup = asyncio.create_task(invoke(method, reservation, deadline=None))
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                await cleanup
+            raise
+        except Exception:
+            return
+
+    async def enforce_symbol_search_limit(request: Request) -> None:
+        window = int(setting(settings, "rate_limit_window_seconds", 60))
+        limit = int(setting(settings, "symbol_search_rate_limit", 30))
+        client = rate_limit_identity(request, settings)
+        try:
+            count = await increment_rate(
+                cache,
+                f"rate:symbol-search:{client}",
+                window,
+            )
+        except Exception as exc:
+            raise HTTPException(503, detail="rate limiter unavailable") from exc
+        if count > limit:
+            raise HTTPException(429, detail="symbol search rate limit exceeded")
 
     protected = [Depends(authorize)]
 
@@ -160,5 +283,100 @@ def build_api_router(
     async def usage(request: Request) -> dict[str, Any]:
         data = await call_service(service, ("usage", "get_usage"))
         return envelope(request, data, service_metadata(service))
+
+    @router.get("/symbols/search", dependencies=protected)
+    async def symbol_search(
+        request: Request,
+        q: str = Query(min_length=2, max_length=32),
+        limit: int = Query(default=8, ge=1, le=8),
+    ) -> dict[str, Any]:
+        method = optional_service_method(
+            service,
+            "search_symbols",
+            unavailable_message="symbol search service is unavailable",
+        )
+        checked_query = validate_symbol_query(q)
+        await enforce_symbol_search_limit(request)
+        data = await invoke(method, checked_query, limit=limit)
+        return envelope(request, data)
+
+    @router.post("/research/query")
+    async def research_query(
+        request: Request,
+        payload: ResearchQueryRequest,
+        authorization: RequestAuthorization = Depends(authorize),  # noqa: B008
+    ) -> dict[str, Any]:
+        if authorization.using_session:
+            if csrf_validator is None:
+                raise HTTPException(503, detail="research service is unavailable")
+            csrf_validator(request, request.headers.get("X-CSRF-Token"))
+        method = optional_service_method(
+            service,
+            "query_research",
+            unavailable_message="research service is unavailable",
+            enabled=setting(settings, "research_enabled", False) is True,
+        )
+        authorize_reservation = optional_service_method(
+            service,
+            "authorize_research_reservation",
+            unavailable_message="research service is unavailable",
+            enabled=setting(settings, "research_enabled", False) is True,
+        )
+        release_reservation = optional_service_method(
+            service,
+            "release_research_reservation",
+            unavailable_message="research service is unavailable",
+            enabled=setting(settings, "research_enabled", False) is True,
+        )
+        maximum_bytes = int(
+            setting(settings, "research_max_request_bytes", DEFAULT_RESEARCH_REQUEST_BYTES)
+        )
+        if len(await request.body()) > maximum_bytes:
+            raise HTTPException(413, detail="research request body is too large")
+        maximum_question_chars = int(setting(settings, "research_max_question_chars", 500))
+        if len(payload.question) > maximum_question_chars:
+            raise HTTPException(422, detail="research question exceeds configured maximum")
+        await enforce_research_rate_limit(request)
+        timeout_seconds = float(setting(settings, "research_timeout_seconds", 8.0))
+        daily_limit = int(
+            setting(
+                settings,
+                "research_daily_global_limit",
+                DEFAULT_RESEARCH_DAILY_BUDGET,
+            )
+        )
+        deadline = RequestDeadline.after(timeout_seconds)
+        reservation: object | None = None
+        try:
+            try:
+                async with asyncio.timeout(timeout_seconds):
+                    reservation = await invoke(
+                        authorize_reservation,
+                        authorization.principal_digest,
+                        daily_limit=daily_limit,
+                        window_seconds=research_daily_window_seconds(),
+                        deadline=deadline,
+                    )
+                    if reservation is None:
+                        raise HTTPException(429, detail="research daily budget exceeded")
+                    data = await invoke(
+                        method,
+                        payload.symbol,
+                        payload.question,
+                        reservation=reservation,
+                        deadline=deadline,
+                    )
+            except TimeoutError:
+                raise HTTPException(504, detail="the research request timed out") from None
+            if not isinstance(data, ResearchAnswer) or data.symbol != payload.symbol:
+                data = None
+                raise ResearchUnavailableError("research response was invalid") from None
+            return envelope(request, data)
+        finally:
+            if reservation is not None:
+                await release_research_reservation(
+                    release_reservation,
+                    reservation,
+                )
 
     return router

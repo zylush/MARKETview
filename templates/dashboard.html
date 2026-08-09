@@ -51,24 +51,45 @@
           <div class="search-field">
             <label for="ticker-search">Stock symbol</label>
             <div class="search-control">
-              <input
-                id="ticker-search"
-                name="symbol"
-                type="text"
-                inputmode="latin"
-                minlength="1"
-                maxlength="32"
-                pattern="[A-Za-z0-9][A-Za-z0-9.\-]{0,31}"
-                placeholder="For example, AAPL or BRK.B"
-                aria-describedby="search-help search-error"
-                autocapitalize="characters"
-                spellcheck="false"
-                data-testid="ticker-search"
-                required
-              >
+              <div class="combobox-shell">
+                <input
+                  id="ticker-search"
+                  name="symbol"
+                  type="text"
+                  role="combobox"
+                  inputmode="latin"
+                  minlength="1"
+                  maxlength="32"
+                  pattern="[A-Za-z0-9][A-Za-z0-9.\-]{0,31}"
+                  placeholder="For example, AAPL or BRK.B"
+                  aria-autocomplete="list"
+                  aria-controls="ticker-suggestions"
+                  aria-expanded="false"
+                  aria-describedby="search-help ticker-search-status search-error"
+                  autocapitalize="characters"
+                  spellcheck="false"
+                  data-testid="ticker-search"
+                  required
+                >
+                <div
+                  id="ticker-suggestions"
+                  class="ticker-suggestions"
+                  role="listbox"
+                  aria-label="Ticker suggestions"
+                  hidden
+                ></div>
+              </div>
               <button class="button button-primary" type="submit" data-testid="search-submit">Load symbol</button>
             </div>
             <p id="search-help" class="field-help">Enter 1–32 letters, numbers, periods, or hyphens.</p>
+            <p
+              id="ticker-search-status"
+              class="suggestion-status"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              data-testid="ticker-search-status"
+            ></p>
             <p id="search-error" class="field-error" role="alert" aria-live="assertive" hidden></p>
           </div>
         </form>
@@ -158,6 +179,71 @@
           </details>
         </div>
       </section>
+
+      {% if request.app.state.settings.research_enabled | default(false) %}
+      <section
+        class="research-section panel"
+        aria-labelledby="research-heading"
+        data-testid="research-panel"
+      >
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Citation-backed SEC evidence</p>
+            <h2 id="research-heading">Filing research</h2>
+          </div>
+          <p class="research-disclaimer">Informational only, not investment advice.</p>
+        </div>
+        <form id="research-form" class="research-form" novalidate>
+          <label for="research-question">Question about SEC filings</label>
+          <textarea
+            id="research-question"
+            name="question"
+            rows="4"
+            maxlength="500"
+            aria-describedby="research-help research-character-count"
+            placeholder="For example: What risks did management identify?"
+            data-testid="research-question"
+            required
+          ></textarea>
+          <div class="research-field-meta">
+            <p id="research-help" class="field-help">Answers are limited to indexed filings for <strong id="research-symbol">AAPL</strong>.</p>
+            <output
+              id="research-character-count"
+              class="character-count"
+              for="research-question"
+              aria-live="polite"
+              data-testid="research-character-count"
+            >0 / 500</output>
+          </div>
+          <div class="research-actions">
+            <button class="button button-primary" type="submit" data-testid="research-submit" disabled>Research filings</button>
+            <button id="research-cancel" class="button button-secondary" type="button" data-testid="research-cancel" hidden>Cancel request</button>
+          </div>
+        </form>
+        <div
+          id="research-status"
+          class="research-status"
+          role="status"
+          aria-live="polite"
+          tabindex="-1"
+        >Ask a question about AAPL SEC filings.</div>
+        <div id="research-error" class="section-message error-message" role="alert" tabindex="-1" hidden></div>
+        <article
+          id="research-result"
+          class="research-result"
+          aria-labelledby="research-result-heading"
+          tabindex="-1"
+          hidden
+        >
+          <h3 id="research-result-heading">Research response</h3>
+          <p id="research-answer"></p>
+          <div id="research-citations-wrap" hidden>
+            <h3>Sources</h3>
+            <ol id="research-citations" class="citation-list"></ol>
+          </div>
+        </article>
+      </section>
+      {% endif %}
     </main>
     <noscript><p class="noscript-message">JavaScript is required to load live market data.</p></noscript>
   </body>

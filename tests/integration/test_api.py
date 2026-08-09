@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import logging
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -24,13 +28,38 @@ from app.errors import (
 )
 from app.main import create_app
 from app.providers.marketdata import MarketDataAppProvider
+from app.research.control import Reservation, ReservationState
+from app.research.deadline import RequestDeadline
+from app.research.domain import ResearchAnswer
+from app.services.dashboard import DashboardService
 from app.services.market_data import MarketDataService
+from app.services.research import DisabledResearchService, EnabledResearchService
+from app.services.symbols import SymbolSearchService
 
 
 async def _csrf(client: httpx.AsyncClient) -> str:
     page = await client.get("/")
     assert page.status_code == 200
     match = re.search(r'name="csrf_token" value="([^"]+)"', page.text)
+    assert match is not None
+    return match.group(1)
+
+
+async def _login_and_dashboard_csrf(client: httpx.AsyncClient) -> str:
+    login_csrf = await _csrf(client)
+    login = await client.post(
+        "/login",
+        data={"password": "correct horse battery staple", "csrf_token": login_csrf},
+        headers={"Origin": "https://dashboard.test"},
+        follow_redirects=False,
+    )
+    assert login.status_code == 303
+    dashboard = await client.get("/dashboard")
+    csrf_cookie = dashboard.headers["set-cookie"].lower()
+    assert "marketdata_csrf=" in csrf_cookie
+    assert "httponly" in csrf_cookie
+    assert "samesite=strict" in csrf_cookie
+    match = re.search(r'<meta name="csrf-token" content="([^"]+)"', dashboard.text)
     assert match is not None
     return match.group(1)
 
@@ -144,6 +173,994 @@ async def test_unsupported_market_data_routes_are_absent_without_service_calls(
         & set(schema["paths"])
     )
     assert service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_symbol_search_is_authenticated_validated_ranked_and_enveloped(
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
+    service,
+) -> None:
+    unauthorized = await client.get("/api/v1/symbols/search?q=ap")
+    too_short = await client.get("/api/v1/symbols/search?q=a&limit=8", headers=api_headers)
+    invalid_limit = await client.get("/api/v1/symbols/search?q=app&limit=9", headers=api_headers)
+    invalid_characters = await client.get(
+        "/api/v1/symbols/search?q=ap%3Cscript%3E", headers=api_headers
+    )
+    response = await client.get("/api/v1/symbols/search?q=app&limit=2", headers=api_headers)
+
+    assert unauthorized.status_code == 401
+    assert too_short.status_code == 422
+    assert invalid_limit.status_code == 422
+    assert invalid_characters.status_code == 422
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["data"] == [
+        {"symbol": "APP", "name": "Applovin Corporation", "exchange": "Nasdaq"},
+        {"symbol": "AAPL", "name": "Apple Inc.", "exchange": "Nasdaq"},
+    ]
+    assert payload["meta"]["pagination"] == {"next_cursor": None, "total": 2, "limit": 2}
+    assert payload["meta"]["source"] == "test-fixture"
+    assert service.calls == [("search_symbols", {"query": "APP", "limit": 2})]
+
+
+@pytest.mark.asyncio
+async def test_symbol_search_has_a_separate_rate_limit(
+    settings,
+    service,
+    cache,
+) -> None:
+    isolated = SimpleNamespace(**{**vars(settings), "symbol_search_rate_limit": 1})
+    transport = httpx.ASGITransport(
+        app=create_app(settings=isolated, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=isolated.allowed_origin) as local:
+        first = await local.get(
+            "/api/v1/symbols/search?q=ap&limit=2",
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+        limited = await local.get(
+            "/api/v1/symbols/search?q=ms&limit=2",
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert first.status_code == 200
+    assert limited.status_code == 429
+    assert cache.counts["rate:symbol-search:127.0.0.1"] == 2
+    assert all("marketdata" not in key and "quota" not in key for key in cache.counts)
+    assert service.calls == [("search_symbols", {"query": "AP", "limit": 2})]
+
+
+@pytest.mark.asyncio
+async def test_unseeded_symbol_directory_returns_specific_sanitized_503(
+    settings,
+    cache,
+) -> None:
+    symbol_search = SymbolSearchService(None, MemoryCache())
+    service = SimpleNamespace(search_symbols=symbol_search.search_symbols)
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as local:
+        response = await local.get(
+            "/api/v1/symbols/search?q=ap&limit=8",
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "SYMBOL_DIRECTORY_UNAVAILABLE",
+        "message": "the symbol directory is unavailable",
+    }
+
+
+class _AtomicResearchControl:
+    def __init__(
+        self,
+        *,
+        timeline: list[str],
+        exhausted: bool = False,
+        unavailable: bool = False,
+    ) -> None:
+        self.events: list[str] = []
+        self.timeline = timeline
+        self.exhausted = exhausted
+        self.unavailable = unavailable
+        self.current: Reservation | None = None
+        self.principal_digests: list[str] = []
+        self.reservations: list[Reservation] = []
+        self.authorized_units = 0
+
+    async def authorize_reservation(
+        self,
+        *,
+        reservation: Reservation,
+        limit: int,
+        window_seconds: int,
+        deadline: RequestDeadline,
+    ) -> bool:
+        del window_seconds, deadline
+        self.events.append("authorize")
+        self.timeline.append("authorize")
+        self.principal_digests.append(reservation.principal_digest)
+        self.reservations.append(reservation)
+        if self.unavailable:
+            raise RuntimeError("private redis control detail")
+        if self.exhausted or self.authorized_units + reservation.units > limit:
+            return False
+        self.authorized_units += reservation.units
+        self.current = reservation
+        return True
+
+    async def commit_reservation(
+        self,
+        *,
+        reservation: Reservation,
+        deadline: RequestDeadline,
+    ) -> bool:
+        del deadline
+        self.events.append("commit")
+        self.timeline.append("commit")
+        if self.current != reservation or self.current.state is not ReservationState.AUTHORIZED:
+            return False
+        self.current = replace(reservation, state=ReservationState.COMMITTED)
+        return True
+
+    async def release_reservation(
+        self,
+        *,
+        reservation: Reservation,
+        deadline: RequestDeadline,
+    ) -> bool:
+        del deadline
+        if self.current == reservation and self.current.state is ReservationState.AUTHORIZED:
+            self.events.append("release_authorized")
+            self.timeline.append("release_authorized")
+            self.authorized_units = max(0, self.authorized_units - reservation.units)
+            self.current = replace(reservation, state=ReservationState.RELEASED)
+            return True
+        self.events.append("retain_committed")
+        self.timeline.append("retain_committed")
+        return False
+
+
+class _AtomicResearchCore:
+    def __init__(
+        self,
+        behavior: str,
+        *,
+        timeline: list[str],
+        error_detail: str | None = None,
+    ) -> None:
+        self.behavior = behavior
+        self.error_detail = error_detail
+        self.events: list[str] = []
+        self.timeline = timeline
+        self.query_started = asyncio.Event()
+        self.paid_call_started = asyncio.Event()
+
+    async def query_research(
+        self,
+        symbol: str,
+        question: str,
+        *,
+        deadline: RequestDeadline | None = None,
+        before_paid_call: Callable[[], Awaitable[None]] | None = None,
+    ) -> ResearchAnswer:
+        del question, deadline
+        self.events.append("query")
+        self.timeline.append("query")
+        self.query_started.set()
+        if self.behavior == "refuse":
+            return ResearchAnswer.refusal(symbol)
+        if self.behavior == "fail_precommit":
+            raise RuntimeError("private pre-commit failure")
+        if self.behavior == "cancel_precommit":
+            await asyncio.Event().wait()
+        assert before_paid_call is not None
+        await before_paid_call()
+        self.events.append("embed")
+        self.timeline.append("embed")
+        self.paid_call_started.set()
+        if self.behavior == "malformed":
+            return {
+                "answer": "unsupported",
+                "citations": [{"url": self.error_detail}],
+            }  # type: ignore[return-value]
+        if self.behavior == "cross_symbol":
+            return ResearchAnswer.insufficient("MSFT")
+        if self.behavior in {"provider_error", "vector_error", "generation_error"}:
+            raise RuntimeError(self.error_detail or f"private {self.behavior}")
+        if self.behavior in {"timeout", "cancel"}:
+            await asyncio.Event().wait()
+        return ResearchAnswer.insufficient(symbol)
+
+
+def _atomic_research_service(
+    behavior: str,
+    *,
+    exhausted: bool = False,
+    unavailable: bool = False,
+    error_detail: str | None = None,
+) -> tuple[EnabledResearchService, _AtomicResearchCore, _AtomicResearchControl]:
+    timeline: list[str] = []
+    core = _AtomicResearchCore(behavior, timeline=timeline, error_detail=error_detail)
+    control = _AtomicResearchControl(
+        timeline=timeline,
+        exhausted=exhausted,
+        unavailable=unavailable,
+    )
+    service = EnabledResearchService(
+        core=core,
+        control_plane=control,
+        timeout_seconds=0.5,
+    )
+    return service, core, control
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("behavior", "expected_status"),
+    [("refuse", 200), ("fail_precommit", 503)],
+)
+async def test_research_precommit_outcomes_release_authorized_spend(
+    settings,
+    cache,
+    behavior: str,
+    expected_status: int,
+) -> None:
+    service, core, control = _atomic_research_service(behavior)
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as local:
+        response = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "Should I buy this stock?"},
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == expected_status
+    assert control.current is not None
+    assert control.current.state is ReservationState.RELEASED
+    assert control.events == ["authorize", "release_authorized"]
+    assert core.events == ["query"]
+    assert all(
+        "provider_quota" not in key and not key.startswith("marketdata:") for key in cache.counts
+    )
+
+
+@pytest.mark.asyncio
+async def test_research_commits_before_first_embedding_and_never_refunds_commit(
+    settings,
+    cache,
+) -> None:
+    service, core, control = _atomic_research_service("success")
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as local:
+        response = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "What risks are described?"},
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == 200
+    assert control.current is not None
+    assert control.current.state is ReservationState.COMMITTED
+    assert control.events == ["authorize", "commit", "retain_committed"]
+    assert core.events == ["query", "embed"]
+    assert control.timeline == ["authorize", "query", "commit", "embed", "retain_committed"]
+    assert control.principal_digests == [hashlib.sha256(b"127.0.0.1").hexdigest()]
+    assert re.fullmatch(r"[0-9a-f]{64}", control.principal_digests[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("behavior", ["provider_error", "vector_error", "generation_error"])
+async def test_research_committed_downstream_errors_retain_charge(
+    settings,
+    cache,
+    behavior: str,
+) -> None:
+    service, core, control = _atomic_research_service(behavior)
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as local:
+        response = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "What risks are described?"},
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "RESEARCH_UNAVAILABLE",
+        "message": "research is not configured",
+    }
+    assert core.events == ["query", "embed"]
+    assert control.current is not None
+    assert control.current.state is ReservationState.COMMITTED
+    assert control.events[-1] == "retain_committed"
+
+
+@pytest.mark.asyncio
+async def test_research_timeout_after_commit_retains_charge(settings, cache) -> None:
+    service, _, control = _atomic_research_service("timeout")
+    isolated = SimpleNamespace(**{**vars(settings), "research_timeout_seconds": 0.01})
+    transport = httpx.ASGITransport(
+        app=create_app(settings=isolated, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=isolated.allowed_origin) as local:
+        response = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "What risks are described?"},
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == 504
+    assert control.current is not None
+    assert control.current.state is ReservationState.COMMITTED
+    assert control.events[-1] == "retain_committed"
+
+
+@pytest.mark.asyncio
+async def test_research_client_cancellation_after_commit_retains_charge(settings, cache) -> None:
+    service, core, control = _atomic_research_service("cancel")
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=cache),
+        raise_app_exceptions=True,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as local:
+        request = asyncio.create_task(
+            local.post(
+                "/api/v1/research/query",
+                json={"symbol": "AAPL", "question": "What risks are described?"},
+                headers={"X-App-Key": "correct horse battery staple"},
+            )
+        )
+        await asyncio.wait_for(core.paid_call_started.wait(), timeout=1)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        await asyncio.sleep(0)
+
+    assert control.current is not None
+    assert control.current.state is ReservationState.COMMITTED
+    assert control.events[-1] == "retain_committed"
+
+
+@pytest.mark.asyncio
+async def test_research_client_cancellation_before_commit_releases_charge(settings, cache) -> None:
+    service, core, control = _atomic_research_service("cancel_precommit")
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=cache),
+        raise_app_exceptions=True,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as local:
+        request = asyncio.create_task(
+            local.post(
+                "/api/v1/research/query",
+                json={"symbol": "AAPL", "question": "What risks are described?"},
+                headers={"X-App-Key": "correct horse battery staple"},
+            )
+        )
+        await asyncio.wait_for(core.query_started.wait(), timeout=1)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+    assert control.current is not None
+    assert control.current.state is ReservationState.RELEASED
+    assert control.events == ["authorize", "release_authorized"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exhausted", "unavailable", "expected_status"),
+    [(True, False, 429), (False, True, 503)],
+)
+async def test_research_reservation_fails_closed_before_paid_call(
+    settings,
+    cache,
+    exhausted: bool,
+    unavailable: bool,
+    expected_status: int,
+) -> None:
+    service, core, control = _atomic_research_service(
+        "success",
+        exhausted=exhausted,
+        unavailable=unavailable,
+    )
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as local:
+        response = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "What risks are described?"},
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == expected_status
+    assert core.events == []
+    # An indeterminate exception triggers an exact-record release attempt. This fake records
+    # every release CAS miss, including a missing record, as "retain_committed".
+    assert control.events == (["authorize", "retain_committed"] if unavailable else ["authorize"])
+    assert not any("provider_quota" in key for key in cache.counts)
+
+
+@pytest.mark.asyncio
+async def test_research_query_is_authenticated_validated_cited_and_sanitized(
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
+    service,
+) -> None:
+    unauthorized = await client.post(
+        "/api/v1/research/query",
+        json={"symbol": "AAPL", "question": "What risks are described?"},
+    )
+    invalid = await client.post(
+        "/api/v1/research/query",
+        json={"symbol": "AAPL", "question": "bad\u0001question"},
+        headers=api_headers,
+    )
+    arbitrary_url = await client.post(
+        "/api/v1/research/query",
+        json={
+            "symbol": "AAPL",
+            "question": "What risks are described?",
+            "url": "https://evil.test/instructions",
+        },
+        headers=api_headers,
+    )
+    response = await client.post(
+        "/api/v1/research/query",
+        json={"symbol": "aapl", "question": "What risks are described?"},
+        headers=api_headers,
+    )
+    insufficient = await client.post(
+        "/api/v1/research/query",
+        json={"symbol": "MSFT", "question": "What risks are described?"},
+        headers=api_headers,
+    )
+
+    assert unauthorized.status_code == 401
+    assert invalid.status_code == 422
+    assert arbitrary_url.status_code == 422
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["data"]["symbol"] == "AAPL"
+    assert payload["data"]["insufficient_evidence"] is False
+    assert payload["data"]["citations"][0]["url"].startswith("https://www.sec.gov/Archives/")
+    assert "investment advice" in payload["data"]["disclaimer"]
+    assert insufficient.status_code == 200
+    assert insufficient.json()["data"]["insufficient_evidence"] is True
+    assert service.calls == [
+        ("query_research", {"symbol": "AAPL", "question": "What risks are described?"}),
+        ("query_research", {"symbol": "MSFT", "question": "What risks are described?"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_research_post_requires_same_origin_double_submit_csrf(
+    client: httpx.AsyncClient,
+    service,
+) -> None:
+    csrf = await _login_and_dashboard_csrf(client)
+    payload = {"symbol": "AAPL", "question": "What risks are described?"}
+
+    missing = await client.post("/api/v1/research/query", json=payload)
+    wrong_origin = await client.post(
+        "/api/v1/research/query",
+        json=payload,
+        headers={"Origin": "https://evil.test", "X-CSRF-Token": csrf},
+    )
+    wrong_token = await client.post(
+        "/api/v1/research/query",
+        json=payload,
+        headers={"Origin": "https://dashboard.test", "X-CSRF-Token": "wrong"},
+    )
+    accepted = await client.post(
+        "/api/v1/research/query",
+        json=payload,
+        headers={"Origin": "https://dashboard.test", "X-CSRF-Token": csrf},
+    )
+
+    assert [missing.status_code, wrong_origin.status_code, wrong_token.status_code] == [
+        403,
+        403,
+        403,
+    ]
+    assert all(
+        response.json()["error"]["code"] == "forbidden"
+        for response in (missing, wrong_origin, wrong_token)
+    )
+    assert accepted.status_code == 200
+    assert service.calls == [
+        ("query_research", {"symbol": "AAPL", "question": "What risks are described?"})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_programmatic_research_post_uses_app_key_without_cookie_csrf(
+    client: httpx.AsyncClient,
+    service,
+) -> None:
+    await _login_and_dashboard_csrf(client)
+    response = await client.post(
+        "/api/v1/research/query",
+        json={"symbol": "aapl", "question": "  What risks are described?  "},
+        headers={"X-App-Key": "correct horse battery staple"},
+    )
+
+    assert response.status_code == 200
+    assert service.calls == [
+        ("query_research", {"symbol": "AAPL", "question": "What risks are described?"})
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"symbol": "AAPL!", "question": "What risks are described?"},
+        {"symbol": "AAPL", "question": "   "},
+        {"symbol": "AAPL", "question": "x" * 501},
+        {"symbol": "AAPL", "question": 42},
+    ],
+)
+async def test_research_request_model_is_strict(
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
+    service,
+    payload: dict[str, object],
+) -> None:
+    response = await client.post(
+        "/api/v1/research/query",
+        json=payload,
+        headers=api_headers,
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"] == {
+        "code": "VALIDATION_ERROR",
+        "message": "request validation failed",
+    }
+    assert service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_research_request_has_a_bounded_raw_body(
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
+    service,
+) -> None:
+    response = await client.post(
+        "/api/v1/research/query",
+        json={
+            "symbol": "AAPL",
+            "question": "What risks are described?",
+            "padding": "x" * 5000,
+        },
+        headers=api_headers,
+    )
+    understated = await client.post(
+        "/api/v1/research/query",
+        content=json.dumps(
+            {
+                "symbol": "AAPL",
+                "question": "What risks are described?",
+                "padding": "x" * 5000,
+            }
+        ),
+        headers={
+            **api_headers,
+            "Content-Length": "1",
+            "Content-Type": "application/json",
+        },
+    )
+
+    assert response.status_code == understated.status_code == 413
+    for rejected in (response, understated):
+        assert rejected.json()["error"] == {
+            "code": "request_too_large",
+            "message": "research request body is too large",
+        }
+    assert service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_research_has_separate_client_rate_and_global_budget_buckets(
+    settings,
+    cache,
+) -> None:
+    service, core, control = _atomic_research_service("success")
+    isolated = SimpleNamespace(
+        **{
+            **vars(settings),
+            "research_rate_limit": 1,
+            "research_daily_global_limit": 2,
+        }
+    )
+    transport = httpx.ASGITransport(
+        app=create_app(settings=isolated, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=isolated.allowed_origin) as local:
+        first = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "What risks are described?"},
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+        limited = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "MSFT", "question": "What risks are described?"},
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert first.status_code == 200
+    assert limited.status_code == 429
+    assert cache.counts["rate:research:127.0.0.1"] == 2
+    assert not any(key.startswith("budget:research:") for key in cache.counts)
+    assert all("marketdata" not in key and "quota" not in key for key in cache.counts)
+    assert core.events == ["query", "embed"]
+    assert control.events == ["authorize", "commit", "retain_committed"]
+
+
+@pytest.mark.asyncio
+async def test_research_global_budget_is_shared_across_clients(
+    settings,
+    cache,
+) -> None:
+    service, core, control = _atomic_research_service("success")
+    isolated = SimpleNamespace(
+        **{
+            **vars(settings),
+            "deployment_platform": "vercel",
+            "research_rate_limit": 10,
+            "research_daily_global_limit": 1,
+        }
+    )
+    transport = httpx.ASGITransport(
+        app=create_app(settings=isolated, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=isolated.allowed_origin) as local:
+        first = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "What risks are described?"},
+            headers={
+                "X-App-Key": "correct horse battery staple",
+                "X-Forwarded-For": "203.0.113.10",
+            },
+        )
+        exhausted = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "MSFT", "question": "What risks are described?"},
+            headers={
+                "X-App-Key": "correct horse battery staple",
+                "X-Forwarded-For": "203.0.113.11",
+            },
+        )
+
+    assert first.status_code == 200
+    assert exhausted.status_code == 429
+    assert cache.counts["rate:research:203.0.113.10"] == 1
+    assert cache.counts["rate:research:203.0.113.11"] == 1
+    assert not any(key.startswith("budget:research:") for key in cache.counts)
+    assert core.events == ["query", "embed"]
+    assert control.events == ["authorize", "commit", "retain_committed", "authorize"]
+    assert len(control.reservations) == 2
+    assert control.reservations[0].budget_digest == control.reservations[1].budget_digest
+    assert control.principal_digests[0] != control.principal_digests[1]
+
+
+@pytest.mark.asyncio
+async def test_research_internal_failure_does_not_leak_secrets(
+    settings,
+    cache,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider_sentinel = "private-embedding-token-and-vector-index"
+
+    service, _, control = _atomic_research_service(
+        "provider_error",
+        error_detail=provider_sentinel,
+    )
+
+    caplog.set_level(logging.WARNING)
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as local:
+        response = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "What risks are described?"},
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "RESEARCH_UNAVAILABLE",
+        "message": "research is not configured",
+    }
+    assert provider_sentinel not in response.text
+    assert provider_sentinel not in caplog.text
+    assert control.current is not None
+    assert control.current.state is ReservationState.COMMITTED
+
+
+@pytest.mark.asyncio
+async def test_research_query_has_a_bounded_server_timeout(settings, cache) -> None:
+    service, _, control = _atomic_research_service("timeout")
+
+    isolated = SimpleNamespace(
+        **{
+            **vars(settings),
+            "research_enabled": True,
+            "research_timeout_seconds": 0.001,
+        }
+    )
+    transport = httpx.ASGITransport(
+        app=create_app(settings=isolated, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=isolated.allowed_origin) as local:
+        response = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "What risks are described?"},
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == 504
+    assert response.json()["error"] == {
+        "code": "RESEARCH_TIMEOUT",
+        "message": "the research request timed out",
+    }
+    assert control.current is not None
+    # A deliberately tiny outer deadline may expire on either side of the atomic
+    # commit. It must never strand an authorized reservation: pre-commit timeouts
+    # release it, while post-commit timeouts retain the charge.
+    assert control.current.state in {
+        ReservationState.RELEASED,
+        ReservationState.COMMITTED,
+    }
+    expected_event = (
+        "release_authorized"
+        if control.current.state is ReservationState.RELEASED
+        else "retain_committed"
+    )
+    assert control.events[-1] == expected_event
+
+
+@pytest.mark.asyncio
+async def test_research_is_fail_closed_when_settings_omit_the_enable_flag(
+    settings,
+    service,
+    cache,
+) -> None:
+    omitted = SimpleNamespace(
+        **{name: value for name, value in vars(settings).items() if name != "research_enabled"}
+    )
+    transport = httpx.ASGITransport(
+        app=create_app(settings=omitted, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=omitted.allowed_origin) as local:
+        response = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "What risks are described?"},
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == 503
+    assert service.calls == []
+    assert not any(key.startswith("budget:research:") for key in cache.counts)
+
+
+@pytest.mark.asyncio
+async def test_research_rejects_unvalidated_adapter_output_without_refunding_committed_spend(
+    settings,
+    cache,
+) -> None:
+    malicious_url = "https://evil.example/private-research-source"
+    service, _, control = _atomic_research_service(
+        "malformed",
+        error_detail=malicious_url,
+    )
+
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as local:
+        response = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "What risks are described?"},
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "RESEARCH_UNAVAILABLE",
+        "message": "research is not configured",
+    }
+    assert malicious_url not in response.text
+    assert control.current is not None
+    assert control.current.state is ReservationState.COMMITTED
+    assert control.events[-1] == "retain_committed"
+
+
+@pytest.mark.asyncio
+async def test_research_rejects_cross_symbol_typed_adapter_output(settings, cache) -> None:
+    service, _, control = _atomic_research_service("cross_symbol")
+
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as local:
+        response = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "What risks are described?"},
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == 503
+    assert control.current is not None
+    assert control.current.state is ReservationState.COMMITTED
+    assert control.events[-1] == "retain_committed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "method"),
+    [
+        ("/api/v1/symbols/search?q=AA", "GET"),
+        ("/api/v1/research/query", "POST"),
+    ],
+)
+async def test_unconfigured_optional_services_return_sanitized_503(
+    settings,
+    cache,
+    path: str,
+    method: str,
+) -> None:
+    private_configuration = "private-vector-token-and-index-name"
+    transport = httpx.ASGITransport(
+        app=create_app(settings=settings, service=object(), cache=cache),
+        raise_app_exceptions=False,
+    )
+    kwargs = {"headers": {"X-App-Key": "correct horse battery staple"}}
+    if method == "POST":
+        kwargs["json"] = {
+            "symbol": "AAPL",
+            "question": "What risks are described?",
+        }
+    async with httpx.AsyncClient(transport=transport, base_url=settings.allowed_origin) as local:
+        response = await local.request(method, path, **kwargs)
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "service_unavailable",
+        "message": (
+            "research service is unavailable"
+            if method == "POST"
+            else "symbol search service is unavailable"
+        ),
+    }
+    assert private_configuration not in response.text
+
+
+@pytest.mark.asyncio
+async def test_disabled_research_returns_503_without_spending_research_budget(
+    settings,
+    service,
+    cache,
+) -> None:
+    isolated = SimpleNamespace(**{**vars(settings), "research_enabled": False})
+    transport = httpx.ASGITransport(
+        app=create_app(settings=isolated, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=isolated.allowed_origin) as local:
+        response = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "What risks are described?"},
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "service_unavailable",
+        "message": "research service is unavailable",
+    }
+    assert not any(key.startswith("rate:research:") for key in cache.counts)
+    assert not any(key.startswith("budget:research:") for key in cache.counts)
+    assert service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_disabled_session_research_still_enforces_csrf_before_feature_state(
+    settings,
+    service,
+    cache,
+) -> None:
+    isolated = SimpleNamespace(**{**vars(settings), "research_enabled": False})
+    transport = httpx.ASGITransport(
+        app=create_app(settings=isolated, service=service, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=isolated.allowed_origin) as local:
+        await _login_and_dashboard_csrf(local)
+        response = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "What risks are described?"},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "forbidden"
+    assert service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_missing_production_research_adapters_fail_with_specific_sanitized_503(
+    settings,
+    service,
+    cache,
+) -> None:
+    isolated = SimpleNamespace(**{**vars(settings), "research_enabled": True})
+    dashboard = DashboardService(service, object(), DisabledResearchService())
+    transport = httpx.ASGITransport(
+        app=create_app(settings=isolated, service=dashboard, cache=cache),
+        raise_app_exceptions=False,
+    )
+    async with httpx.AsyncClient(transport=transport, base_url=isolated.allowed_origin) as local:
+        response = await local.post(
+            "/api/v1/research/query",
+            json={"symbol": "AAPL", "question": "What risks are described?"},
+            headers={"X-App-Key": "correct horse battery staple"},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "RESEARCH_UNAVAILABLE",
+        "message": "research is not configured",
+    }
+
+
+@pytest.mark.asyncio
+async def test_openapi_research_contract_contains_no_secret_or_arbitrary_url_fields(
+    client: httpx.AsyncClient,
+    api_headers: dict[str, str],
+) -> None:
+    schema = (await client.get("/openapi.json", headers=api_headers)).json()
+    serialized = str(schema).lower()
+    request_schema = schema["components"]["schemas"]["ResearchQueryRequest"]
+
+    assert set(request_schema["properties"]) == {"symbol", "question"}
+    assert request_schema["additionalProperties"] is False
+    assert all(
+        secret not in serialized
+        for secret in (
+            "marketdata_token",
+            "openai_api_key",
+            "upstash_redis_rest_token",
+            "vector_token",
+            "correct horse battery staple",
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -642,7 +1659,7 @@ async def test_provider_plan_or_ip_restriction_is_sanitized(settings, cache) -> 
 
 
 @pytest.mark.asyncio
-async def test_dashboard_exposes_only_direct_symbol_lookup_sections(
+async def test_dashboard_exposes_accessible_symbol_lookup_without_removed_sections(
     client: httpx.AsyncClient,
 ) -> None:
     token = await _csrf(client)
@@ -657,8 +1674,9 @@ async def test_dashboard_exposes_only_direct_symbol_lookup_sections(
     assert response.status_code == 200
     assert 'name="symbol"' in response.text
     assert 'pattern="[A-Za-z0-9][A-Za-z0-9.\\-]{0,31}"' in response.text
-    assert 'role="combobox"' not in response.text
-    assert 'role="listbox"' not in response.text
+    assert 'role="combobox"' in response.text
+    assert 'role="listbox"' in response.text
+    assert 'aria-autocomplete="list"' in response.text
     assert "company-metadata" not in response.text
     assert "splits-table" not in response.text
     assert "dividends-table" not in response.text
@@ -739,7 +1757,7 @@ async def test_local_rate_limits_ignore_forwarded_headers(
 ) -> None:
     response = await client.get(
         "/api/v1/eod/latest/AAPL",
-        headers={**api_headers, "X-Vercel-Forwarded-For": "203.0.113.7"},
+        headers={**api_headers, "X-Forwarded-For": "203.0.113.7"},
     )
 
     assert response.status_code == 200
@@ -748,7 +1766,7 @@ async def test_local_rate_limits_ignore_forwarded_headers(
 
 
 @pytest.mark.asyncio
-async def test_vercel_rate_limits_use_first_valid_forwarded_ip(
+async def test_vercel_rate_limits_use_official_forwarded_ip(
     settings,
     service,
     cache,
@@ -761,14 +1779,14 @@ async def test_vercel_rate_limits_use_first_valid_forwarded_ip(
             "/api/v1/eod/latest/AAPL",
             headers={
                 **api_headers,
-                "X-Vercel-Forwarded-For": "invalid, 203.0.113.8, 203.0.113.9",
+                "X-Vercel-Forwarded-For": "203.0.113.8",
                 "X-Forwarded-For": "198.51.100.1",
             },
         )
 
     assert response.status_code == 200
-    assert "rate:api:203.0.113.8" in cache.counts
-    assert "rate:api:198.51.100.1" not in cache.counts
+    assert "rate:api:203.0.113.8" not in cache.counts
+    assert "rate:api:198.51.100.1" in cache.counts
 
 
 @pytest.mark.asyncio

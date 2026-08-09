@@ -6,6 +6,7 @@ from datetime import date
 from app.errors import InputValidationError
 
 _SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,31}$")
+_SYMBOL_QUERY = re.compile(r"^[A-Z0-9.\- ]{2,32}$")
 _CURSOR = re.compile(r"^\d{1,12}$")
 
 
@@ -13,6 +14,26 @@ def validate_symbol(symbol: str) -> str:
     normalized = symbol.strip().upper() if isinstance(symbol, str) else ""
     if not _SYMBOL.fullmatch(normalized):
         raise InputValidationError("symbol must contain 1-32 market identifier characters")
+    return normalized
+
+
+def validate_symbol_query(query: str) -> str:
+    normalized = query.strip().upper() if isinstance(query, str) else ""
+    if len(normalized) < 2:
+        raise InputValidationError("symbol search query must contain at least two characters")
+    if not _SYMBOL_QUERY.fullmatch(normalized):
+        raise InputValidationError(
+            "symbol search query must use letters, numbers, spaces, periods, or hyphens"
+        )
+    return normalized
+
+
+def validate_research_question(question: str) -> str:
+    normalized = question.strip() if isinstance(question, str) else ""
+    if not 1 <= len(normalized) <= 500:
+        raise InputValidationError("research question must contain 1-500 characters")
+    if any(ord(character) < 32 or ord(character) == 127 for character in normalized):
+        raise InputValidationError("research question must not contain control characters")
     return normalized
 
 

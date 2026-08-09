@@ -43,3 +43,28 @@ class Page[ItemT](DomainModel):
     items: tuple[ItemT, ...] = ()
     next_cursor: str | None = None
     total: int | None = Field(default=None, ge=0)
+
+
+class SymbolRecord(DomainModel):
+    symbol: str = Field(min_length=1, max_length=32, pattern=r"^[A-Z0-9][A-Z0-9.\-]{0,31}$")
+    name: str = Field(min_length=1, max_length=200)
+    exchange: str = Field(min_length=1, max_length=80)
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def normalize_symbol(cls, value: object) -> object:
+        return value.strip().upper() if isinstance(value, str) else value
+
+    @field_validator("name", "exchange")
+    @classmethod
+    def reject_markup(cls, value: str) -> str:
+        if any(character in value for character in "<>"):
+            raise ValueError("symbol directory text must not contain markup")
+        return value.strip()
+
+
+class SymbolSearchPage(Page[SymbolRecord]):
+    source: str
+    as_of: datetime
+    stale: bool = False
+    limit: int = Field(ge=1, le=8)

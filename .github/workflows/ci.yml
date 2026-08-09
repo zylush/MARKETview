@@ -14,9 +14,9 @@ concurrency:
 env:
   PYTHONUNBUFFERED: "1"
   ENVIRONMENT: development
-  MARKETSTACK_API_KEY: test-provider-key-never-used
-  MARKETSTACK_BASE_URL: https://marketstack.invalid/v2
-  MARKETSTACK_MONTHLY_BUDGET: "90"
+  MARKETDATA_TOKEN: test-provider-key-never-used
+  MARKETDATA_BASE_URL: https://api.marketdata.app/v1
+  MARKETDATA_DAILY_CREDIT_BUDGET: "90"
   APP_ACCESS_KEY_SHA256: 7c222fb2927d828af22f592134e8932480637c0d23f8469b0e9e25c531b77a92
   SESSION_SECRET: test-only-session-secret-with-at-least-32-characters
   UPSTASH_REDIS_REST_URL: https://upstash.invalid
@@ -25,6 +25,7 @@ env:
   ALLOWED_HOSTS: testserver,localhost,127.0.0.1
   SESSION_COOKIE_SECURE: "false"
   HTTP_TIMEOUT_SECONDS: "1"
+  RESEARCH_ENABLED: "false"
 
 jobs:
   quality:

@@ -11,7 +11,15 @@ from app.config import Settings
 _MARKETDATA_SECRET = "marketdata-traceback-secret-sentinel"
 _UPSTASH_SECRET = "upstash-traceback-secret-sentinel"
 _SESSION_SECRET = "session-traceback-secret-sentinel-longer-than-32-bytes"
-_SECRET_SENTINELS = (_MARKETDATA_SECRET, _UPSTASH_SECRET, _SESSION_SECRET)
+_OPENAI_SECRET = "openai-traceback-secret-sentinel"
+_VECTOR_SECRET = "vector-traceback-secret-sentinel"
+_SECRET_SENTINELS = (
+    _MARKETDATA_SECRET,
+    _UPSTASH_SECRET,
+    _SESSION_SECRET,
+    _OPENAI_SECRET,
+    _VECTOR_SECRET,
+)
 
 
 def secure_production_values() -> dict[str, object]:
@@ -228,6 +236,279 @@ def test_timeout_and_daily_budget_load_from_canonical_environment(
 
     assert settings.http_timeout_seconds == 7.5
     assert settings.marketdata_daily_credit_budget == 123
+
+
+def test_symbol_and_research_controls_load_without_external_provider_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SEC_USER_AGENT", "MARKETview admin@example.com")
+    monkeypatch.setenv("SYMBOL_INDEX_SCHEMA_VERSION", "v7")
+    monkeypatch.setenv("SYMBOL_DIRECTORY_MAX_AGE_SECONDS", "43200")
+    monkeypatch.setenv("SYMBOL_SEARCH_RATE_LIMIT", "24")
+    monkeypatch.setenv("RESEARCH_ENABLED", "false")
+    monkeypatch.setenv("RESEARCH_MAX_QUESTION_CHARS", "480")
+    monkeypatch.setenv("RESEARCH_MAX_REQUEST_BYTES", "3072")
+    monkeypatch.setenv("RESEARCH_TIMEOUT_SECONDS", "6.5")
+    monkeypatch.setenv("RESEARCH_RATE_LIMIT", "7")
+    monkeypatch.setenv("RESEARCH_DAILY_GLOBAL_LIMIT", "40")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.sec_user_agent == "MARKETview admin@example.com"
+    assert settings.symbol_index_schema_version == "v7"
+    assert settings.symbol_directory_max_age_seconds == 43_200
+    assert settings.symbol_search_rate_limit == 24
+    assert settings.research_enabled is False
+    assert settings.research_max_question_chars == 480
+    assert settings.research_max_request_bytes == 3072
+    assert settings.research_timeout_seconds == 6.5
+    assert settings.research_rate_limit == 7
+    assert settings.research_daily_global_limit == 40
+
+
+def test_research_is_disabled_by_default_without_model_or_vector_credentials() -> None:
+    settings = Settings(environment="test", _env_file=None)
+
+    assert settings.research_enabled is False
+    assert settings.openai_api_key is None
+    assert settings.upstash_vector_rest_url is None
+    assert settings.upstash_vector_rest_token is None
+
+
+def complete_research_values() -> dict[str, object]:
+    return {
+        "openai_api_key": _OPENAI_SECRET,
+        "upstash_vector_rest_url": "https://example-index-us1-vector.upstash.io",
+        "upstash_vector_rest_token": _VECTOR_SECRET,
+        "research_embedding_provider": "openai",
+        "research_embedding_model": "text-embedding-3-small",
+        "research_embedding_dimensions": 1536,
+        "research_generation_provider": "openai",
+        "research_generation_model": "gpt-5.6-luna",
+        "research_generation_max_output_tokens": 700,
+        "research_vector_provider": "upstash",
+        "research_vector_namespace": "sec-filings-v1",
+        "research_index_schema_version": "v1",
+        "research_chunk_tokens": 800,
+        "research_chunk_overlap_tokens": 100,
+        "research_max_results": 5,
+        "research_vector_overfetch": 4,
+        "research_minimum_score": 0.70,
+    }
+
+
+def test_complete_enabled_research_configuration_is_typed_and_secret_safe() -> None:
+    settings = Settings(
+        environment="test",
+        research_enabled=True,
+        **complete_research_values(),
+        _env_file=None,
+    )
+
+    assert isinstance(settings.openai_api_key, SecretStr)
+    assert isinstance(settings.upstash_vector_rest_token, SecretStr)
+    assert settings.openai_api_key.get_secret_value() == _OPENAI_SECRET
+    assert settings.upstash_vector_rest_token.get_secret_value() == _VECTOR_SECRET
+    assert settings.research_embedding_model == "text-embedding-3-small"
+    assert settings.research_embedding_dimensions == 1536
+    assert settings.research_generation_model == "gpt-5.6-luna"
+    assert settings.research_vector_namespace == "sec-filings-v1"
+    surfaces = (
+        repr(settings),
+        str(settings),
+        repr(settings.model_dump()),
+        settings.model_dump_json(),
+    )
+    assert all(secret not in surface for secret in _SECRET_SENTINELS for surface in surfaces)
+
+
+@pytest.mark.parametrize(
+    "missing_name",
+    ["openai_api_key", "upstash_vector_rest_url", "upstash_vector_rest_token"],
+)
+def test_enabled_research_requires_complete_provider_configuration(missing_name: str) -> None:
+    with pytest.raises(ValidationError, match="research configuration is incomplete") as captured:
+        Settings(
+            environment="test",
+            research_enabled=True,
+            **{
+                name: value
+                for name, value in complete_research_values().items()
+                if name != missing_name
+            },
+            _env_file=None,
+        )
+
+    _assert_secret_free_exception(captured.value)
+
+
+def test_partial_research_credentials_fail_closed_even_while_disabled() -> None:
+    with pytest.raises(ValidationError, match="research configuration is incomplete") as captured:
+        Settings(
+            environment="test",
+            openai_api_key=_OPENAI_SECRET,
+            _env_file=None,
+        )
+
+    _assert_secret_free_exception(captured.value)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"research_embedding_provider": "other"}, "RESEARCH_EMBEDDING_PROVIDER"),
+        ({"research_embedding_model": "other"}, "RESEARCH_EMBEDDING_MODEL"),
+        ({"research_embedding_dimensions": 3}, "RESEARCH_EMBEDDING_DIMENSIONS"),
+        ({"research_generation_provider": "other"}, "RESEARCH_GENERATION_PROVIDER"),
+        ({"research_generation_model": "other"}, "RESEARCH_GENERATION_MODEL"),
+        ({"research_vector_provider": "other"}, "RESEARCH_VECTOR_PROVIDER"),
+        ({"research_vector_namespace": "../unsafe"}, "RESEARCH_VECTOR_NAMESPACE"),
+        (
+            {"upstash_vector_rest_url": "https://vector.example/api"},
+            "UPSTASH_VECTOR_REST_URL",
+        ),
+    ],
+)
+def test_enabled_research_rejects_unsupported_or_unsafe_contract_values(
+    override: dict[str, object], message: str
+) -> None:
+    values = {**complete_research_values(), **override}
+
+    with pytest.raises(ValidationError, match=message):
+        Settings(
+            environment="test",
+            research_enabled=True,
+            **values,
+            _env_file=None,
+        )
+
+
+def test_research_chunk_overlap_must_be_smaller_than_chunk_size() -> None:
+    with pytest.raises(ValidationError, match="RESEARCH_CHUNK_OVERLAP_TOKENS"):
+        Settings(
+            environment="test",
+            research_enabled=True,
+            **{
+                **complete_research_values(),
+                "research_chunk_tokens": 100,
+                "research_chunk_overlap_tokens": 100,
+            },
+            _env_file=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"research_generation_max_output_tokens": 2001}, "RESEARCH_GENERATION_MAX_OUTPUT_TOKENS"),
+        (
+            {"research_max_results": 5, "research_vector_overfetch": 5},
+            "RESEARCH_MAX_RESULTS",
+        ),
+        ({"research_vector_namespace": "research-v1"}, "RESEARCH_VECTOR_NAMESPACE"),
+    ],
+)
+def test_enabled_research_rejects_values_the_runtime_adapters_cannot_honor(
+    override: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        Settings(
+            environment="test",
+            research_enabled=True,
+            **{**complete_research_values(), **override},
+            _env_file=None,
+        )
+
+
+@pytest.mark.parametrize("research_enabled", [False, True])
+def test_configured_research_caps_results_at_generator_evidence_limit(
+    research_enabled: bool,
+) -> None:
+    with pytest.raises(ValidationError, match="RESEARCH_MAX_RESULTS must not exceed 8"):
+        Settings(
+            environment="test",
+            research_enabled=research_enabled,
+            **{
+                **complete_research_values(),
+                "research_max_results": 9,
+                "research_vector_overfetch": 2,
+            },
+            _env_file=None,
+        )
+
+
+def test_configured_research_allows_eight_results_with_safe_overfetch_product() -> None:
+    settings = Settings(
+        environment="test",
+        research_enabled=True,
+        **{
+            **complete_research_values(),
+            "research_max_results": 8,
+            "research_vector_overfetch": 2,
+        },
+        _env_file=None,
+    )
+
+    assert settings.research_max_results == 8
+    assert settings.research_max_results * settings.research_vector_overfetch == 16
+
+
+def test_disabled_unconfigured_research_retains_dormant_max_results_range() -> None:
+    settings = Settings(
+        environment="test",
+        research_max_results=20,
+        research_vector_overfetch=1,
+        _env_file=None,
+    )
+
+    assert settings.research_enabled is False
+    assert settings.research_max_results == 20
+
+
+def test_research_secret_validation_discards_exception_graph_and_traceback_locals() -> None:
+    with pytest.raises(ValidationError) as captured:
+        Settings(
+            environment="test",
+            research_enabled=True,
+            **{
+                **complete_research_values(),
+                "openai_api_key": f"{_OPENAI_SECRET}\n",
+                "upstash_vector_rest_token": f"{_VECTOR_SECRET}\n",
+            },
+            _env_file=None,
+        )
+
+    _assert_secret_free_exception(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "user_agent",
+    ["MarketView", "MarketView admin@localhost", "MarketView admin@example.com\r\nInjected: 1"],
+)
+def test_invalid_sec_user_agent_is_rejected_before_refresh(user_agent: str) -> None:
+    with pytest.raises(ValidationError, match="SEC_USER_AGENT"):
+        Settings(sec_user_agent=user_agent, _env_file=None)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("RESEARCH_MAX_QUESTION_CHARS", "501"),
+        ("RESEARCH_MAX_REQUEST_BYTES", "1023"),
+        ("RESEARCH_MAX_REQUEST_BYTES", "65537"),
+    ],
+)
+def test_research_request_limits_reject_misleading_or_unsafe_values(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
 
 
 def test_all_settings_secrets_are_redacted_from_settings_surfaces(

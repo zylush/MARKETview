@@ -4,27 +4,64 @@
   const API = Object.freeze({
     latest: (symbol) => `/api/v1/eod/latest/${encodeURIComponent(symbol)}`,
     history: (symbol) => `/api/v1/eod/history/${encodeURIComponent(symbol)}`,
+    symbols: (query) => {
+      const params = new URLSearchParams({ q: query, limit: "8" });
+      return `/api/v1/symbols/search?${params.toString()}`;
+    },
+    research: "/api/v1/research/query",
     usage: "/api/v1/usage",
   });
   const SYMBOL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.-]{0,31}$/;
+  const SYMBOL_QUERY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9 .-]{1,31}$/;
+  const AUTOCOMPLETE_DELAY_MS = 250;
   const $ = (id) => document.getElementById(id);
   const elements = Object.freeze({
     searchForm: $("ticker-search-form"),
     searchInput: $("ticker-search"),
     searchButton: document.querySelector("[data-testid='search-submit']"),
     searchError: $("search-error"),
+    searchStatus: $("ticker-search-status"),
+    suggestionList: $("ticker-suggestions"),
     historyForm: $("history-range-form"),
     dateFrom: $("date-from"),
     dateTo: $("date-to"),
     logoutForm: $("logout-form"),
+    researchForm: $("research-form"),
+    researchQuestion: $("research-question"),
+    researchSubmit: document.querySelector("[data-testid='research-submit']"),
+    researchCancel: $("research-cancel"),
   });
   let state = Object.freeze({
     symbol: String(document.body.dataset.initialSymbol || "AAPL").toUpperCase(),
     chart: null,
+    autocomplete: Object.freeze({
+      items: Object.freeze([]),
+      activeIndex: -1,
+      debounceTimer: null,
+      controller: null,
+      requestVersion: 0,
+    }),
+    research: Object.freeze({
+      controller: null,
+      requestVersion: 0,
+      loading: false,
+    }),
   });
 
   function updateState(changes) {
     state = Object.freeze({ ...state, ...changes });
+  }
+
+  function updateAutocomplete(changes) {
+    updateState({
+      autocomplete: Object.freeze({ ...state.autocomplete, ...changes }),
+    });
+  }
+
+  function updateResearch(changes) {
+    updateState({
+      research: Object.freeze({ ...state.research, ...changes }),
+    });
   }
 
   function setVisible(element, visible) {
@@ -115,11 +152,12 @@
     setText("data-freshness", `${source}${stale}${meta.as_of ? ` · ${dateValue(meta.as_of)}` : ""}`);
   }
 
-  async function request(url) {
+  async function request(url, options = {}) {
     const response = await fetch(url, {
       method: "GET",
       credentials: "same-origin",
       headers: { Accept: "application/json" },
+      signal: options.signal,
     });
     let payload = null;
     try {
@@ -128,7 +166,41 @@
       throw new Error("The server returned an unreadable response.");
     }
     if (!response.ok || payload.success === false) {
-      throw new Error(payload?.error?.message || `Request failed (${response.status}).`);
+      const error = new Error(payload?.error?.message || `Request failed (${response.status}).`);
+      error.status = response.status;
+      error.code = payload?.error?.code || "";
+      throw error;
+    }
+    return payload;
+  }
+
+  async function postJson(url, body, signal) {
+    const csrf = document.querySelector("meta[name='csrf-token']")?.content || "";
+    const response = await fetch(url, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrf,
+      },
+      body: JSON.stringify(body),
+      signal,
+    });
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (_error) {
+      const error = new Error("The server returned an unreadable response.");
+      error.status = response.status;
+      error.code = "UNREADABLE_RESPONSE";
+      throw error;
+    }
+    if (!response.ok || payload?.success === false) {
+      const error = new Error(payload?.error?.message || `Request failed (${response.status}).`);
+      error.status = response.status;
+      error.code = payload?.error?.code || "";
+      throw error;
     }
     return payload;
   }
@@ -136,6 +208,136 @@
   function normalizeSymbol(value) {
     const normalized = String(value || "").trim().toUpperCase();
     return SYMBOL_PATTERN.test(normalized) ? normalized : null;
+  }
+
+  function normalizeSymbolQuery(value) {
+    const normalized = String(value || "").trim().toUpperCase();
+    return SYMBOL_QUERY_PATTERN.test(normalized) ? normalized : null;
+  }
+
+  function setSuggestionStatus(message, isError = false) {
+    elements.searchStatus.textContent = message;
+    elements.searchStatus.classList.toggle("is-error", isError);
+  }
+
+  function closeSuggestions({ clearItems = true, clearStatus = false } = {}) {
+    elements.suggestionList.hidden = true;
+    elements.searchInput.setAttribute("aria-expanded", "false");
+    elements.searchInput.removeAttribute("aria-activedescendant");
+    if (clearItems) elements.suggestionList.replaceChildren();
+    if (clearStatus) setSuggestionStatus("");
+    updateAutocomplete({
+      items: clearItems ? Object.freeze([]) : state.autocomplete.items,
+      activeIndex: -1,
+    });
+  }
+
+  function cancelAutocomplete({ clearStatus = false } = {}) {
+    const { debounceTimer, controller, requestVersion } = state.autocomplete;
+    if (debounceTimer !== null) window.clearTimeout(debounceTimer);
+    if (controller) controller.abort();
+    updateAutocomplete({
+      debounceTimer: null,
+      controller: null,
+      requestVersion: requestVersion + 1,
+    });
+    closeSuggestions({ clearStatus });
+  }
+
+  function normalizeSuggestion(item) {
+    const symbol = normalizeSymbol(item?.symbol);
+    const name = typeof item?.name === "string" ? item.name.trim() : "";
+    const exchange = typeof item?.exchange === "string" ? item.exchange.trim() : "";
+    if (!symbol || !name || !exchange) return null;
+    return Object.freeze({ symbol, name, exchange });
+  }
+
+  function suggestionOption(item, index) {
+    const option = document.createElement("div");
+    const symbol = document.createElement("span");
+    const name = document.createElement("span");
+    const exchange = document.createElement("span");
+    option.id = `ticker-suggestion-${index}`;
+    option.className = "ticker-suggestion";
+    option.setAttribute("role", "option");
+    option.setAttribute("aria-selected", "false");
+    option.dataset.index = String(index);
+    symbol.className = "ticker-suggestion-symbol";
+    name.className = "ticker-suggestion-name";
+    exchange.className = "ticker-suggestion-exchange";
+    symbol.textContent = item.symbol;
+    name.textContent = item.name;
+    exchange.textContent = item.exchange;
+    option.replaceChildren(symbol, name, exchange);
+    return option;
+  }
+
+  function renderSuggestions(rawItems) {
+    const items = Object.freeze(
+      rawItems.slice(0, 8).map(normalizeSuggestion).filter(Boolean),
+    );
+    if (!items.length) {
+      closeSuggestions();
+      setSuggestionStatus("No ticker suggestions found. Type a symbol and press Enter to load it directly.");
+      return;
+    }
+    const options = items.map(suggestionOption);
+    elements.suggestionList.replaceChildren(...options);
+    elements.suggestionList.hidden = false;
+    elements.searchInput.setAttribute("aria-expanded", "true");
+    updateAutocomplete({ items, activeIndex: -1 });
+    const noun = items.length === 1 ? "suggestion" : "suggestions";
+    setSuggestionStatus(`${items.length} ticker ${noun} available. Use the arrow keys to review them.`);
+  }
+
+  function setActiveSuggestion(index) {
+    const { items } = state.autocomplete;
+    if (!items.length) return;
+    const nextIndex = ((index % items.length) + items.length) % items.length;
+    Array.from(elements.suggestionList.children).forEach((option, optionIndex) => {
+      option.setAttribute("aria-selected", optionIndex === nextIndex ? "true" : "false");
+    });
+    const active = elements.suggestionList.children[nextIndex];
+    elements.searchInput.setAttribute("aria-activedescendant", active.id);
+    active.scrollIntoView({ block: "nearest" });
+    updateAutocomplete({ activeIndex: nextIndex });
+  }
+
+  async function loadSuggestions(query) {
+    const controller = new AbortController();
+    const requestVersion = state.autocomplete.requestVersion + 1;
+    updateAutocomplete({ controller, requestVersion, debounceTimer: null });
+    setSuggestionStatus("Loading ticker suggestions…");
+    try {
+      const response = await request(API.symbols(query), { signal: controller.signal });
+      if (controller.signal.aborted || requestVersion !== state.autocomplete.requestVersion) return;
+      renderSuggestions(asList(response.data));
+    } catch (error) {
+      if (error?.name === "AbortError" || requestVersion !== state.autocomplete.requestVersion) return;
+      closeSuggestions();
+      setSuggestionStatus("Could not load ticker suggestions. Type a symbol and press Enter instead.", true);
+    } finally {
+      if (requestVersion === state.autocomplete.requestVersion) {
+        updateAutocomplete({ controller: null });
+      }
+    }
+  }
+
+  function queueSuggestions() {
+    clearSymbolError();
+    cancelAutocomplete({ clearStatus: true });
+    const query = normalizeSymbolQuery(elements.searchInput.value);
+    if (!query) return;
+    const debounceTimer = window.setTimeout(() => loadSuggestions(query), AUTOCOMPLETE_DELAY_MS);
+    updateAutocomplete({ debounceTimer });
+  }
+
+  function selectSuggestion(index) {
+    const item = state.autocomplete.items[index];
+    if (!item) return;
+    cancelAutocomplete({ clearStatus: true });
+    elements.searchInput.value = item.symbol;
+    loadDashboard(item.symbol);
   }
 
   function showSymbolError(message) {
@@ -272,6 +474,224 @@
     setSectionState("usage", "ready");
   }
 
+  function updateResearchControls() {
+    if (!elements.researchForm) return;
+    const maximum = Number(elements.researchQuestion.maxLength) || 500;
+    const length = elements.researchQuestion.value.length;
+    setText("research-character-count", `${length} / ${maximum}`);
+    elements.researchSubmit.disabled = state.research.loading
+      || !elements.researchQuestion.value.trim()
+      || length > maximum;
+    setVisible(elements.researchCancel, state.research.loading);
+  }
+
+  function clearResearchOutput() {
+    if (!elements.researchForm) return;
+    setVisible($("research-error"), false);
+    setVisible($("research-result"), false);
+    setVisible($("research-citations-wrap"), false);
+    $("research-citations").replaceChildren();
+    setText("research-answer", "");
+  }
+
+  function setResearchStatus(message, { loading = false, focus = false } = {}) {
+    if (!elements.researchForm) return;
+    const status = $("research-status");
+    status.textContent = message;
+    status.classList.toggle("is-loading", loading);
+    setVisible(status, true);
+    if (focus) status.focus({ preventScroll: true });
+  }
+
+  function setResearchError(message) {
+    clearResearchOutput();
+    setVisible($("research-status"), false);
+    const error = $("research-error");
+    error.textContent = message;
+    setVisible(error, true);
+    error.focus({ preventScroll: true });
+  }
+
+  function canonicalSecCitationUrl(value) {
+    if (typeof value !== "string" || value.includes("%")) return null;
+    try {
+      const url = new URL(value);
+      const validPath = /^\/Archives\/edgar\/data\/[0-9]+\/[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(url.pathname);
+      const unsafeSegment = url.pathname.split("/").some((segment) => segment === "." || segment === "..");
+      if (
+        url.protocol !== "https:"
+        || url.hostname !== "www.sec.gov"
+        || url.host !== "www.sec.gov"
+        || url.username
+        || url.password
+        || url.port
+        || url.search
+        || url.hash
+        || !validPath
+        || unsafeSegment
+        || url.href !== value
+      ) return null;
+      return url.href;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function normalizedCitation(value) {
+    const url = canonicalSecCitationUrl(value?.url);
+    const title = typeof value?.title === "string" ? value.title.trim() : "";
+    const filedDate = typeof value?.filed_date === "string" ? value.filed_date : "";
+    const filingType = typeof value?.filing_type === "string" ? value.filing_type.trim() : "";
+    const snippet = typeof value?.snippet === "string" ? value.snippet.trim() : "";
+    if (!url || !title || !/^\d{4}-\d{2}-\d{2}$/.test(filedDate)) return null;
+    return Object.freeze({ url, title, filedDate, filingType, snippet });
+  }
+
+  function citationItem(citation) {
+    const item = document.createElement("li");
+    const link = document.createElement("a");
+    const metadata = document.createElement("span");
+    const filed = document.createElement("span");
+    link.className = "citation-link";
+    link.href = citation.url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = citation.title;
+    metadata.className = "citation-meta";
+    filed.textContent = `Filed ${dateValue(citation.filedDate)}`;
+    metadata.append(filed);
+    if (citation.filingType) {
+      const filingType = document.createElement("span");
+      filingType.textContent = ` · ${citation.filingType}`;
+      metadata.append(filingType);
+    }
+    item.replaceChildren(link, metadata);
+    if (citation.snippet) {
+      const snippet = document.createElement("span");
+      snippet.className = "citation-snippet";
+      snippet.textContent = citation.snippet;
+      item.append(snippet);
+    }
+    return item;
+  }
+
+  function renderResearchAnswer(data) {
+    const result = data && typeof data === "object" ? data : {};
+    if (normalizeSymbol(result.symbol) !== state.symbol) {
+      setResearchError("Research is temporarily unavailable. Try again later.");
+      return;
+    }
+    const refused = result.outcome === "refused" || result.refused === true;
+    const insufficient = result.outcome === "insufficient_evidence"
+      || result.insufficient_evidence === true;
+    clearResearchOutput();
+    setVisible($("research-status"), false);
+    const answer = $("research-answer");
+    if (refused) {
+      answer.textContent = "I cannot provide personalized buy or sell recommendations.";
+    } else if (insufficient) {
+      answer.textContent = "Insufficient evidence in the indexed SEC filings.";
+    } else {
+      const citations = Object.freeze(
+        asList(result.citations).map(normalizedCitation).filter(Boolean),
+      );
+      if (!citations.length || typeof result.answer !== "string" || !result.answer.trim()) {
+        answer.textContent = "Insufficient evidence in the indexed SEC filings.";
+      } else {
+        answer.textContent = result.answer.trim();
+        $("research-citations").replaceChildren(...citations.map(citationItem));
+        setVisible($("research-citations-wrap"), true);
+      }
+    }
+    const response = $("research-result");
+    setVisible(response, true);
+    response.focus({ preventScroll: true });
+  }
+
+  function cancelResearch(message = "Research request cancelled.") {
+    if (!elements.researchForm) return;
+    const { controller, requestVersion } = state.research;
+    if (controller) controller.abort();
+    updateResearch({
+      controller: null,
+      requestVersion: requestVersion + 1,
+      loading: false,
+    });
+    clearResearchOutput();
+    setResearchStatus(message, { focus: true });
+    updateResearchControls();
+  }
+
+  function resetResearch(symbol) {
+    if (!elements.researchForm) return;
+    const { controller, requestVersion } = state.research;
+    if (controller) controller.abort();
+    updateResearch({
+      controller: null,
+      requestVersion: requestVersion + 1,
+      loading: false,
+    });
+    elements.researchQuestion.value = "";
+    setText("research-symbol", symbol);
+    clearResearchOutput();
+    setResearchStatus(`Ask a question about ${symbol} SEC filings.`);
+    updateResearchControls();
+  }
+
+  function researchErrorMessage(error) {
+    if (error?.status === 504 || error?.code === "RESEARCH_TIMEOUT") {
+      return "Research request timed out. Try again.";
+    }
+    if (error?.status === 503 || error?.code === "RESEARCH_UNAVAILABLE") {
+      return "Research is temporarily unavailable. Try again later.";
+    }
+    if (error?.status === 429) {
+      return "Research request limit reached. Try again later.";
+    }
+    if (error?.status === 422 || error?.status === 413) {
+      return "Check the question length and try again.";
+    }
+    return "Could not complete the research request. Check your connection and try again.";
+  }
+
+  async function submitResearch() {
+    if (!elements.researchForm || state.research.loading) return;
+    const question = elements.researchQuestion.value.trim();
+    if (!question || question.length > elements.researchQuestion.maxLength) {
+      setResearchError("Enter a question within the character limit.");
+      elements.researchQuestion.focus();
+      return;
+    }
+    const controller = new AbortController();
+    const requestVersion = state.research.requestVersion + 1;
+    const requestedSymbol = state.symbol;
+    updateResearch({ controller, requestVersion, loading: true });
+    clearResearchOutput();
+    setResearchStatus(`Searching SEC filings for ${requestedSymbol}…`, { loading: true });
+    updateResearchControls();
+    try {
+      const response = await postJson(
+        API.research,
+        Object.freeze({ symbol: requestedSymbol, question }),
+        controller.signal,
+      );
+      if (
+        controller.signal.aborted
+        || requestVersion !== state.research.requestVersion
+        || requestedSymbol !== state.symbol
+      ) return;
+      renderResearchAnswer(response.data);
+    } catch (error) {
+      if (error?.name === "AbortError" || requestVersion !== state.research.requestVersion) return;
+      setResearchError(researchErrorMessage(error));
+    } finally {
+      if (requestVersion === state.research.requestVersion) {
+        updateResearch({ controller: null, loading: false });
+        updateResearchControls();
+      }
+    }
+  }
+
   function historyUrl(symbol) {
     const params = new URLSearchParams({
       date_from: elements.dateFrom.value,
@@ -303,7 +723,9 @@
   }
 
   async function loadDashboard(symbol) {
+    const symbolChanged = state.symbol !== symbol;
     updateState({ symbol });
+    if (symbolChanged) resetResearch(symbol);
     elements.searchInput.value = symbol;
     setText("header-symbol", symbol);
     setText("company-symbol", symbol);
@@ -335,6 +757,7 @@
   }
 
   function submitSymbol() {
+    cancelAutocomplete({ clearStatus: true });
     clearSymbolError();
     const symbol = normalizeSymbol(elements.searchInput.value);
     if (!symbol) {
@@ -350,7 +773,54 @@
       event.preventDefault();
       submitSymbol();
     });
-    elements.searchInput.addEventListener("input", clearSymbolError);
+    elements.searchInput.addEventListener("input", queueSuggestions);
+    elements.searchInput.addEventListener("keydown", (event) => {
+      const { activeIndex, items } = state.autocomplete;
+      if (event.key === "Escape" && (
+        !elements.suggestionList.hidden
+        || state.autocomplete.debounceTimer !== null
+        || state.autocomplete.controller
+      )) {
+        event.preventDefault();
+        cancelAutocomplete({ clearStatus: true });
+        return;
+      }
+      if (elements.suggestionList.hidden || !items.length) return;
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setActiveSuggestion(activeIndex + 1);
+      } else if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setActiveSuggestion(activeIndex < 0 ? items.length - 1 : activeIndex - 1);
+      } else if (event.key === "Enter" && activeIndex >= 0) {
+        event.preventDefault();
+        selectSuggestion(activeIndex);
+      }
+    });
+    elements.suggestionList.addEventListener("pointerdown", (event) => {
+      if (event.target.closest("[role='option']")) event.preventDefault();
+    });
+    elements.suggestionList.addEventListener("click", (event) => {
+      const option = event.target.closest("[role='option']");
+      if (option) selectSuggestion(Number(option.dataset.index));
+    });
+    document.addEventListener("pointerdown", (event) => {
+      if (!elements.searchForm.contains(event.target)) cancelAutocomplete({ clearStatus: true });
+    });
+    if (elements.researchForm) {
+      elements.researchQuestion.addEventListener("input", updateResearchControls);
+      elements.researchQuestion.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && state.research.loading) {
+          event.preventDefault();
+          cancelResearch();
+        }
+      });
+      elements.researchForm.addEventListener("submit", (event) => {
+        event.preventDefault();
+        submitResearch();
+      });
+      elements.researchCancel.addEventListener("click", () => cancelResearch());
+    }
     elements.historyForm.addEventListener("submit", (event) => {
       event.preventDefault();
       if (elements.dateFrom.value > elements.dateTo.value) {
@@ -399,6 +869,7 @@
   function initialize() {
     initializeDates();
     bindEvents();
+    updateResearchControls();
     const initial = normalizeSymbol(state.symbol) || "AAPL";
     loadDashboard(initial);
   }

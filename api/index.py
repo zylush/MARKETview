@@ -6,7 +6,10 @@ from app.cache.upstash import UpstashCache
 from app.config import Settings, get_settings
 from app.main import create_app
 from app.providers.marketdata import MarketDataAppProvider
+from app.services.dashboard import DashboardService
 from app.services.market_data import MarketDataService
+from app.services.research import DisabledResearchService, build_research_runtime
+from app.services.symbols import SymbolSearchService
 
 
 def _runtime_dependencies(settings: Settings | None = None) -> tuple[object, object, object]:
@@ -33,12 +36,22 @@ def _runtime_dependencies(settings: Settings | None = None) -> tuple[object, obj
         base_url=settings.marketdata_base_url,
         timeout_seconds=settings.http_timeout_seconds,
     )
-    service = MarketDataService(
+    market_data = MarketDataService(
         provider,
         cache,
         daily_credit_budget=settings.marketdata_daily_credit_budget,
         schema_version=settings.cache_schema_version,
     )
+    symbols = SymbolSearchService(
+        None,
+        cache,
+        schema_version=settings.symbol_index_schema_version,
+        directory_ttl_seconds=settings.symbol_directory_max_age_seconds,
+    )
+    research = (
+        build_research_runtime(settings) if settings.research_enabled else DisabledResearchService()
+    )
+    service = DashboardService(market_data, symbols, research)
     return settings, service, cache
 
 
