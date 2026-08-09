@@ -795,6 +795,8 @@ class UpstashVectorStore:
             return None
         decoded: list[tuple[str, dict[str, object]]] = []
         for item in result:
+            if item is None:
+                continue
             if not isinstance(item, dict) or set(item) != {"id", "metadata"}:
                 return None
             point_id = item.get("id")

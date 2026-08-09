@@ -379,6 +379,27 @@ async def test_inspect_generation_returns_only_safe_aggregate_state_without_vect
 
 
 @pytest.mark.asyncio
+async def test_inspect_generation_treats_missing_fetch_entries_as_absent() -> None:
+    chunks = embedded_chunks()
+    filing_manifest = manifest(chunks)
+
+    adapter, client = store(
+        httpx.MockTransport(lambda _: httpx.Response(200, json={"result": [None, None]}))
+    )
+    try:
+        inspection = await adapter.inspect_generation(
+            filing_manifest,
+            deadline=RequestDeadline.after(1),
+        )
+    finally:
+        await client.aclose()
+
+    assert inspection.state is GenerationInspectionState.ABSENT
+    assert inspection.expected_point_count == 2
+    assert inspection.observed_point_count == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["duplicate", "unexpected", "metadata", "malformed"])
 async def test_inspect_generation_fails_closed_on_inconsistent_provider_records(
     fault: str,
