@@ -20,6 +20,7 @@ from app.research.control import (
     IngestionStageError,
 )
 from app.research.deadline import RequestDeadline
+from app.research.domain import GenerationVerificationOutcome
 from app.research.ingestion import (
     IngestionCheckpointStore,
     ResearchIngestionRequest,
@@ -89,6 +90,23 @@ class ResultLike(Protocol):
     processed_count: int
     removed_count: int
     skipped_count: int
+
+
+def _verification_payload(
+    diagnostic: GenerationVerificationOutcome,
+) -> dict[str, int | str]:
+    if (
+        not isinstance(diagnostic, GenerationVerificationOutcome)
+        or diagnostic.verification is not None
+    ):
+        raise ValueError("vector verification diagnostic is invalid")
+    return {
+        "attempt_count": diagnostic.attempt_count,
+        "expected_point_count": diagnostic.expected_point_count,
+        "null_point_count": diagnostic.null_point_count,
+        "observed_point_count": diagnostic.observed_point_count,
+        "reason": diagnostic.reason.value,
+    }
 
 
 class ControlCheckpointBackend(Protocol):
@@ -397,7 +415,7 @@ async def _default_runner_factory(config: RunnerConfig) -> OwnedResearchIngestio
 
 
 def _result_payload(result: ResultLike) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "applied": not result.dry_run,
         "dry_run": result.dry_run,
         "errors": list(result.errors),
@@ -410,6 +428,12 @@ def _result_payload(result: ResultLike) -> dict[str, object]:
         "removed_count": result.removed_count,
         "skipped_count": result.skipped_count,
     }
+    diagnostics = tuple(getattr(result, "vector_verification_failures", ()))
+    if diagnostics:
+        payload["vector_verification_failures"] = [
+            _verification_payload(item) for item in diagnostics
+        ]
+    return payload
 
 
 def _failure_category(error: Exception) -> str:
@@ -453,8 +477,9 @@ def _failure_payload(
     request: ResearchIngestionRequest,
     category: str,
     failure_stage: IngestionFailureStage | None = None,
+    verification: GenerationVerificationOutcome | None = None,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "applied": bool(request.apply),
         "dry_run": not request.apply,
         "error_category": category,
@@ -468,6 +493,9 @@ def _failure_payload(
         "removed_count": 0,
         "skipped_count": 0,
     }
+    if verification is not None:
+        payload["vector_verification_failures"] = [_verification_payload(verification)]
+    return payload
 
 
 async def async_main(
@@ -510,9 +538,10 @@ async def async_main(
     except Exception as error:
         category = _failure_category(error)
         failure_stage = error.stage if isinstance(error, IngestionStageError) else None
+        verification = error.verification if isinstance(error, IngestionStageError) else None
         print(
             json.dumps(
-                _failure_payload(request, category, failure_stage),
+                _failure_payload(request, category, failure_stage, verification),
                 sort_keys=True,
             )
         )

@@ -29,6 +29,8 @@ from app.research.domain import (
     GeneratedClaim,
     GenerationManifest,
     GenerationVerification,
+    GenerationVerificationOutcome,
+    GenerationVerificationReason,
     ResearchAnswer,
     ResearchCitation,
     ResearchOutcome,
@@ -263,10 +265,15 @@ class FailFirstVerificationAndAbortStore(InMemoryVectorStore):
         manifest: GenerationManifest,
         *,
         deadline: RequestDeadline,
-    ) -> GenerationVerification | None:
+    ) -> GenerationVerificationOutcome:
         if self._fail_verification:
             self._fail_verification = False
-            return None
+            return GenerationVerificationOutcome.failed(
+                reason=GenerationVerificationReason.MISSING_POINTS,
+                expected_point_count=len(manifest.chunk_ids),
+                observed_point_count=0,
+                null_point_count=len(manifest.chunk_ids),
+            )
         return await super().verify_generation(manifest, deadline=deadline)
 
     async def abort_generation(
@@ -279,6 +286,23 @@ class FailFirstVerificationAndAbortStore(InMemoryVectorStore):
             self._fail_abort = False
             raise RuntimeError("simulated vector abort interruption")
         await super().abort_generation(manifest, deadline=deadline)
+
+
+class PartialVisibilityStore(InMemoryVectorStore):
+    async def verify_generation(
+        self,
+        manifest: GenerationManifest,
+        *,
+        deadline: RequestDeadline,
+    ) -> GenerationVerificationOutcome:
+        deadline.raise_if_expired()
+        return GenerationVerificationOutcome.failed(
+            reason=GenerationVerificationReason.PARTIAL_VISIBILITY,
+            expected_point_count=len(manifest.chunk_ids),
+            observed_point_count=1,
+            null_point_count=len(manifest.chunk_ids) - 1,
+            attempt_count=3,
+        )
 
 
 class FailFirstCleanupMarkerControl(InMemoryResearchControlPlane):
@@ -476,6 +500,39 @@ async def test_embedding_failure_is_stage_typed_and_never_stages_partial_vectors
             pending.append(current.__context__)
     assert "private filing text" not in rendered
     assert "provider response" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_vector_verification_failure_preserves_only_sanitized_diagnostic() -> None:
+    store = PartialVisibilityStore()
+
+    with pytest.raises(IngestionStageError) as caught:
+        await service(store=store).ingest(
+            filing(text="private filing text\n\nsecond private filing text")
+        )
+
+    error = caught.value
+    assert error.stage is IngestionFailureStage.VECTOR_VERIFICATION
+    assert error.verification is not None
+    assert error.verification.reason is GenerationVerificationReason.PARTIAL_VISIBILITY
+    assert error.verification.expected_point_count == 2
+    assert error.verification.observed_point_count == 1
+    assert error.verification.null_point_count == 1
+    assert error.verification.attempt_count == 3
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert store.chunks == ()
+    rendered = repr(error) + str(error)
+    traceback = error.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_code.co_filename.endswith("service.py"):
+            rendered += "".join(
+                repr(value)
+                for value in traceback.tb_frame.f_locals.values()
+                if not inspect.iscoroutine(value)
+            )
+        traceback = traceback.tb_next
+    assert "private filing text" not in rendered
 
 
 @pytest.mark.asyncio
@@ -692,11 +749,16 @@ async def test_retry_recovers_aborted_generation_after_clean_marker_interruption
         manifest: GenerationManifest,
         *,
         deadline: RequestDeadline,
-    ) -> GenerationVerification | None:
+    ) -> GenerationVerificationOutcome:
         nonlocal fail_verification
         if fail_verification:
             fail_verification = False
-            return None
+            return GenerationVerificationOutcome.failed(
+                reason=GenerationVerificationReason.MISSING_POINTS,
+                expected_point_count=len(manifest.chunk_ids),
+                observed_point_count=0,
+                null_point_count=len(manifest.chunk_ids),
+            )
         return await original_verify(manifest, deadline=deadline)
 
     store.verify_generation = verify_once  # type: ignore[method-assign]

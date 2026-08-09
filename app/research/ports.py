@@ -23,6 +23,7 @@ from app.research.domain import (
     GeneratedAnswer,
     GenerationManifest,
     GenerationVerification,
+    GenerationVerificationOutcome,
     RawFiling,
     SearchHit,
 )
@@ -129,7 +130,7 @@ class VectorStore(Protocol):
         manifest: GenerationManifest,
         *,
         deadline: RequestDeadline,
-    ) -> GenerationVerification | None: ...
+    ) -> GenerationVerificationOutcome: ...
 
     async def abort_generation(
         self,

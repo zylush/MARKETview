@@ -21,6 +21,9 @@ from app.research.domain import (
     FilingDiscoveryRequest,
     FilingDocument,
     FilingReference,
+    GenerationVerification,
+    GenerationVerificationOutcome,
+    GenerationVerificationReason,
     IngestionResult,
     RawFiling,
 )
@@ -28,6 +31,7 @@ from app.research.ingestion import (
     IngestionCheckpointStore,
     ResearchIngestionJob,
     ResearchIngestionRequest,
+    ResearchIngestionResult,
     ResearchIngestionRetryError,
     ResearchIngestionRunner,
     RetryCheckpointSnapshot,
@@ -488,6 +492,68 @@ async def test_retry_failure_records_only_fixed_stage_without_sensitive_exceptio
     assert failed.errors == ("ingestion failed during embedding",)
     rendered = repr(failed) + repr(checkpoints.results[dry.opaque_job_id])
     assert sensitive_sentinel not in rendered
+
+
+@pytest.mark.asyncio
+async def test_runner_returns_sanitized_vector_verification_diagnostic_only() -> None:
+    diagnostic = GenerationVerificationOutcome.failed(
+        reason=GenerationVerificationReason.PARTIAL_VISIBILITY,
+        expected_point_count=128,
+        observed_point_count=96,
+        null_point_count=32,
+        attempt_count=4,
+    )
+
+    class FailingCore(FakeCore):
+        async def ingest(self, document, *, deadline=None, retry_failed=False):
+            del document, retry_failed
+            if deadline is not None:
+                deadline.raise_if_expired()
+            raise IngestionStageError(
+                IngestionFailureStage.VECTOR_VERIFICATION,
+                verification=diagnostic,
+            ) from None
+
+    runner = ResearchIngestionRunner(
+        source=FakeSource((reference(),)),
+        parser=FakeParser(),
+        core=FailingCore(),
+    )
+
+    result = await runner.run(
+        request(limit=1, apply=True),
+        deadline=RequestDeadline.after(30.0),
+    )
+
+    assert result.failure_stages == (IngestionFailureStage.VECTOR_VERIFICATION,)
+    assert result.vector_verification_failures == (diagnostic,)
+    assert "AAPL" not in repr(result.vector_verification_failures)
+
+
+def test_result_rejects_success_proof_as_failure_diagnostic() -> None:
+    item = reference()
+    job = ResearchIngestionJob.from_plan(request(limit=1, apply=True), (item,))
+    verified = GenerationVerificationOutcome.verified(
+        verification=GenerationVerification.from_point_ids(
+            "gen-" + "a" * 64,
+            ("chunk-" + "b" * 64,),
+        ),
+        expected_point_count=1,
+    )
+
+    with pytest.raises(ValueError, match="diagnostics"):
+        ResearchIngestionResult(
+            dry_run=False,
+            job=job,
+            planned_count=1,
+            processed_count=0,
+            skipped_count=0,
+            failed_count=1,
+            inserted_count=0,
+            removed_count=0,
+            failure_stages=(IngestionFailureStage.VECTOR_VERIFICATION,),
+            vector_verification_failures=(verified,),
+        )
 
 
 @pytest.mark.asyncio

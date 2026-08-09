@@ -180,6 +180,36 @@ Expected exit behavior is deterministic: zero for a successful dry-run/apply or 
 argument/configuration, partial filing failure, provider/vector, or control-state failure. Do not
 work around a nonzero result by deleting Redis keys or vector points manually.
 
+### Isolated Vector smoke probe
+
+The operator-only Vector smoke is a separate command from ingestion. Its default invocation is a
+zero-network dry run:
+
+```powershell
+python -m app.vector_smoke
+```
+
+It prints fixed-length, domain-separated fingerprints for the Vector endpoint, Vector token, and
+OpenAI key. Compare those opaque values with an independently recorded operator baseline; never
+record or display the underlying credentials. The OpenAI-key fingerprint can confirm that two
+environments use the same key, but it does not independently prove which OpenAI project owns that
+key. Confirm project ownership in the OpenAI console as a separate read-only check.
+
+A live smoke requires its own explicit approval and both CLI acknowledgements:
+
+```powershell
+python -m app.vector_smoke --apply --acknowledge-live-vector-smoke
+```
+
+The live command writes exactly one synthetic 1536-dimensional nonzero point in the fixed
+`marketview-nonprod-smoke-v1` namespace. It performs one upsert, bounded read-after-write fetch
+polling under one absolute deadline, one exact-ID delete in `finally`, and bounded cleanup
+verification. It never constructs or calls SEC, OpenAI, or Redis providers and never retries either
+write. A result is successful only when the point was verified and its deletion was also verified.
+Do not run it against a Production index without a separate Production-specific approval.
+Even a recorded successful smoke does not authorize another ingestion attempt: an append-only second
+recovery-attempt ledger requires a separate design and approval after the smoke passes.
+
 ## Preview-first rollout and bounded smoke test
 
 Request and record explicit approval for each gate independently:

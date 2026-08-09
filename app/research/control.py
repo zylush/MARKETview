@@ -12,6 +12,8 @@ from app.research.domain import (
     EmbeddingDescriptor,
     GenerationManifest,
     GenerationVerification,
+    GenerationVerificationOutcome,
+    GenerationVerificationReason,
 )
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -37,10 +39,23 @@ class IngestionFailureStage(StrEnum):
 class IngestionStageError(RuntimeError):
     """Sanitized ingestion failure detached from provider exception graphs."""
 
-    def __init__(self, stage: IngestionFailureStage) -> None:
+    def __init__(
+        self,
+        stage: IngestionFailureStage,
+        *,
+        verification: GenerationVerificationOutcome | None = None,
+    ) -> None:
         if not isinstance(stage, IngestionFailureStage):
             raise ValueError("ingestion failure stage is invalid")
+        if verification is not None and (
+            stage is not IngestionFailureStage.VECTOR_VERIFICATION
+            or not isinstance(verification, GenerationVerificationOutcome)
+            or verification.reason is GenerationVerificationReason.VERIFIED
+            or verification.verification is not None
+        ):
+            raise ValueError("ingestion verification diagnostic is invalid")
         self.stage = stage
+        self.verification = verification
         super().__init__(f"research ingestion failed during {stage.value}")
 
 

@@ -23,6 +23,8 @@ from app.research.domain import (
     GeneratedAnswerStatus,
     GeneratedClaim,
     GenerationManifest,
+    GenerationVerificationOutcome,
+    GenerationVerificationReason,
     IngestionResult,
     ResearchAnswer,
     ResearchCitation,
@@ -153,10 +155,18 @@ class ResearchCorpusUnavailableError(RuntimeError):
 class _IngestionOutcome:
     result: IngestionResult | None = None
     failure_stage: IngestionFailureStage | None = None
+    verification: GenerationVerificationOutcome | None = None
 
     def __post_init__(self) -> None:
         if (self.result is None) == (self.failure_stage is None):
             raise ValueError("ingestion outcome must contain exactly one result")
+        if self.verification is not None and (
+            self.failure_stage is not IngestionFailureStage.VECTOR_VERIFICATION
+            or self.result is not None
+            or self.verification.reason is GenerationVerificationReason.VERIFIED
+            or self.verification.verification is not None
+        ):
+            raise ValueError("ingestion outcome verification diagnostic is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,7 +234,10 @@ class ResearchCoreService:
         )
         document = None  # type: ignore[assignment]
         if outcome.failure_stage is not None:
-            raise IngestionStageError(outcome.failure_stage) from None
+            raise IngestionStageError(
+                outcome.failure_stage,
+                verification=outcome.verification,
+            ) from None
         if outcome.result is None:  # pragma: no cover - guarded by the outcome type
             raise IngestionStageError(IngestionFailureStage.PARSING_CHUNKING) from None
         return outcome.result
@@ -244,7 +257,10 @@ class ResearchCoreService:
             )
             return _IngestionOutcome(result=result)
         except IngestionStageError as error:
-            return _IngestionOutcome(failure_stage=error.stage)
+            return _IngestionOutcome(
+                failure_stage=error.stage,
+                verification=error.verification,
+            )
         except Exception:
             return _IngestionOutcome(failure_stage=IngestionFailureStage.CLEANUP)
 
@@ -359,12 +375,18 @@ class ResearchCoreService:
             failure_stage = IngestionFailureStage.VECTOR_STAGING
             await self._store.stage_generation(manifest, chunks, deadline=operation_deadline)
             failure_stage = IngestionFailureStage.VECTOR_VERIFICATION
-            verification = await self._store.verify_generation(
+            verification_outcome = await self._store.verify_generation(
                 manifest,
                 deadline=operation_deadline,
             )
-            if verification is None or not verification.proves(manifest):
-                raise ValueError("staged research generation failed verification")
+            if not verification_outcome.proves(manifest):
+                raise IngestionStageError(
+                    IngestionFailureStage.VECTOR_VERIFICATION,
+                    verification=verification_outcome,
+                )
+            verification = verification_outcome.verification
+            if verification is None:  # pragma: no cover - enforced by outcome invariants
+                raise IngestionStageError(IngestionFailureStage.VECTOR_VERIFICATION)
             failure_stage = IngestionFailureStage.REDIS_PUBLICATION
             verified_stage = await self._control_plane.mark_generation_verified(
                 lease=lease,
@@ -413,8 +435,11 @@ class ResearchCoreService:
                 ),
                 cleanup_pending_count=cleanup_pending_count,
             )
-        except Exception:
+        except Exception as error:
             original_stage = failure_stage
+            verification_diagnostic = (
+                error.verification if isinstance(error, IngestionStageError) else None
+            )
             if (
                 generation_stage is not None
                 and not published
@@ -440,7 +465,15 @@ class ResearchCoreService:
                         )
                 except Exception:
                     original_stage = IngestionFailureStage.CLEANUP
-            raise IngestionStageError(original_stage) from None
+                    verification_diagnostic = None
+            raise IngestionStageError(
+                original_stage,
+                verification=(
+                    verification_diagnostic
+                    if original_stage is IngestionFailureStage.VECTOR_VERIFICATION
+                    else None
+                ),
+            ) from None
         finally:
             if operation_deadline.remaining_seconds() > 0:
                 active_error = sys.exception()

@@ -25,6 +25,7 @@ from app.research.domain import (
     EvidenceChunk,
     FilingDocument,
     GenerationManifest,
+    GenerationVerificationReason,
 )
 from app.research.ports import GenerationInspectionState
 
@@ -42,7 +43,12 @@ def corpus() -> CorpusDescriptor:
     )
 
 
-def embedded_chunks() -> tuple[EmbeddedChunk, ...]:
+def embedded_chunks(
+    texts: tuple[str, ...] = (
+        "Supply risk disclosure.",
+        "Cloud demand disclosure.",
+    ),
+) -> tuple[EmbeddedChunk, ...]:
     configured = corpus()
     document = FilingDocument(
         symbol="AAPL",
@@ -54,7 +60,7 @@ def embedded_chunks() -> tuple[EmbeddedChunk, ...]:
         source_url=(
             "https://www.sec.gov/Archives/edgar/data/320193/000032019325000001/aapl-20250927.htm"
         ),
-        text="Supply risk disclosure. Cloud demand disclosure.",
+        text=" ".join(texts),
     )
     return tuple(
         EmbeddedChunk(
@@ -71,8 +77,8 @@ def embedded_chunks() -> tuple[EmbeddedChunk, ...]:
         )
         for ordinal, (text, values) in enumerate(
             (
-                ("Supply risk disclosure.", (1.0, 0.0)),
-                ("Cloud demand disclosure.", (0.0, 1.0)),
+                (text, (1.0, 0.0) if ordinal % 2 == 0 else (0.0, 1.0))
+                for ordinal, text in enumerate(texts)
             )
         )
     )
@@ -301,7 +307,11 @@ async def test_verify_fetches_exact_ids_without_vectors_and_checks_all_metadata(
     finally:
         await client.aclose()
 
-    assert verified is not None
+    assert verified.reason is GenerationVerificationReason.VERIFIED
+    assert verified.expected_point_count == 2
+    assert verified.observed_point_count == 2
+    assert verified.null_point_count == 0
+    assert verified.attempt_count == 1
     assert verified.proves(filing_manifest)
     assert request_payloads == [
         {
@@ -508,15 +518,22 @@ async def test_verify_rejects_same_id_point_tampering_without_traceback_disclosu
 
     adapter, client = store(httpx.MockTransport(handler))
     try:
-        assert (
-            await adapter.verify_generation(
-                filing_manifest,
-                deadline=RequestDeadline.after(1),
-            )
-            is None
+        outcome = await adapter.verify_generation(
+            filing_manifest,
+            deadline=RequestDeadline.after(1),
         )
     finally:
         await client.aclose()
+
+    expected_reason = (
+        GenerationVerificationReason.DATA_MISMATCH
+        if tamper == "data"
+        else GenerationVerificationReason.METADATA_MISMATCH
+    )
+    assert outcome.reason is expected_reason
+    assert outcome.expected_point_count == 2
+    assert outcome.observed_point_count == 2
+    assert outcome.null_point_count == 0
 
 
 @pytest.mark.asyncio
@@ -584,15 +601,304 @@ async def test_verify_returns_false_for_missing_or_incompatible_points() -> None
 
     adapter, client = store(httpx.MockTransport(handler))
     try:
-        assert (
-            await adapter.verify_generation(
-                manifest(chunks),
-                deadline=RequestDeadline.after(1),
-            )
-            is None
+        outcome = await adapter.verify_generation(
+            manifest(chunks),
+            deadline=RequestDeadline.after(1),
         )
     finally:
         await client.aclose()
+
+    assert outcome.reason is GenerationVerificationReason.RESPONSE_SHAPE
+
+
+@pytest.mark.asyncio
+async def test_verify_polls_only_missing_points_then_succeeds_without_reupsert() -> None:
+    chunks = embedded_chunks()
+    filing_manifest = manifest(chunks)
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        visible = len(calls) > 1
+        return httpx.Response(
+            200,
+            json={
+                "result": [
+                    {
+                        "id": chunks[0].evidence.chunk_id,
+                        "metadata": metadata(chunks[0]),
+                        "data": chunks[0].evidence.text,
+                    },
+                    (
+                        {
+                            "id": chunks[1].evidence.chunk_id,
+                            "metadata": metadata(chunks[1]),
+                            "data": chunks[1].evidence.text,
+                        }
+                        if visible
+                        else None
+                    ),
+                ]
+            },
+        )
+
+    adapter, client = store(httpx.MockTransport(handler))
+    try:
+        outcome = await adapter.verify_generation(
+            filing_manifest,
+            deadline=RequestDeadline.after(1),
+        )
+    finally:
+        await client.aclose()
+
+    assert outcome.reason is GenerationVerificationReason.VERIFIED
+    assert outcome.proves(filing_manifest)
+    assert calls == ["/fetch/sec-filings-v1", "/fetch/sec-filings-v1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_index", [0, 1])
+async def test_verify_polls_short_leading_or_internal_visibility_as_partial_then_succeeds(
+    missing_index: int,
+) -> None:
+    chunks = embedded_chunks(("First disclosure.", "Second disclosure.", "Third disclosure."))
+    filing_manifest = manifest(chunks)
+    calls = 0
+
+    def record(index: int) -> dict[str, object]:
+        return {
+            "id": chunks[index].evidence.chunk_id,
+            "metadata": metadata(chunks[index]),
+            "data": chunks[index].evidence.text,
+        }
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        records = (
+            [record(index) for index in range(3) if index != missing_index]
+            if calls == 1
+            else [record(0), record(1), record(2)]
+        )
+        return httpx.Response(200, json={"result": records})
+
+    adapter, client = store(httpx.MockTransport(handler))
+    try:
+        outcome = await adapter.verify_generation(
+            filing_manifest,
+            deadline=RequestDeadline.after(1),
+        )
+    finally:
+        await client.aclose()
+
+    assert outcome.reason is GenerationVerificationReason.VERIFIED
+    assert outcome.attempt_count == 2
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fault", "expected_reason"),
+    [
+        ("shape", GenerationVerificationReason.RESPONSE_SHAPE),
+        ("order", GenerationVerificationReason.ORDERING_MISMATCH),
+        ("duplicate", GenerationVerificationReason.ORDERING_MISMATCH),
+        ("unrequested", GenerationVerificationReason.ORDERING_MISMATCH),
+        ("null_position", GenerationVerificationReason.ORDERING_MISMATCH),
+        ("metadata", GenerationVerificationReason.METADATA_MISMATCH),
+        ("data", GenerationVerificationReason.DATA_MISMATCH),
+        ("integrity", GenerationVerificationReason.INTEGRITY_MISMATCH),
+    ],
+)
+async def test_verify_does_not_poll_nonretryable_failures(
+    fault: str,
+    expected_reason: GenerationVerificationReason,
+) -> None:
+    chunks = embedded_chunks()
+    records: object = [
+        {
+            "id": chunk.evidence.chunk_id,
+            "metadata": metadata(chunk),
+            "data": chunk.evidence.text,
+        }
+        for chunk in chunks
+    ]
+    if fault == "shape":
+        records = ["private-provider-payload"]
+    elif fault == "order":
+        records = list(reversed(records))  # type: ignore[arg-type]
+    elif fault == "duplicate":
+        records = [records[0], records[0]]  # type: ignore[index]
+    elif fault == "unrequested":
+        records[0]["id"] = "chunk-" + "f" * 64  # type: ignore[index]
+    elif fault == "null_position":
+        records = [None, records[0]]  # type: ignore[index]
+    elif fault == "metadata":
+        changed = dict(records[0]["metadata"])  # type: ignore[index]
+        changed["symbol"] = "MSFT"
+        records[0]["metadata"] = changed  # type: ignore[index]
+    elif fault == "data":
+        records[0]["data"] = "private-tampered-filing-text"  # type: ignore[index]
+    else:
+        changed = dict(records[0]["metadata"])  # type: ignore[index]
+        changed["point_digest"] = "f" * 64
+        records[0]["metadata"] = changed  # type: ignore[index]
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"result": records})
+
+    adapter, client = store(httpx.MockTransport(handler))
+    try:
+        outcome = await adapter.verify_generation(
+            manifest(chunks),
+            deadline=RequestDeadline.after(1),
+        )
+    finally:
+        await client.aclose()
+
+    assert outcome.reason is expected_reason
+    assert calls == 1
+    assert "private" not in repr(outcome)
+
+
+@pytest.mark.asyncio
+async def test_verify_missing_counts_are_sanitized_after_bounded_polling() -> None:
+    chunks = embedded_chunks()
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={
+                "result": [
+                    {
+                        "id": chunks[0].evidence.chunk_id,
+                        "metadata": metadata(chunks[0]),
+                        "data": chunks[0].evidence.text,
+                    },
+                    None,
+                ]
+            },
+        )
+
+    adapter, client = store(httpx.MockTransport(handler))
+    try:
+        outcome = await adapter.verify_generation(
+            manifest(chunks),
+            deadline=RequestDeadline.after(1),
+        )
+    finally:
+        await client.aclose()
+
+    assert outcome.reason is GenerationVerificationReason.PARTIAL_VISIBILITY
+    assert outcome.expected_point_count == 2
+    assert outcome.observed_point_count == 1
+    assert outcome.null_point_count == 1
+    assert outcome.attempt_count == 4
+    assert calls == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("visible_count", "expected_reason"),
+    [
+        (0, GenerationVerificationReason.MISSING_POINTS),
+        (1, GenerationVerificationReason.PARTIAL_VISIBILITY),
+    ],
+)
+async def test_verify_short_result_is_pollable_without_inventing_nulls(
+    visible_count: int,
+    expected_reason: GenerationVerificationReason,
+) -> None:
+    chunks = embedded_chunks()
+    records = [
+        {
+            "id": chunk.evidence.chunk_id,
+            "metadata": metadata(chunk),
+            "data": chunk.evidence.text,
+        }
+        for chunk in chunks[:visible_count]
+    ]
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"result": records})
+
+    adapter, client = store(httpx.MockTransport(handler))
+    try:
+        outcome = await adapter.verify_generation(
+            manifest(chunks),
+            deadline=RequestDeadline.after(1),
+        )
+    finally:
+        await client.aclose()
+
+    assert outcome.reason is expected_reason
+    assert outcome.observed_point_count == visible_count
+    assert outcome.null_point_count == 0
+    assert outcome.attempt_count == 4
+    assert calls == 4
+
+
+@pytest.mark.asyncio
+async def test_verify_polling_never_extends_the_absolute_deadline() -> None:
+    chunks = embedded_chunks()
+    now = [10.0]
+    calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        now[0] = 12.0
+        return httpx.Response(200, json={"result": [None, None]})
+
+    adapter, client = store(httpx.MockTransport(handler))
+    try:
+        with pytest.raises(UpstashVectorTimeoutError, match="timed out") as caught:
+            await adapter.verify_generation(
+                manifest(chunks),
+                deadline=RequestDeadline.after(1, clock=lambda: now[0]),
+            )
+    finally:
+        await client.aclose()
+
+    assert calls == 1
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_verify_128_points_recomputes_global_counts_for_each_poll_attempt() -> None:
+    filing_manifest = manifest_with_point_count(128)
+    call_sizes: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        ids = json.loads(request.content)["ids"]
+        call_sizes.append(len(ids))
+        return httpx.Response(200, json={"result": [None for _ in ids]})
+
+    adapter, client = store(httpx.MockTransport(handler))
+    try:
+        outcome = await adapter.verify_generation(
+            filing_manifest,
+            deadline=RequestDeadline.after(2),
+        )
+    finally:
+        await client.aclose()
+
+    assert outcome.reason is GenerationVerificationReason.MISSING_POINTS
+    assert outcome.expected_point_count == 128
+    assert outcome.observed_point_count == 0
+    assert outcome.null_point_count == 128
+    assert outcome.attempt_count == 4
+    assert call_sizes == [100, 28, 100, 28, 100, 28, 100, 28]
 
 
 @pytest.mark.asyncio

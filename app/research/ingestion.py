@@ -20,6 +20,8 @@ from app.research.domain import (
     FilingDiscoveryRequest,
     FilingDocument,
     FilingReference,
+    GenerationVerificationOutcome,
+    GenerationVerificationReason,
 )
 from app.research.ports import FilingParser, FilingSource
 
@@ -278,6 +280,20 @@ class ResearchIngestionResult:
     removed_count: int
     errors: tuple[str, ...] = ()
     failure_stages: tuple[IngestionFailureStage, ...] = ()
+    vector_verification_failures: tuple[GenerationVerificationOutcome, ...] = ()
+
+    def __post_init__(self) -> None:
+        diagnostics = tuple(self.vector_verification_failures)
+        if any(
+            not isinstance(item, GenerationVerificationOutcome)
+            or item.reason is GenerationVerificationReason.VERIFIED
+            or item.verification is not None
+            for item in diagnostics
+        ):
+            raise ValueError("vector verification diagnostics are invalid")
+        if diagnostics and IngestionFailureStage.VECTOR_VERIFICATION not in self.failure_stages:
+            raise ValueError("vector verification diagnostics require a matching stage")
+        object.__setattr__(self, "vector_verification_failures", diagnostics)
 
     @property
     def opaque_job_id(self) -> str:
@@ -292,6 +308,7 @@ class ResearchIngestionResult:
 class _RunnerOutcome:
     result: ResearchIngestionResult | None = None
     failure_stage: IngestionFailureStage | None = None
+    verification: GenerationVerificationOutcome | None = None
     timeout: bool = False
     retry_conflict: bool = False
 
@@ -306,13 +323,23 @@ class _RunnerOutcome:
         )
         if present != 1:
             raise ValueError("runner outcome must contain exactly one result")
+        if self.verification is not None and (
+            self.failure_stage is not IngestionFailureStage.VECTOR_VERIFICATION
+            or self.result is not None
+            or self.verification.reason is GenerationVerificationReason.VERIFIED
+            or self.verification.verification is not None
+        ):
+            raise ValueError("runner verification diagnostic is invalid")
 
 
 def _resolve_runner_outcome(outcome: _RunnerOutcome) -> ResearchIngestionResult:
     if outcome.result is not None:
         return outcome.result
     if outcome.failure_stage is not None:
-        raise IngestionStageError(outcome.failure_stage) from None
+        raise IngestionStageError(
+            outcome.failure_stage,
+            verification=outcome.verification,
+        ) from None
     if outcome.timeout:
         raise TimeoutError("research request deadline expired") from None
     raise ResearchIngestionRetryError() from None
@@ -352,7 +379,10 @@ class ResearchIngestionRunner:
             result = await self._run_impl(request, deadline=deadline)
             return _RunnerOutcome(result=result)
         except IngestionStageError as error:
-            return _RunnerOutcome(failure_stage=error.stage)
+            return _RunnerOutcome(
+                failure_stage=error.stage,
+                verification=error.verification,
+            )
         except TimeoutError:
             return _RunnerOutcome(timeout=True)
         except ResearchIngestionRetryError:
@@ -421,6 +451,7 @@ class ResearchIngestionRunner:
         removed_count = 0
         errors: tuple[str, ...] = ()
         failure_stages: tuple[IngestionFailureStage, ...] = ()
+        vector_verification_failures: tuple[GenerationVerificationOutcome, ...] = ()
         cursor_digest = checkpoint.cursor_digest if checkpoint is not None else None
         for index, reference in enumerate(job.references):
             if index < resume_index:
@@ -446,6 +477,11 @@ class ResearchIngestionRunner:
                 failure_stage = error.stage
                 failed_count += 1
                 failure_stages = (*failure_stages, failure_stage)
+                if error.verification is not None:
+                    vector_verification_failures = (
+                        *vector_verification_failures,
+                        error.verification,
+                    )
                 errors = (*errors, f"ingestion failed during {failure_stage.value}")
             except Exception:
                 failed_count += 1
@@ -489,6 +525,7 @@ class ResearchIngestionRunner:
                 removed_count=removed_count,
                 errors=tuple(dict.fromkeys(errors)),
                 failure_stages=tuple(dict.fromkeys(failure_stages)),
+                vector_verification_failures=tuple(dict.fromkeys(vector_verification_failures)),
             )
         new_failure_count = failed_count - (
             checkpoint.failed_count if checkpoint is not None else 0
@@ -515,6 +552,7 @@ class ResearchIngestionRunner:
             removed_count=removed_count,
             errors=tuple(dict.fromkeys(errors)),
             failure_stages=tuple(dict.fromkeys(failure_stages)),
+            vector_verification_failures=tuple(dict.fromkeys(vector_verification_failures)),
         )
 
     async def _claim_retry(

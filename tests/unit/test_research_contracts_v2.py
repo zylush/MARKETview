@@ -19,10 +19,16 @@ from app.research.domain import (
     FilingDocument,
     FilingReference,
     GenerationManifest,
+    GenerationVerification,
+    GenerationVerificationOutcome,
+    GenerationVerificationReason,
     RawFiling,
 )
 from app.research.memory import InMemoryResearchControlPlane, InMemoryVectorStore
-from app.research.ports import GenerationInspection, GenerationInspectionState
+from app.research.ports import (
+    GenerationInspection,
+    GenerationInspectionState,
+)
 
 
 def reference() -> FilingReference:
@@ -216,6 +222,84 @@ def test_generation_inspection_rejects_impossible_state_counts(
             state=state,
             expected_point_count=expected,
             observed_point_count=observed,
+        )
+
+
+def test_generation_verification_outcome_is_immutable_and_sanitized() -> None:
+    filing_manifest, _ = _inspection_fixture()
+    verified = GenerationVerificationOutcome.verified(
+        verification=GenerationVerification.from_point_ids(
+            filing_manifest.generation_id,
+            filing_manifest.chunk_ids,
+        ),
+        expected_point_count=2,
+    )
+    missing = GenerationVerificationOutcome.failed(
+        reason=GenerationVerificationReason.PARTIAL_VISIBILITY,
+        expected_point_count=2,
+        observed_point_count=1,
+        null_point_count=1,
+        attempt_count=4,
+    )
+
+    assert verified.reason is GenerationVerificationReason.VERIFIED
+    assert verified.proves(filing_manifest)
+    reordered = GenerationVerification.from_point_ids(
+        filing_manifest.generation_id,
+        tuple(reversed(filing_manifest.chunk_ids)),
+    )
+    assert not reordered.proves(filing_manifest)
+    assert missing.reason is GenerationVerificationReason.PARTIAL_VISIBILITY
+    assert missing.expected_point_count == 2
+    assert missing.observed_point_count == 1
+    assert missing.null_point_count == 1
+    assert missing.attempt_count == 4
+    assert not missing.proves(filing_manifest)
+    assert "point_ids_hash" not in repr(verified)
+    assert not hasattr(missing, "point_ids")
+    assert not hasattr(missing, "vectors")
+    assert not hasattr(missing, "data")
+    with pytest.raises(FrozenInstanceError):
+        missing.observed_point_count = 2  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected", "observed", "nulls"),
+    [
+        (GenerationVerificationReason.VERIFIED, 2, 2, 0),
+        (GenerationVerificationReason.MISSING_POINTS, 2, 1, 0),
+        (GenerationVerificationReason.PARTIAL_VISIBILITY, 2, 0, 2),
+        (GenerationVerificationReason.PARTIAL_VISIBILITY, 2, 2, 0),
+        (GenerationVerificationReason.ORDERING_MISMATCH, 2, 3, 0),
+    ],
+)
+def test_generation_verification_outcome_rejects_impossible_counts(
+    reason: GenerationVerificationReason,
+    expected: int,
+    observed: int,
+    nulls: int,
+) -> None:
+    with pytest.raises(ValueError, match="verification outcome"):
+        GenerationVerificationOutcome(
+            reason=reason,
+            expected_point_count=expected,
+            observed_point_count=observed,
+            null_point_count=nulls,
+            attempt_count=1,
+        )
+
+
+@pytest.mark.parametrize("attempt_count", [0, 5, True])
+def test_generation_verification_outcome_rejects_invalid_attempt_count(
+    attempt_count: object,
+) -> None:
+    with pytest.raises(ValueError, match="attempt count"):
+        GenerationVerificationOutcome.failed(
+            reason=GenerationVerificationReason.MISSING_POINTS,
+            expected_point_count=2,
+            observed_point_count=0,
+            null_point_count=2,
+            attempt_count=attempt_count,  # type: ignore[arg-type]
         )
 
 

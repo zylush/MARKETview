@@ -10,6 +10,10 @@ import pytest
 from pydantic import SecretStr
 
 from app.research.control import IngestionFailureStage, IngestionStageError
+from app.research.domain import (
+    GenerationVerificationOutcome,
+    GenerationVerificationReason,
+)
 from app.research.ingestion import ResearchIngestionRetryError
 
 
@@ -299,6 +303,64 @@ async def test_cli_propagates_only_fixed_ingestion_failure_stage(
     output = json.loads(capsys.readouterr().out)
     assert exit_code == cli.EXIT_PROVIDER
     assert output["failure_stages"] == ["embedding"]
+    assert sensitive_sentinel not in json.dumps(output)
+
+
+@pytest.mark.asyncio
+async def test_cli_outputs_only_fixed_vector_verification_diagnostic(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import app.ingest_research as cli
+
+    sensitive_sentinel = "private vector payload and credential"
+    diagnostic = GenerationVerificationOutcome.failed(
+        reason=GenerationVerificationReason.MISSING_POINTS,
+        expected_point_count=128,
+        observed_point_count=0,
+        null_point_count=128,
+        attempt_count=4,
+    )
+
+    async def fake_run(request: Any, *, deadline: Any) -> object:
+        del request
+        deadline.raise_if_expired()
+        try:
+            raise RuntimeError(sensitive_sentinel)
+        except RuntimeError:
+            raise IngestionStageError(
+                IngestionFailureStage.VECTOR_VERIFICATION,
+                verification=diagnostic,
+            ) from None
+
+    exit_code = await cli.async_main(
+        [
+            "--symbol",
+            "AAPL",
+            "--cik",
+            "0000320193",
+            "--forms",
+            "10-K",
+            "--from",
+            "2025-01-01",
+            "--to",
+            "2025-12-31",
+            "--apply",
+        ],
+        runner_factory=lambda _: SimpleNamespace(run=fake_run),
+    )
+
+    output = json.loads(capsys.readouterr().out)
+    assert exit_code == cli.EXIT_PROVIDER
+    assert output["failure_stages"] == ["vector_verification"]
+    assert output["vector_verification_failures"] == [
+        {
+            "attempt_count": 4,
+            "expected_point_count": 128,
+            "null_point_count": 128,
+            "observed_point_count": 0,
+            "reason": "missing_points",
+        }
+    ]
     assert sensitive_sentinel not in json.dumps(output)
 
 
