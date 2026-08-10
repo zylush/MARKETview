@@ -4,7 +4,6 @@ import math
 import re
 import secrets
 import sys
-import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -38,25 +37,9 @@ from app.research.ports import (
     ResearchControlPlane,
     VectorStore,
 )
+from app.research.retrieval import classify_safe_hits, contains_prompt_injection
 from app.validation import validate_research_question, validate_symbol
 
-_PROMPT_INJECTION_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in (
-        r"\bignore\s+(?:all\s+)?previous\s+instructions\b",
-        r"\breveal\s+(?:the\s+)?(?:system|developer)\s+prompt\b",
-        r"\b(?:system|developer)\s+message\s*:",
-        r"\bdisclose\s+(?:your\s+)?hidden\s+instructions\b",
-        r"\bact\s+as\s+(?:the\s+)?system\b",
-        r"\b(?:ignore|forget|disregard|override|bypass|supersede)\b.{0,80}"
-        r"\b(?:instructions?|directions?|rules?|guidance|safeguards?)\b",
-        r"\b(?:reveal|expose|print|output|disclose|divulge)\b.{0,80}"
-        r"\b(?:hidden|private|confidential|system|developer)\b.{0,40}"
-        r"\b(?:prompts?|instructions?|directives?|configuration)\b",
-        r"\btreat\b.{0,60}\b(?:higher[- ]priority|authoritative)\b.{0,40}"
-        r"\b(?:instructions?|guidance|commands?)\b",
-    )
-)
 _PERSONAL_CONTEXT = re.compile(r"\b(?:i|me|my|mine|we|us|our|ours)\b", re.IGNORECASE)
 _INVESTMENT_ACTION = re.compile(
     r"\b(?:buy|buying|purchase|purchasing|acquire|acquiring|invest|investing|"
@@ -616,31 +599,14 @@ class ResearchCoreService:
         active: tuple[GenerationManifest, ...],
         hits: tuple[SearchHit, ...],
     ) -> tuple[SearchHit, ...]:
-        active_by_generation = {item.generation_id: item for item in active}
-        safe: list[SearchHit] = []
-        seen_chunks: set[str] = set()
-        for hit in hits:
-            evidence = hit.evidence
-            manifest = active_by_generation.get(hit.active_generation_id)
-            if (
-                manifest is None
-                or evidence.chunk_id in seen_chunks
-                or evidence.symbol != symbol
-                or evidence.corpus != self._corpus
-                or hit.embedding_descriptor != self._corpus.embedding
-                or hit.active_generation_id != evidence.generation_id
-                or manifest.accession_number != evidence.accession_number
-                or manifest.content_hash != evidence.content_hash
-                or evidence.chunk_id not in manifest.chunk_ids
-                or hit.score < self._policy.minimum_score
-                or self._contains_prompt_injection(evidence.text)
-            ):
-                continue
-            safe.append(hit)
-            seen_chunks.add(evidence.chunk_id)
-            if len(safe) == self._policy.max_results:
-                break
-        return tuple(safe)
+        return classify_safe_hits(
+            symbol,
+            self._corpus,
+            active,
+            hits,
+            minimum_score=self._policy.minimum_score,
+            max_results=self._policy.max_results,
+        ).accepted_hits
 
     def _claims_are_grounded(
         self,
@@ -694,16 +660,7 @@ class ResearchCoreService:
 
     @staticmethod
     def _contains_prompt_injection(text: str) -> bool:
-        normalized = unicodedata.normalize("NFKC", text)
-        safe_text = "".join(
-            ""
-            if unicodedata.category(character) == "Cf"
-            else " "
-            if unicodedata.category(character) == "Cc"
-            else character
-            for character in normalized
-        )
-        return any(pattern.search(safe_text) for pattern in _PROMPT_INJECTION_PATTERNS)
+        return contains_prompt_injection(text)
 
     @staticmethod
     def _is_personalized_trade_request(text: str) -> bool:

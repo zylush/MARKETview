@@ -244,6 +244,43 @@ Do not run it against a Production index without a separate Production-specific 
 Even a recorded successful smoke does not authorize another ingestion attempt: an append-only second
 recovery attempt requires a separate one-time approval after the smoke passes.
 
+### Retrieval-only diagnostic
+
+The operator-only retrieval diagnostic explains why the fixed indexed Apple 10-K risk case has no
+safe evidence without calling the answer generator. Its default invocation validates local
+configuration and prints a zero-network plan:
+
+```powershell
+python -m app.retrieval_diagnostic
+```
+
+The case, symbol, filing type, and question are fixed in code and have no CLI overrides. A live run
+requires separate approval and both acknowledgements:
+
+```powershell
+python -m app.retrieval_diagnostic `
+  --apply `
+  --acknowledge-live-retrieval-diagnostic
+```
+
+The optional `--timeout-seconds` value must be between 1 and 120. A live run requires exactly one
+active AAPL generation, no pending cleanup, and an exact Vector inspection. It authorizes one unit
+against the existing UTC-daily global research budget, revalidates the safety state, commits the
+unit immediately before one query embedding, and performs one Vector search using the configured
+result limit multiplied by the configured overfetch factor. It never invokes answer generation.
+Confirmed failures before commit release the reservation; an indeterminate commit or any failure
+after commit retains the unit.
+
+Output is aggregate-only: counts, rounded score ranges, the configured threshold, fixed rejection
+counters, paid-call counts, and the committed budget units. It never contains credentials,
+endpoints, provider fingerprints, the internal question, generation or chunk identifiers, filing
+text, citations, embeddings, vectors, exception text, or raw provider responses. Exit `0` means a
+dry-run or at least one accepted safe hit, exit `1` means retrieval/provider failure, and exit `3`
+means usage, configuration, preflight, or budget rejection.
+
+Do not run the live form without separate approval. Keep Preview `RESEARCH_ENABLED=false`; this
+diagnostic does not authorize a Preview query, a configuration change, or Production promotion.
+
 ## Preview-first rollout and bounded smoke test
 
 Request and record explicit approval for each gate independently:
