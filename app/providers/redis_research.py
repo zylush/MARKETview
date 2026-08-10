@@ -144,32 +144,42 @@ _MAX_RESPONSE_BYTES = 1_048_576
 _GENERATION_ID = re.compile(r"^gen-([0-9a-f]{64})$")
 _SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,31}$")
 _ACCESSION = re.compile(r"^\d{10}-\d{2}-\d{6}$")
+_UPSTASH_REST_HOST = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+upstash\.io$")
+_SAFE_TEST_HOST = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.example$")
 
 
 def _raise_unavailable() -> NoReturn:
     raise ResearchControlUnavailableError("research control plane is unavailable")
 
 
-def _safe_endpoint(endpoint: object) -> str:
-    if not isinstance(endpoint, str) or not endpoint:
-        raise ValueError("research control endpoint is invalid")
+def _safe_endpoint(endpoint: object, *, allow_test_endpoint: bool) -> str:
+    if not isinstance(endpoint, str):
+        raise ValueError("research control endpoint must be an approved HTTPS root")
+    normalized = endpoint.strip()
+    if not normalized or any(
+        ord(character) < 32 or ord(character) == 127 for character in endpoint
+    ):
+        raise ValueError("research control endpoint must be an approved HTTPS root")
     try:
-        parsed = urlsplit(endpoint)
-    except (TypeError, ValueError):
-        raise ValueError("research control endpoint is invalid") from None
+        parsed = urlsplit(normalized)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("research control endpoint must be an approved HTTPS root") from None
+    hostname = parsed.hostname.lower() if parsed.hostname else ""
+    approved_host = _UPSTASH_REST_HOST.fullmatch(hostname) is not None
+    safe_test_host = allow_test_endpoint and _SAFE_TEST_HOST.fullmatch(hostname) is not None
     if not (
         parsed.scheme == "https"
-        and parsed.hostname
+        and (approved_host or safe_test_host)
         and parsed.username is None
         and parsed.password is None
-        and parsed.port is None
+        and port is None
         and parsed.query == ""
         and parsed.fragment == ""
         and parsed.path in {"", "/"}
-        and parsed.netloc == parsed.hostname
     ):
-        raise ValueError("research control endpoint must be a root HTTPS endpoint")
-    return endpoint.rstrip("/")
+        raise ValueError("research control endpoint must be an approved HTTPS root")
+    return f"https://{hostname}"
 
 
 def _positive_seconds(value: object, name: str) -> int:
@@ -235,7 +245,10 @@ class RedisResearchControl:
         client: httpx.AsyncClient | None = None,
         timeout_seconds: float = 3.0,
     ) -> None:
-        self._endpoint = _safe_endpoint(endpoint)
+        allow_test_endpoint = client is not None and isinstance(
+            getattr(client, "_transport", None), httpx.MockTransport
+        )
+        self._endpoint = _safe_endpoint(endpoint, allow_test_endpoint=allow_test_endpoint)
         if not isinstance(token, SecretStr):
             raise TypeError("research control token must be SecretStr")
         if not token.get_secret_value():
@@ -294,6 +307,7 @@ class RedisResearchControl:
                     },
                     json=command,
                     timeout=timeout,
+                    follow_redirects=False,
                 ) as response:
                     if 200 <= response.status_code < 300:
                         received = 0
