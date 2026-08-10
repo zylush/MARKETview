@@ -191,13 +191,22 @@ class DeterministicGenerator:
 
 
 class LeakyStore(InMemoryVectorStore):
-    def __init__(self, hits: tuple[SearchHit, ...], *, ignore_limit: bool = False) -> None:
+    def __init__(
+        self,
+        hits: tuple[SearchHit, ...],
+        *,
+        ignore_limit: bool = False,
+        expected_limit: int | None = None,
+    ) -> None:
         super().__init__()
         self._hits = hits
         self._ignore_limit = ignore_limit
+        self._expected_limit = expected_limit
 
     async def search(self, **kwargs) -> tuple[SearchHit, ...]:
         limit = kwargs["limit"]
+        if self._expected_limit is not None:
+            assert limit == self._expected_limit
         return self._hits if self._ignore_limit else self._hits[:limit]
 
 
@@ -442,6 +451,8 @@ def service(
     embedder: DeterministicEmbedder | None = None,
     chunker: DeterministicChunker | None = None,
     minimum_score: float = 0.5,
+    max_results: int = 3,
+    overfetch_factor: int = 3,
 ) -> ResearchCoreService:
     return ResearchCoreService(
         corpus=CORPUS,
@@ -450,7 +461,11 @@ def service(
         store=store or InMemoryVectorStore(),
         control_plane=control or InMemoryResearchControlPlane(),
         generator=generator or DeterministicGenerator(),
-        policy=ResearchPolicy(minimum_score=minimum_score, max_results=3),
+        policy=ResearchPolicy(
+            minimum_score=minimum_score,
+            max_results=max_results,
+            overfetch_factor=overfetch_factor,
+        ),
     )
 
 
@@ -1337,15 +1352,21 @@ async def test_query_overfetches_but_caps_context_and_deduplicates_hits() -> Non
     generator = DeterministicGenerator()
     hits = tuple(hit(item, score=0.95) for item in items)
     core = service(
-        store=LeakyStore((hits[0], hits[0], *hits[1:]), ignore_limit=True),
+        store=LeakyStore(
+            (hits[0], hits[0], *hits[1:]),
+            ignore_limit=True,
+            expected_limit=20,
+        ),
         control=control,
         generator=generator,
+        max_results=5,
+        overfetch_factor=4,
     )
 
     await core.query_research("AAPL", "What supply risk was disclosed?")
 
     sent_ids = tuple(item.chunk_id for item in generator.calls[0][1])
-    assert sent_ids == tuple(item.chunk_id for item in items[:3])
+    assert sent_ids == tuple(item.chunk_id for item in items[:5])
 
 
 @pytest.mark.parametrize("score", [-0.01, 1.01, math.nan, math.inf])

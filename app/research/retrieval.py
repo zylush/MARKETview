@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from app.research.domain import CorpusDescriptor, GenerationManifest, SearchHit
 
+_SUPPORTED_FILING_TYPES = frozenset({"10-K", "10-K/A", "10-Q", "10-Q/A", "8-K", "8-K/A"})
 _PROMPT_INJECTION_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -116,6 +117,7 @@ def classify_safe_hits(
     active_manifests: tuple[GenerationManifest, ...],
     hits: tuple[SearchHit, ...],
     *,
+    filing_type: str | None = None,
     minimum_score: float,
     max_results: int,
 ) -> SafeHitClassification:
@@ -140,6 +142,10 @@ def classify_safe_hits(
         raise ValueError("safe-hit active manifest scope is invalid")
     if any(not isinstance(item, SearchHit) for item in candidates):
         raise ValueError("safe-hit candidate is invalid")
+    if filing_type is not None and (
+        not isinstance(filing_type, str) or filing_type not in _SUPPORTED_FILING_TYPES
+    ):
+        raise ValueError("safe-hit filing type is invalid")
 
     active_by_generation = {item.generation_id: item for item in active}
     accepted: list[SearchHit] = []
@@ -161,6 +167,7 @@ def classify_safe_hits(
             counts["duplicate_chunk"] += 1
         elif (
             evidence.symbol != symbol
+            or (filing_type is not None and evidence.filing_type != filing_type)
             or evidence.corpus != corpus
             or hit.embedding_descriptor != corpus.embedding
             or hit.active_generation_id != evidence.generation_id

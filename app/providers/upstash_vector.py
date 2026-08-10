@@ -38,7 +38,6 @@ _NAMESPACE = re.compile(r"^sec-filings-v[1-9][0-9]{0,5}$")
 _SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,31}$")
 _MAX_RESPONSE_BYTES = 1_048_576
 _MAX_BATCH_SIZE = 100
-_MAX_CANDIDATES = 50
 _MAX_ACTIVE_GENERATIONS = 100
 _VERIFICATION_POLL_DELAYS_SECONDS = (0.05, 0.1, 0.2)
 
@@ -471,7 +470,7 @@ class UpstashVectorStore:
         )
         if not active:
             return ()
-        candidate_limit = min(_MAX_CANDIDATES, limit * 5)
+        candidate_limit = limit
         request_payload: dict[str, object] = {
             "vector": list(vector.values),
             "topK": candidate_limit,

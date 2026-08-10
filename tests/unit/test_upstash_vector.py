@@ -997,7 +997,7 @@ async def test_search_filters_provider_and_defensively_rejects_stale_cross_scope
                 values=(1.0, 0.0),
             ),
             active_generations=(active,),
-            limit=2,
+            limit=3,
             deadline=RequestDeadline.after(1),
         )
     finally:
@@ -1006,7 +1006,7 @@ async def test_search_filters_provider_and_defensively_rejects_stale_cross_scope
     assert tuple(hit.evidence.chunk_id for hit in hits) == (chunks[0].evidence.chunk_id,)
     assert hits[0].active_generation_id == active.generation_id
     assert request_body["vector"] == [1.0, 0.0]
-    assert request_body["topK"] == 10
+    assert request_body["topK"] == 3
     assert request_body["includeVectors"] is False
     assert request_body["includeMetadata"] is True
     assert request_body["includeData"] is True

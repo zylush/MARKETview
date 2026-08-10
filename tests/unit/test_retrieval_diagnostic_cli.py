@@ -31,9 +31,10 @@ class _Settings:
     research_chunk_tokens: int = 800
     research_chunk_overlap_tokens: int = 100
     research_max_results: int = 5
-    research_vector_overfetch: int = 3
+    research_vector_overfetch: int = 4
     research_minimum_score: float = 0.70
     research_daily_global_limit: int = 100
+    research_enabled: bool = False
 
 
 @pytest.mark.asyncio
@@ -55,7 +56,7 @@ async def test_diagnostic_cli_dry_run_constructs_no_runtime_and_emits_no_secrets
     assert output["dry_run"] is True
     assert output["applied"] is False
     assert output["passed"] is False
-    assert output["requested_candidate_limit"] == 15
+    assert output["requested_candidate_limit"] == 20
     assert output["call_counts"] == {
         "answer_generation": 0,
         "embedding": 0,

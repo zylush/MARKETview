@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import argparse
@@ -58,9 +57,7 @@ class _SafeArgumentParser(argparse.ArgumentParser):
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = _SafeArgumentParser(
-        description="Plan or run the fixed operator retrieval diagnostic."
-    )
+    parser = _SafeArgumentParser(description="Plan or run the fixed operator retrieval diagnostic.")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--acknowledge-live-retrieval-diagnostic", action="store_true")
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
@@ -97,9 +94,7 @@ def _payload(
     error_message: str | None = None,
 ) -> dict[str, object]:
     rejections = (
-        classification.rejection_counts
-        if classification is not None
-        else SafeHitRejectionCounts()
+        classification.rejection_counts if classification is not None else SafeHitRejectionCounts()
     )
     payload: dict[str, object] = {
         "accepted_count": classification.accepted_count if classification is not None else 0,
@@ -122,15 +117,11 @@ def _payload(
         ),
         "diagnostic_case": DIAGNOSTIC_CASE,
         "dry_run": not applied,
-        "expected_point_count": (
-            preflight.expected_point_count if preflight is not None else None
-        ),
+        "expected_point_count": (preflight.expected_point_count if preflight is not None else None),
         "filing_type": _FILING_TYPE,
         "inspection_state": preflight.inspection_state if preflight is not None else None,
         "network_calls": 0 if not applied else None,
-        "observed_point_count": (
-            preflight.observed_point_count if preflight is not None else None
-        ),
+        "observed_point_count": (preflight.observed_point_count if preflight is not None else None),
         "passed": passed,
         "pending_cleanup_count": (
             preflight.pending_cleanup_count if preflight is not None else None
@@ -157,6 +148,15 @@ def _payload(
 
 def _emit(payload: dict[str, object]) -> None:
     print(json.dumps(payload, sort_keys=True))
+
+
+def _classification_passes(classification: SafeHitClassification) -> bool:
+    rejections = classification.rejection_counts
+    return bool(
+        classification.accepted_count > 0
+        and rejections.metadata_integrity == 0
+        and rejections.prompt_injection == 0
+    )
 
 
 async def _release_before_commit(
@@ -339,10 +339,10 @@ async def _run_live(
                 budget_units_committed=1,
             )
         classification = result
-        if classification.accepted_count < 1:
+        if not _classification_passes(classification):
             raise _LiveFailureError(
                 "retrieval",
-                "retrieval diagnostic accepted no safe evidence",
+                "retrieval diagnostic safe evidence gate failed",
                 budget_units_committed=1,
             )
     except asyncio.CancelledError:
@@ -459,7 +459,7 @@ async def async_main(
                 and outcome.preflight is not None
                 and outcome.preflight.is_exact
                 and outcome.classification is not None
-                and outcome.classification.accepted_count > 0
+                and _classification_passes(outcome.classification)
             ),
             configuration=configuration,
             preflight=outcome.preflight,

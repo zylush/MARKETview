@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import inspect
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 
+import httpx
 import pytest
 from pydantic import SecretStr
 
+from app.providers.upstash_vector import UpstashVectorStore
 from app.research import diagnostic_runtime
 from app.research.control import Reservation, ReservationState
 from app.research.deadline import RequestDeadline
@@ -42,17 +45,20 @@ VECTOR = EmbeddingVector(descriptor=EMBEDDING, values=(1.0, 0.0))
 QUESTION = "What material risks did Apple disclose in its latest Form 10-K?"
 
 
-def document(*, text: str = "Apple reports supply constraints and product demand risks."):
+def document(
+    *,
+    text: str = "Apple reports supply constraints and product demand risks.",
+    filing_type: str = "10-K",
+):
     return FilingDocument(
         symbol="AAPL",
         cik="0000320193",
         accession_number="0000320193-25-000001",
-        filing_type="10-K",
-        title="AAPL 2025 Form 10-K",
+        filing_type=filing_type,
+        title=f"AAPL 2025 Form {filing_type}",
         filed_date=date(2025, 10, 31),
         source_url=(
-            "https://www.sec.gov/Archives/edgar/data/320193/"
-            "000032019325000001/aapl-20250927.htm"
+            "https://www.sec.gov/Archives/edgar/data/320193/000032019325000001/aapl-20250927.htm"
         ),
         text=text,
     )
@@ -455,6 +461,96 @@ async def test_search_uses_overfetch_limit_and_returns_shared_classifier_aggrega
     ]
 
 
+@pytest.mark.asyncio
+async def test_search_rejects_non_10k_hit_from_fixed_diagnostic_case() -> None:
+    quarterly = evidence(
+        text="A quarterly supply constraint disclosure.",
+        source=document(filing_type="10-Q"),
+    )
+    active = manifest(quarterly)
+    store = FakeStore(
+        hits=(
+            SearchHit(
+                evidence=quarterly,
+                score=0.95,
+                embedding_descriptor=EMBEDDING,
+                active_generation_id=active.generation_id,
+            ),
+        )
+    )
+    subject, _, _, _ = runtime(
+        active=(active,),
+        store=store,
+        maximum_results=5,
+        overfetch_factor=4,
+    )
+    snapshot = DiagnosticPreflight(
+        active_generation_count=1,
+        pending_cleanup_count=0,
+        inspection_state="exact",
+        expected_point_count=1,
+        observed_point_count=1,
+        private_manifest=active,
+    )
+
+    result = await subject.search(
+        symbol="AAPL",
+        filing_type="10-K",
+        vector=VECTOR,
+        preflight=snapshot,
+        deadline=RequestDeadline.after(1),
+    )
+
+    assert result.candidate_count == 1
+    assert result.accepted_count == 0
+    assert result.rejection_counts.metadata_integrity == 1
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_provider_query_breadth_is_exactly_twenty_candidates() -> None:
+    request_body: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_body.update(json.loads(request.content))
+        return httpx.Response(200, json={"result": []})
+
+    item = evidence()
+    active = manifest(item)
+    store = UpstashVectorStore(
+        "https://research-vector.upstash.io",
+        SecretStr("private-vector-token"),
+        namespace="sec-filings-v1",
+        transport=httpx.MockTransport(handler),
+    )
+    subject, _, _, _ = runtime(
+        active=(active,),
+        store=store,  # type: ignore[arg-type]
+        maximum_results=5,
+        overfetch_factor=4,
+    )
+    snapshot = DiagnosticPreflight(
+        active_generation_count=1,
+        pending_cleanup_count=0,
+        inspection_state="exact",
+        expected_point_count=1,
+        observed_point_count=1,
+        private_manifest=active,
+    )
+
+    try:
+        await subject.search(
+            symbol="AAPL",
+            filing_type="10-K",
+            vector=VECTOR,
+            preflight=snapshot,
+            deadline=RequestDeadline.after(1),
+        )
+    finally:
+        await store.aclose()
+
+    assert request_body["topK"] == 20
+
+
 @dataclass(frozen=True)
 class _Settings:
     openai_api_key: SecretStr = field(default_factory=lambda: SecretStr("private-openai-key"))
@@ -475,9 +571,10 @@ class _Settings:
     research_chunk_tokens: int = 800
     research_chunk_overlap_tokens: int = 100
     research_max_results: int = 5
-    research_vector_overfetch: int = 3
+    research_vector_overfetch: int = 4
     research_minimum_score: float = 0.70
     research_daily_global_limit: int = 100
+    research_enabled: bool = False
 
 
 def test_builder_constructs_retrieval_only_graph_without_answer_generator(

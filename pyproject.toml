@@ -30,8 +30,8 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["app*"]
-exclude = ["api*", "tests*"]
+include = ["app*", "api*"]
+exclude = ["tests*"]
 
 [tool.pytest.ini_options]
 addopts = [
@@ -46,6 +46,7 @@ addopts = [
 ]
 asyncio_default_fixture_loop_scope = "function"
 asyncio_mode = "auto"
+pythonpath = ["."]
 testpaths = ["tests"]
 markers = [
     "unit: isolated unit tests",

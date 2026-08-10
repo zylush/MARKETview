@@ -20,7 +20,11 @@ from app.research.domain import (
     GenerationManifest,
     SearchHit,
 )
-from app.research.retrieval import SafeHitClassification, classify_safe_hits
+from app.research.retrieval import (
+    SafeHitClassification,
+    SafeHitRejectionCounts,
+    classify_safe_hits,
+)
 from app.retrieval_diagnostic import (
     EXIT_CONFIG,
     EXIT_FAILURE,
@@ -52,8 +56,7 @@ def filing() -> FilingDocument:
         title="AAPL 2025 Form 10-K",
         filed_date=date(2025, 10, 31),
         source_url=(
-            "https://www.sec.gov/Archives/edgar/data/320193/"
-            "000032019325000001/aapl-20250927.htm"
+            "https://www.sec.gov/Archives/edgar/data/320193/000032019325000001/aapl-20250927.htm"
         ),
         text="private-content-sentinel Apple reports supply constraints.",
     )
@@ -99,6 +102,15 @@ def classification(*, score: float = 0.95) -> SafeHitClassification:
         ),
         minimum_score=0.70,
         max_results=5,
+    )
+
+
+def mixed_unsafe_classification(reason: str) -> SafeHitClassification:
+    accepted = classification()
+    return replace(
+        accepted,
+        candidate_count=2,
+        rejection_counts=SafeHitRejectionCounts(**{reason: 1}),
     )
 
 
@@ -148,9 +160,10 @@ class _Settings:
     research_chunk_tokens: int = 800
     research_chunk_overlap_tokens: int = 100
     research_max_results: int = 5
-    research_vector_overfetch: int = 3
+    research_vector_overfetch: int = 4
     research_minimum_score: float = 0.70
     research_daily_global_limit: int = 100
+    research_enabled: bool = False
 
 
 _DEFAULT_AUTHORIZATION = object()
@@ -169,9 +182,7 @@ class FakeRuntime:
         commit_result: bool = True,
     ) -> None:
         self.snapshot = snapshot or preflight()
-        self.authorized = (
-            reservation() if authorized is _DEFAULT_AUTHORIZATION else authorized
-        )
+        self.authorized = reservation() if authorized is _DEFAULT_AUTHORIZATION else authorized
         self.classification_result = classification_result or classification()
         self.fail_at = fail_at
         self.timeout_at = timeout_at
@@ -231,6 +242,98 @@ LIVE_FLAGS = ["--apply", "--acknowledge-live-retrieval-diagnostic"]
 
 def output_json(capsys: pytest.CaptureFixture[str]) -> dict[str, Any]:
     return json.loads(capsys.readouterr().out)
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_rejects_five_by_three_candidate_contract_before_runtime(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = replace(_Settings(), research_vector_overfetch=3)
+
+    exit_code = await async_main(
+        [],
+        settings_factory=lambda: settings,
+        runtime_factory=lambda _settings: pytest.fail("runtime constructed"),
+    )
+
+    output = output_json(capsys)
+    assert exit_code == EXIT_CONFIG
+    assert output["error_category"] == "configuration"
+    assert output["call_counts"]["vector_search"] == 0
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_rejects_nonfixed_result_limit_before_runtime(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = replace(_Settings(), research_max_results=4)
+
+    exit_code = await async_main(
+        [],
+        settings_factory=lambda: settings,
+        runtime_factory=lambda _settings: pytest.fail("runtime constructed"),
+    )
+
+    output = output_json(capsys)
+    assert exit_code == EXIT_CONFIG
+    assert output["error_category"] == "configuration"
+    assert output["call_counts"]["vector_search"] == 0
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_rejects_non_upstash_redis_endpoint_before_runtime(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = replace(_Settings(), upstash_redis_rest_url="https://attacker.example")
+
+    exit_code = await async_main(
+        [],
+        settings_factory=lambda: settings,
+        runtime_factory=lambda _settings: pytest.fail("runtime constructed"),
+    )
+
+    output = output_json(capsys)
+    assert exit_code == EXIT_CONFIG
+    assert output["error_category"] == "configuration"
+    assert output["call_counts"]["vector_search"] == 0
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_requires_research_to_remain_disabled_before_runtime(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = replace(_Settings(), research_enabled=True)
+
+    exit_code = await async_main(
+        [],
+        settings_factory=lambda: settings,
+        runtime_factory=lambda _settings: pytest.fail("runtime constructed"),
+    )
+
+    output = output_json(capsys)
+    assert exit_code == EXIT_CONFIG
+    assert output["error_category"] == "configuration"
+    assert output["call_counts"]["embedding"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("minimum_score", [0.69, 0.71])
+async def test_diagnostic_rejects_nonfixed_minimum_score_before_runtime(
+    minimum_score: float,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = replace(_Settings(), research_minimum_score=minimum_score)
+
+    exit_code = await async_main(
+        [],
+        settings_factory=lambda: settings,
+        runtime_factory=lambda _settings: pytest.fail("runtime constructed"),
+    )
+
+    output = output_json(capsys)
+    assert exit_code == EXIT_CONFIG
+    assert output["error_category"] == "configuration"
+    assert output["call_counts"]["embedding"] == 0
 
 
 def test_preflight_is_frozen_and_hides_private_manifest_identifiers() -> None:
@@ -651,12 +754,34 @@ async def test_no_candidates_and_all_below_threshold_are_aggregate_failures(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["metadata_integrity", "prompt_injection"])
+async def test_any_integrity_or_injection_rejection_fails_even_with_an_accepted_hit(
+    reason: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime = FakeRuntime(classification_result=mixed_unsafe_classification(reason))
+
+    exit_code = await async_main(
+        LIVE_FLAGS,
+        settings_factory=_Settings,
+        runtime_factory=lambda _settings: runtime,
+    )
+
+    output = output_json(capsys)
+    assert exit_code == EXIT_FAILURE
+    assert output["passed"] is False
+    assert output["accepted_count"] == 1
+    assert output["rejection_counts"][reason] == 1
+    assert output["error_category"] == "retrieval"
+    assert output["budget_units_committed"] == 1
+    assert "release" not in runtime.events
+
+
+@pytest.mark.asyncio
 async def test_malformed_search_result_fails_closed_after_commit(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    runtime = FakeRuntime(
-        classification_result={"accepted_hits": ["private-content-sentinel"]}
-    )
+    runtime = FakeRuntime(classification_result={"accepted_hits": ["private-content-sentinel"]})
 
     exit_code = await async_main(
         LIVE_FLAGS,

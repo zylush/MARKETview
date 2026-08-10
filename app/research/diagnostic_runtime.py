@@ -31,6 +31,7 @@ _UPSTASH_HOST_SUFFIX = ".upstash.io"
 
 
 class _SettingsLike(Protocol):
+    research_enabled: bool
     openai_api_key: SecretStr | None
     upstash_vector_rest_url: str | None
     upstash_vector_rest_token: SecretStr | None
@@ -181,7 +182,7 @@ def _root_https_endpoint(value: object, *, require_upstash_host: bool) -> bool:
 def _configuration(settings: _SettingsLike) -> _Configuration:
     if not _root_https_endpoint(
         settings.upstash_vector_rest_url, require_upstash_host=True
-    ) or not _root_https_endpoint(settings.upstash_redis_rest_url, require_upstash_host=False):
+    ) or not _root_https_endpoint(settings.upstash_redis_rest_url, require_upstash_host=True):
         raise ValueError("retrieval diagnostic endpoint configuration is invalid")
     if not all(
         _secret_is_present(value)
@@ -209,16 +210,16 @@ def _configuration(settings: _SettingsLike) -> _Configuration:
         or type(settings.research_chunk_overlap_tokens) is not int
         or not 0 <= settings.research_chunk_overlap_tokens < settings.research_chunk_tokens
         or type(settings.research_max_results) is not int
-        or not 1 <= settings.research_max_results <= 20
+        or settings.research_max_results != 5
         or type(settings.research_vector_overfetch) is not int
-        or not 1 <= settings.research_vector_overfetch <= 10
-        or settings.research_max_results * settings.research_vector_overfetch > 20
+        or settings.research_vector_overfetch != 4
         or type(settings.research_daily_global_limit) is not int
         or settings.research_daily_global_limit < 1
+        or settings.research_enabled is not False
     ):
         raise ValueError("retrieval diagnostic configuration is invalid")
     minimum_score = float(settings.research_minimum_score)
-    if not math.isfinite(minimum_score) or not 0.0 <= minimum_score <= 1.0:
+    if not math.isfinite(minimum_score) or minimum_score != 0.70:
         raise ValueError("retrieval diagnostic score configuration is invalid")
     return _Configuration(
         requested_candidate_limit=(
@@ -387,6 +388,7 @@ class RetrievalDiagnosticRuntime:
             self._corpus,
             (manifest,),
             hits,
+            filing_type=filing_type,
             minimum_score=self._minimum_score,
             max_results=self._maximum_results,
         )
