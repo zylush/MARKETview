@@ -57,6 +57,8 @@ def test_refresh_requires_shared_upstash_when_cache_is_not_injected(
 ) -> None:
     monkeypatch.delenv("UPSTASH_REDIS_REST_URL", raising=False)
     monkeypatch.delenv("UPSTASH_REDIS_REST_TOKEN", raising=False)
+    monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.delenv("VERCEL_ENV", raising=False)
 
     settings = Settings(
         environment="test",

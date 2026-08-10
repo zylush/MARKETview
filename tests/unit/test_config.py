@@ -82,6 +82,8 @@ def test_vercel_markers_force_production_posture(
 ) -> None:
     monkeypatch.delenv("ENVIRONMENT", raising=False)
     monkeypatch.delenv("MARKETDATA_TOKEN", raising=False)
+    monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.delenv("VERCEL_ENV", raising=False)
     monkeypatch.setenv(marker, value)
 
     with pytest.raises(ValidationError, match="MARKETDATA_TOKEN"):
@@ -162,6 +164,8 @@ def test_missing_token_is_allowed_only_in_explicit_local_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("MARKETDATA_TOKEN", raising=False)
+    monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.delenv("VERCEL_ENV", raising=False)
 
     settings = Settings(environment="test", _env_file=None)
 
