@@ -20,7 +20,13 @@ from app.research.domain import (
     EvidenceChunk,
     GenerationManifest,
     GenerationVerification,
+    GenerationVerificationOutcome,
+    GenerationVerificationReason,
     SearchHit,
+)
+from app.research.ports import (
+    GenerationInspection,
+    GenerationInspectionState,
 )
 
 
@@ -37,6 +43,56 @@ class InMemoryVectorStore:
     @property
     def embedded_chunks(self) -> tuple[EmbeddedChunk, ...]:
         return tuple(chunk for _, chunks in self._generations for chunk in chunks)
+
+    async def inspect_generation(
+        self,
+        manifest: GenerationManifest,
+        *,
+        deadline: RequestDeadline,
+    ) -> GenerationInspection:
+        deadline.raise_if_expired()
+        if not isinstance(manifest, GenerationManifest):
+            raise ValueError("generation manifest is invalid")
+        expected_count = len(manifest.chunk_ids)
+        entries = tuple(
+            entry for entry in self._generations if entry[0].generation_id == manifest.generation_id
+        )
+        observed_count = sum(len(chunks) for _, chunks in entries)
+        if not entries:
+            state = GenerationInspectionState.ABSENT
+        elif len(entries) != 1 or entries[0][0] != manifest:
+            state = GenerationInspectionState.INCONSISTENT
+        else:
+            chunks = entries[0][1]
+            point_ids = tuple(chunk.evidence.chunk_id for chunk in chunks)
+            expected_subset = tuple(
+                point_id for point_id in manifest.chunk_ids if point_id in point_ids
+            )
+            metadata_matches = all(
+                chunk.evidence.corpus == manifest.corpus
+                and chunk.evidence.symbol == manifest.symbol
+                and chunk.evidence.accession_number == manifest.accession_number
+                and chunk.evidence.generation_id == manifest.generation_id
+                and chunk.evidence.content_hash == manifest.content_hash
+                and chunk.embedding.descriptor == manifest.corpus.embedding
+                for chunk in chunks
+            )
+            if (
+                not chunks
+                or len(set(point_ids)) != len(point_ids)
+                or point_ids != expected_subset
+                or not metadata_matches
+            ):
+                state = GenerationInspectionState.INCONSISTENT
+            elif point_ids == manifest.chunk_ids:
+                state = GenerationInspectionState.EXACT
+            else:
+                state = GenerationInspectionState.PARTIAL
+        return GenerationInspection(
+            state=state,
+            expected_point_count=expected_count,
+            observed_point_count=observed_count,
+        )
 
     async def stage_generation(
         self,
@@ -63,18 +119,34 @@ class InMemoryVectorStore:
         manifest: GenerationManifest,
         *,
         deadline: RequestDeadline,
-    ) -> GenerationVerification | None:
+    ) -> GenerationVerificationOutcome:
         deadline.raise_if_expired()
         entry = self._find_generation(manifest.generation_id)
         if entry is None or entry[0] != manifest:
-            return None
+            return GenerationVerificationOutcome.failed(
+                reason=GenerationVerificationReason.MISSING_POINTS,
+                expected_point_count=len(manifest.chunk_ids),
+                observed_point_count=0,
+                null_point_count=0,
+                attempt_count=1,
+            )
         try:
             self._validate_generation(entry[0], entry[1])
         except ValueError:
-            return None
-        return GenerationVerification.from_point_ids(
-            manifest.generation_id,
-            tuple(chunk.evidence.chunk_id for chunk in entry[1]),
+            return GenerationVerificationOutcome.failed(
+                reason=GenerationVerificationReason.INTEGRITY_MISMATCH,
+                expected_point_count=len(manifest.chunk_ids),
+                observed_point_count=min(len(entry[1]), len(manifest.chunk_ids)),
+                null_point_count=0,
+                attempt_count=1,
+            )
+        verification = GenerationVerification.from_point_ids(
+            manifest.generation_id, tuple(chunk.evidence.chunk_id for chunk in entry[1])
+        )
+        return GenerationVerificationOutcome.verified(
+            verification=verification,
+            expected_point_count=len(manifest.chunk_ids),
+            attempt_count=1,
         )
 
     async def abort_generation(
@@ -249,6 +321,25 @@ class InMemoryResearchControlPlane:
         )
         self._replace_stage(verified)
         return verified
+
+    async def get_generation_stage(
+        self,
+        *,
+        manifest: GenerationManifest,
+        deadline: RequestDeadline,
+    ) -> GenerationStageRecord | None:
+        deadline.raise_if_expired()
+        if not isinstance(manifest, GenerationManifest):
+            raise ValueError("generation manifest is invalid")
+        return next(
+            (
+                item
+                for item in self._stages
+                if item.manifest.generation_id == manifest.generation_id
+                and item.manifest == manifest
+            ),
+            None,
+        )
 
     async def get_active_generation(
         self,

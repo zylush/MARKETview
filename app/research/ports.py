@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol
 
 from app.research.control import (
@@ -21,9 +23,47 @@ from app.research.domain import (
     GeneratedAnswer,
     GenerationManifest,
     GenerationVerification,
+    GenerationVerificationOutcome,
     RawFiling,
     SearchHit,
 )
+
+
+class GenerationInspectionState(StrEnum):
+    """Safe aggregate state observed for one immutable generation manifest."""
+
+    ABSENT = "absent"
+    EXACT = "exact"
+    PARTIAL = "partial"
+    INCONSISTENT = "inconsistent"
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationInspection:
+    """Vector preflight result that deliberately excludes IDs, text, and vectors."""
+
+    state: GenerationInspectionState
+    expected_point_count: int
+    observed_point_count: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, GenerationInspectionState):
+            raise ValueError("generation inspection state is invalid")
+        if type(self.expected_point_count) is not int or self.expected_point_count < 1:
+            raise ValueError("generation inspection expected count is invalid")
+        if type(self.observed_point_count) is not int or self.observed_point_count < 0:
+            raise ValueError("generation inspection observed count is invalid")
+        if self.state is GenerationInspectionState.ABSENT and self.observed_point_count != 0:
+            raise ValueError("absent generation inspection must observe no points")
+        if (
+            self.state is GenerationInspectionState.EXACT
+            and self.observed_point_count != self.expected_point_count
+        ):
+            raise ValueError("exact generation inspection must observe every point")
+        if self.state is GenerationInspectionState.PARTIAL and not (
+            0 < self.observed_point_count < self.expected_point_count
+        ):
+            raise ValueError("partial generation inspection count is invalid")
 
 
 class FilingParser(Protocol):
@@ -70,6 +110,13 @@ class Embedder(Protocol):
 
 
 class VectorStore(Protocol):
+    async def inspect_generation(
+        self,
+        manifest: GenerationManifest,
+        *,
+        deadline: RequestDeadline,
+    ) -> GenerationInspection: ...
+
     async def stage_generation(
         self,
         manifest: GenerationManifest,
@@ -83,7 +130,7 @@ class VectorStore(Protocol):
         manifest: GenerationManifest,
         *,
         deadline: RequestDeadline,
-    ) -> GenerationVerification | None: ...
+    ) -> GenerationVerificationOutcome: ...
 
     async def abort_generation(
         self,
@@ -135,6 +182,13 @@ class ResearchControlPlane(Protocol):
         lease: AccessionLease,
         staged: GenerationStageRecord,
         verification: GenerationVerification,
+        deadline: RequestDeadline,
+    ) -> GenerationStageRecord | None: ...
+
+    async def get_generation_stage(
+        self,
+        *,
+        manifest: GenerationManifest,
         deadline: RequestDeadline,
     ) -> GenerationStageRecord | None: ...
 

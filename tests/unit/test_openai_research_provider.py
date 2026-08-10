@@ -152,6 +152,135 @@ async def test_embedder_posts_bounded_ordered_batches_to_official_embeddings_end
 
 
 @pytest.mark.asyncio
+async def test_embedder_splits_128_documents_into_ordered_96_and_32_batches() -> None:
+    batch_sizes: list[int] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        batch_sizes.append(len(payload["input"]))
+        return httpx.Response(200, json=_embedding_response(len(payload["input"])))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        embedder = OpenAIEmbedder(api_key=SecretStr("openai-secret"), client=client)
+        vectors = await embedder.embed_documents(
+            tuple(f"document-{index}" for index in range(128)),
+            deadline=_deadline(),
+        )
+
+    assert batch_sizes == [96, 32]
+    assert len(vectors) == 128
+    assert tuple(vector.values[0] for vector in vectors) == tuple(
+        [float(index + 1) for index in range(96)] + [float(index + 1) for index in range(32)]
+    )
+
+
+@pytest.mark.asyncio
+async def test_embedder_validates_every_document_before_first_paid_batch() -> None:
+    requests = 0
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(200, json=_embedding_response(96))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        embedder = OpenAIEmbedder(api_key=SecretStr("openai-secret"), client=client)
+        with pytest.raises(ValueError, match="embedding input batch is invalid"):
+            await embedder.embed_documents(
+                (*tuple("valid" for _ in range(127)), ""),
+                deadline=_deadline(),
+            )
+
+    assert requests == 0
+
+
+@pytest.mark.asyncio
+async def test_embedding_validation_failure_detaches_every_document() -> None:
+    secret_text = "private invalid filing input"
+    embedder = OpenAIEmbedder(
+        api_key=SecretStr("validation-openai-secret"),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(lambda _: None)),
+    )
+
+    with pytest.raises(ValueError, match="embedding input batch is invalid") as caught:
+        await embedder.embed_documents((secret_text, ""), deadline=_deadline())
+
+    rendered = _exception_graph_text(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert secret_text not in rendered
+    assert "validation-openai-secret" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_embedder_reuses_one_absolute_deadline_across_batches() -> None:
+    current_time = 100.0
+    observed_timeouts: list[float] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal current_time
+        observed_timeouts.append(request.extensions["timeout"]["connect"])
+        current_time += 4.0
+        payload = json.loads(request.content)
+        return httpx.Response(200, json=_embedding_response(len(payload["input"])))
+
+    deadline = RequestDeadline.after(10.0, clock=lambda: current_time)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        embedder = OpenAIEmbedder(api_key=SecretStr("openai-secret"), client=client)
+        await embedder.embed_documents(tuple("valid" for _ in range(128)), deadline=deadline)
+
+    assert observed_timeouts == [10.0, 6.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["malformed", "provider"])
+async def test_embedder_second_batch_failure_is_sanitized_and_never_retried(
+    failure: str,
+) -> None:
+    requests = 0
+    secret_text = "private-filing-body"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        payload = json.loads(request.content)
+        if requests == 1:
+            return httpx.Response(200, json=_embedding_response(len(payload["input"])))
+        if failure == "provider":
+            return httpx.Response(429, json={"error": secret_text})
+        return httpx.Response(200, json={"data": [{"index": 7, "embedding": []}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        embedder = OpenAIEmbedder(api_key=SecretStr("openai-secret"), client=client)
+        with pytest.raises(OpenAIResearchProviderError) as caught:
+            await embedder.embed_documents(
+                (*tuple("valid" for _ in range(127)), secret_text),
+                deadline=_deadline(),
+            )
+
+    assert requests == 2
+    rendered = _exception_graph_text(caught.value)
+    assert secret_text not in rendered
+    assert "openai-secret" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_embedder_accepts_bounded_realistic_96_vector_response() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        response = _embedding_response(96)
+        assert len(json.dumps(response).encode("utf-8")) < 4_000_000
+        return httpx.Response(200, json=response)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        embedder = OpenAIEmbedder(api_key=SecretStr("openai-secret"), client=client)
+        vectors = await embedder.embed_documents(
+            tuple("valid" for _ in range(96)), deadline=_deadline()
+        )
+
+    assert len(vectors) == 96
+
+
+@pytest.mark.asyncio
 async def test_embedder_rejects_misordered_wrong_dimension_or_nonfinite_vectors() -> None:
     async def handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(

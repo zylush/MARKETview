@@ -19,6 +19,7 @@ _ACCESSION = re.compile(r"^\d{10}-\d{2}-\d{6}$")
 _FILING_TYPE = re.compile(r"^(?:10-K|10-Q|8-K)(?:/A)?$")
 _VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _MEDIA_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+_MAX_GENERATION_VERIFICATION_ATTEMPTS = 4
 _SEC_ARCHIVE_DOCUMENT_PATH = re.compile(
     r"^/Archives/edgar/data/(?P<cik>[1-9][0-9]{0,9})/"
     r"(?P<accession>[0-9]{18})/(?P<filename>[A-Za-z0-9][A-Za-z0-9._-]{0,254})$"
@@ -853,12 +854,118 @@ class GenerationVerification:
         return cls(
             generation_id=generation_id,
             point_count=len(checked_ids),
-            point_ids_hash=_canonical_digest(*sorted(checked_ids)),
+            point_ids_hash=_canonical_digest(*checked_ids),
         )
 
     def proves(self, manifest: GenerationManifest) -> bool:
         expected = self.from_point_ids(manifest.generation_id, manifest.chunk_ids)
         return self == expected
+
+
+class GenerationVerificationReason(StrEnum):
+    """Fixed, non-sensitive result codes for exact generation verification."""
+
+    VERIFIED = "verified"
+    MISSING_POINTS = "missing_points"
+    PARTIAL_VISIBILITY = "partial_visibility"
+    RESPONSE_SHAPE = "response_shape"
+    ORDERING_MISMATCH = "ordering_mismatch"
+    METADATA_MISMATCH = "metadata_mismatch"
+    DATA_MISMATCH = "data_mismatch"
+    INTEGRITY_MISMATCH = "integrity_mismatch"
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationVerificationOutcome:
+    """Sanitized aggregate verification result with no point IDs or record data."""
+
+    reason: GenerationVerificationReason
+    expected_point_count: int
+    observed_point_count: int
+    null_point_count: int
+    attempt_count: int
+    verification: GenerationVerification | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, GenerationVerificationReason):
+            raise ValueError("generation verification outcome reason is invalid")
+        if type(self.expected_point_count) is not int or self.expected_point_count < 1:
+            raise ValueError("generation verification outcome expected count is invalid")
+        if (
+            type(self.observed_point_count) is not int
+            or not 0 <= self.observed_point_count <= self.expected_point_count
+        ):
+            raise ValueError("generation verification outcome observed count is invalid")
+        if (
+            type(self.null_point_count) is not int
+            or not 0 <= self.null_point_count <= self.expected_point_count
+            or self.observed_point_count + self.null_point_count > self.expected_point_count
+        ):
+            raise ValueError("generation verification outcome null count is invalid")
+        if (
+            type(self.attempt_count) is not int
+            or not 1 <= self.attempt_count <= _MAX_GENERATION_VERIFICATION_ATTEMPTS
+        ):
+            raise ValueError("generation verification outcome attempt count is invalid")
+        if self.reason is GenerationVerificationReason.VERIFIED:
+            if (
+                not isinstance(self.verification, GenerationVerification)
+                or self.observed_point_count != self.expected_point_count
+                or self.null_point_count != 0
+                or self.verification.point_count != self.expected_point_count
+            ):
+                raise ValueError("verified generation verification outcome is invalid")
+        elif self.verification is not None:
+            raise ValueError("failed generation verification outcome cannot contain proof")
+        if (
+            self.reason is GenerationVerificationReason.MISSING_POINTS
+            and self.observed_point_count != 0
+        ):
+            raise ValueError("missing generation verification outcome count is invalid")
+        if self.reason is GenerationVerificationReason.PARTIAL_VISIBILITY and not (
+            0 < self.observed_point_count < self.expected_point_count
+        ):
+            raise ValueError("partial generation verification outcome count is invalid")
+
+    @classmethod
+    def verified(
+        cls,
+        *,
+        verification: GenerationVerification,
+        expected_point_count: int,
+        attempt_count: int = 1,
+    ) -> GenerationVerificationOutcome:
+        return cls(
+            reason=GenerationVerificationReason.VERIFIED,
+            expected_point_count=expected_point_count,
+            observed_point_count=expected_point_count,
+            null_point_count=0,
+            attempt_count=attempt_count,
+            verification=verification,
+        )
+
+    @classmethod
+    def failed(
+        cls,
+        *,
+        reason: GenerationVerificationReason,
+        expected_point_count: int,
+        observed_point_count: int,
+        null_point_count: int,
+        attempt_count: int = 1,
+    ) -> GenerationVerificationOutcome:
+        if reason is GenerationVerificationReason.VERIFIED:
+            raise ValueError("failed generation verification outcome reason is invalid")
+        return cls(
+            reason=reason,
+            expected_point_count=expected_point_count,
+            observed_point_count=observed_point_count,
+            null_point_count=null_point_count,
+            attempt_count=attempt_count,
+        )
+
+    def proves(self, manifest: GenerationManifest) -> bool:
+        return bool(self.verification is not None and self.verification.proves(manifest))
 
 
 @dataclass(frozen=True, slots=True)

@@ -52,7 +52,14 @@ def test_refresh_rejects_missing_sec_identity_before_constructing_external_resou
         run(refresh_symbol_directory(settings=settings, cache=MemoryCache()))
 
 
-def test_refresh_requires_shared_upstash_when_cache_is_not_injected() -> None:
+def test_refresh_requires_shared_upstash_when_cache_is_not_injected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("UPSTASH_REDIS_REST_URL", raising=False)
+    monkeypatch.delenv("UPSTASH_REDIS_REST_TOKEN", raising=False)
+    monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.delenv("VERCEL_ENV", raising=False)
+
     settings = Settings(
         environment="test",
         sec_user_agent="MarketView/1.0 operations@example.com",

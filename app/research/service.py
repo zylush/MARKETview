@@ -3,11 +3,16 @@ from __future__ import annotations
 import math
 import re
 import secrets
-import unicodedata
+import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
-from app.research.control import AccessionLease
+from app.research.control import (
+    AccessionLease,
+    GenerationState,
+    IngestionFailureStage,
+    IngestionStageError,
+)
 from app.research.deadline import RequestDeadline
 from app.research.domain import (
     CorpusDescriptor,
@@ -17,6 +22,8 @@ from app.research.domain import (
     GeneratedAnswerStatus,
     GeneratedClaim,
     GenerationManifest,
+    GenerationVerificationOutcome,
+    GenerationVerificationReason,
     IngestionResult,
     ResearchAnswer,
     ResearchCitation,
@@ -26,28 +33,13 @@ from app.research.ports import (
     AnswerGenerator,
     DocumentChunker,
     Embedder,
+    GenerationInspectionState,
     ResearchControlPlane,
     VectorStore,
 )
+from app.research.retrieval import classify_safe_hits, contains_prompt_injection
 from app.validation import validate_research_question, validate_symbol
 
-_PROMPT_INJECTION_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in (
-        r"\bignore\s+(?:all\s+)?previous\s+instructions\b",
-        r"\breveal\s+(?:the\s+)?(?:system|developer)\s+prompt\b",
-        r"\b(?:system|developer)\s+message\s*:",
-        r"\bdisclose\s+(?:your\s+)?hidden\s+instructions\b",
-        r"\bact\s+as\s+(?:the\s+)?system\b",
-        r"\b(?:ignore|forget|disregard|override|bypass|supersede)\b.{0,80}"
-        r"\b(?:instructions?|directions?|rules?|guidance|safeguards?)\b",
-        r"\b(?:reveal|expose|print|output|disclose|divulge)\b.{0,80}"
-        r"\b(?:hidden|private|confidential|system|developer)\b.{0,40}"
-        r"\b(?:prompts?|instructions?|directives?|configuration)\b",
-        r"\btreat\b.{0,60}\b(?:higher[- ]priority|authoritative)\b.{0,40}"
-        r"\b(?:instructions?|guidance|commands?)\b",
-    )
-)
 _PERSONAL_CONTEXT = re.compile(r"\b(?:i|me|my|mine|we|us|our|ours)\b", re.IGNORECASE)
 _INVESTMENT_ACTION = re.compile(
     r"\b(?:buy|buying|purchase|purchasing|acquire|acquiring|invest|investing|"
@@ -143,6 +135,24 @@ class ResearchCorpusUnavailableError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class _IngestionOutcome:
+    result: IngestionResult | None = None
+    failure_stage: IngestionFailureStage | None = None
+    verification: GenerationVerificationOutcome | None = None
+
+    def __post_init__(self) -> None:
+        if (self.result is None) == (self.failure_stage is None):
+            raise ValueError("ingestion outcome must contain exactly one result")
+        if self.verification is not None and (
+            self.failure_stage is not IngestionFailureStage.VECTOR_VERIFICATION
+            or self.result is not None
+            or self.verification.reason is GenerationVerificationReason.VERIFIED
+            or self.verification.verification is not None
+        ):
+            raise ValueError("ingestion outcome verification diagnostic is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class ResearchPolicy:
     minimum_score: float = 0.70
     max_results: int = 5
@@ -198,37 +208,89 @@ class ResearchCoreService:
         document: FilingDocument,
         *,
         deadline: RequestDeadline | None = None,
+        retry_failed: bool = False,
+    ) -> IngestionResult:
+        outcome = await self._ingestion_outcome(
+            document,
+            deadline=deadline,
+            retry_failed=retry_failed,
+        )
+        document = None  # type: ignore[assignment]
+        if outcome.failure_stage is not None:
+            raise IngestionStageError(
+                outcome.failure_stage,
+                verification=outcome.verification,
+            ) from None
+        if outcome.result is None:  # pragma: no cover - guarded by the outcome type
+            raise IngestionStageError(IngestionFailureStage.PARSING_CHUNKING) from None
+        return outcome.result
+
+    async def _ingestion_outcome(
+        self,
+        document: FilingDocument,
+        *,
+        deadline: RequestDeadline | None,
+        retry_failed: bool,
+    ) -> _IngestionOutcome:
+        try:
+            result = await self._ingest_impl(
+                document,
+                deadline=deadline,
+                retry_failed=retry_failed,
+            )
+            return _IngestionOutcome(result=result)
+        except IngestionStageError as error:
+            return _IngestionOutcome(
+                failure_stage=error.stage,
+                verification=error.verification,
+            )
+        except Exception:
+            return _IngestionOutcome(failure_stage=IngestionFailureStage.CLEANUP)
+
+    async def _ingest_impl(
+        self,
+        document: FilingDocument,
+        *,
+        deadline: RequestDeadline | None = None,
+        retry_failed: bool = False,
     ) -> IngestionResult:
         operation_deadline = deadline or RequestDeadline.after(
             self._policy.ingestion_timeout_seconds
         )
         operation_deadline.raise_if_expired()
-        if self._chunker is None:
-            raise ValueError("research ingestion chunker is not configured")
-        texts = tuple(text.strip() for text in self._chunker.chunk(document) if text.strip())
-        if not texts:
-            raise ValueError("filing chunker produced no usable content")
-        evidence = tuple(
-            EvidenceChunk.from_document(
-                document,
-                corpus=self._corpus,
-                ordinal=ordinal,
-                text=text,
+        try:
+            if self._chunker is None:
+                raise ValueError("research ingestion chunker is not configured")
+            texts = tuple(text.strip() for text in self._chunker.chunk(document) if text.strip())
+            if not texts:
+                raise ValueError("filing chunker produced no usable content")
+            evidence = tuple(
+                EvidenceChunk.from_document(
+                    document,
+                    corpus=self._corpus,
+                    ordinal=ordinal,
+                    text=text,
+                )
+                for ordinal, text in enumerate(texts)
             )
-            for ordinal, text in enumerate(texts)
-        )
-        manifest = self._manifest(evidence)
-        lease = await self._control_plane.acquire_generation_lease(
-            manifest=manifest,
-            owner_digest=secrets.token_hex(32),
-            ttl_seconds=max(1, min(3600, math.ceil(operation_deadline.remaining_seconds()))),
-            deadline=operation_deadline,
-        )
+            manifest = self._manifest(evidence)
+        except Exception:
+            raise IngestionStageError(IngestionFailureStage.PARSING_CHUNKING) from None
+        try:
+            lease = await self._control_plane.acquire_generation_lease(
+                manifest=manifest,
+                owner_digest=secrets.token_hex(32),
+                ttl_seconds=max(1, min(3600, math.ceil(operation_deadline.remaining_seconds()))),
+                deadline=operation_deadline,
+            )
+        except Exception:
+            raise IngestionStageError(IngestionFailureStage.REDIS_PUBLICATION) from None
         if lease is None:
-            raise RuntimeError("research generation is already being ingested")
-        stage = None
+            raise IngestionStageError(IngestionFailureStage.REDIS_PUBLICATION) from None
+        generation_stage = None
         published = False
         current: GenerationManifest | None = None
+        failure_stage = IngestionFailureStage.REDIS_PUBLICATION
         try:
             current = await self._control_plane.get_active_generation(
                 corpus=self._corpus,
@@ -236,6 +298,33 @@ class ResearchCoreService:
                 accession_number=document.accession_number,
                 deadline=operation_deadline,
             )
+            if retry_failed and current is not None:
+                raise RuntimeError("failed-checkpoint recovery state is inconsistent")
+            if retry_failed:
+                pending = await self._control_plane.list_pending_cleanups(
+                    corpus=self._corpus,
+                    symbol=document.symbol,
+                    deadline=operation_deadline,
+                )
+                if any(
+                    item.superseded_manifest.accession_number == document.accession_number
+                    for item in pending
+                ):
+                    raise RuntimeError("failed-checkpoint recovery state is inconsistent")
+                recovered_stage = await self._control_plane.get_generation_stage(
+                    manifest=manifest,
+                    deadline=operation_deadline,
+                )
+                if recovered_stage is None or recovered_stage.state is not GenerationState.CLEANED:
+                    raise RuntimeError("failed-checkpoint recovery state is inconsistent")
+                failure_stage = IngestionFailureStage.VECTOR_VERIFICATION
+                inspection = await self._store.inspect_generation(
+                    manifest,
+                    deadline=operation_deadline,
+                )
+                if inspection.state is not GenerationInspectionState.ABSENT:
+                    raise RuntimeError("failed-checkpoint recovery state is inconsistent")
+                failure_stage = IngestionFailureStage.REDIS_PUBLICATION
             if current == manifest:
                 cleanup_pending_count = await self._cleanup_superseded_generations(
                     lease=lease,
@@ -248,13 +337,14 @@ class ResearchCoreService:
                     removed_count=0,
                     cleanup_pending_count=cleanup_pending_count,
                 )
-            stage = await self._control_plane.stage_generation(
+            generation_stage = await self._control_plane.stage_generation(
                 lease=lease,
                 manifest=manifest,
                 deadline=operation_deadline,
             )
-            if stage is None:
+            if generation_stage is None:
                 raise RuntimeError("research generation could not be staged")
+            failure_stage = IngestionFailureStage.EMBEDDING
             embeddings = await self._embedder.embed_documents(
                 texts,
                 deadline=operation_deadline,
@@ -265,22 +355,31 @@ class ResearchCoreService:
                 EmbeddedChunk(evidence=item, embedding=embedding)
                 for item, embedding in zip(evidence, embeddings, strict=True)
             )
+            failure_stage = IngestionFailureStage.VECTOR_STAGING
             await self._store.stage_generation(manifest, chunks, deadline=operation_deadline)
-            verification = await self._store.verify_generation(
+            failure_stage = IngestionFailureStage.VECTOR_VERIFICATION
+            verification_outcome = await self._store.verify_generation(
                 manifest,
                 deadline=operation_deadline,
             )
-            if verification is None or not verification.proves(manifest):
-                raise ValueError("staged research generation failed verification")
+            if not verification_outcome.proves(manifest):
+                raise IngestionStageError(
+                    IngestionFailureStage.VECTOR_VERIFICATION,
+                    verification=verification_outcome,
+                )
+            verification = verification_outcome.verification
+            if verification is None:  # pragma: no cover - enforced by outcome invariants
+                raise IngestionStageError(IngestionFailureStage.VECTOR_VERIFICATION)
+            failure_stage = IngestionFailureStage.REDIS_PUBLICATION
             verified_stage = await self._control_plane.mark_generation_verified(
                 lease=lease,
-                staged=stage,
+                staged=generation_stage,
                 verification=verification,
                 deadline=operation_deadline,
             )
             if verified_stage is None:
                 raise RuntimeError("research generation verification was not recorded")
-            stage = verified_stage
+            generation_stage = verified_stage
             published = await self._control_plane.publish_generation(
                 lease=lease,
                 verified_stage=verified_stage,
@@ -319,32 +418,58 @@ class ResearchCoreService:
                 ),
                 cleanup_pending_count=cleanup_pending_count,
             )
-        except Exception:
-            if stage is not None and not published and operation_deadline.remaining_seconds() > 0:
-                aborted = await self._control_plane.abort_generation(
-                    lease=lease,
-                    stage=stage,
-                    deadline=operation_deadline,
-                )
-                if aborted is not None:
-                    if current is None or current.generation_id != manifest.generation_id:
-                        await self._store.abort_generation(
-                            manifest,
-                            deadline=operation_deadline,
-                        )
-                    await self._control_plane.clean_generation(
+        except Exception as error:
+            original_stage = failure_stage
+            verification_diagnostic = (
+                error.verification if isinstance(error, IngestionStageError) else None
+            )
+            if (
+                generation_stage is not None
+                and not published
+                and operation_deadline.remaining_seconds() > 0
+            ):
+                try:
+                    aborted = await self._control_plane.abort_generation(
                         lease=lease,
-                        aborted_stage=aborted,
-                        marker_ttl_seconds=86_400,
+                        stage=generation_stage,
                         deadline=operation_deadline,
                     )
-            raise
+                    if aborted is not None:
+                        if current is None or current.generation_id != manifest.generation_id:
+                            await self._store.abort_generation(
+                                manifest,
+                                deadline=operation_deadline,
+                            )
+                        await self._control_plane.clean_generation(
+                            lease=lease,
+                            aborted_stage=aborted,
+                            marker_ttl_seconds=86_400,
+                            deadline=operation_deadline,
+                        )
+                except Exception:
+                    original_stage = IngestionFailureStage.CLEANUP
+                    verification_diagnostic = None
+            raise IngestionStageError(
+                original_stage,
+                verification=(
+                    verification_diagnostic
+                    if original_stage is IngestionFailureStage.VECTOR_VERIFICATION
+                    else None
+                ),
+            ) from None
         finally:
             if operation_deadline.remaining_seconds() > 0:
-                await self._control_plane.release_generation_lease(
-                    lease=lease,
-                    deadline=operation_deadline,
-                )
+                active_error = sys.exception()
+                release_failed = False
+                try:
+                    await self._control_plane.release_generation_lease(
+                        lease=lease,
+                        deadline=operation_deadline,
+                    )
+                except Exception:
+                    release_failed = True
+                if release_failed and active_error is None:
+                    raise IngestionStageError(IngestionFailureStage.CLEANUP) from None
 
     async def _cleanup_superseded_generations(
         self,
@@ -474,31 +599,14 @@ class ResearchCoreService:
         active: tuple[GenerationManifest, ...],
         hits: tuple[SearchHit, ...],
     ) -> tuple[SearchHit, ...]:
-        active_by_generation = {item.generation_id: item for item in active}
-        safe: list[SearchHit] = []
-        seen_chunks: set[str] = set()
-        for hit in hits:
-            evidence = hit.evidence
-            manifest = active_by_generation.get(hit.active_generation_id)
-            if (
-                manifest is None
-                or evidence.chunk_id in seen_chunks
-                or evidence.symbol != symbol
-                or evidence.corpus != self._corpus
-                or hit.embedding_descriptor != self._corpus.embedding
-                or hit.active_generation_id != evidence.generation_id
-                or manifest.accession_number != evidence.accession_number
-                or manifest.content_hash != evidence.content_hash
-                or evidence.chunk_id not in manifest.chunk_ids
-                or hit.score < self._policy.minimum_score
-                or self._contains_prompt_injection(evidence.text)
-            ):
-                continue
-            safe.append(hit)
-            seen_chunks.add(evidence.chunk_id)
-            if len(safe) == self._policy.max_results:
-                break
-        return tuple(safe)
+        return classify_safe_hits(
+            symbol,
+            self._corpus,
+            active,
+            hits,
+            minimum_score=self._policy.minimum_score,
+            max_results=self._policy.max_results,
+        ).accepted_hits
 
     def _claims_are_grounded(
         self,
@@ -552,16 +660,7 @@ class ResearchCoreService:
 
     @staticmethod
     def _contains_prompt_injection(text: str) -> bool:
-        normalized = unicodedata.normalize("NFKC", text)
-        safe_text = "".join(
-            ""
-            if unicodedata.category(character) == "Cf"
-            else " "
-            if unicodedata.category(character) == "Cc"
-            else character
-            for character in normalized
-        )
-        return any(pattern.search(safe_text) for pattern in _PROMPT_INJECTION_PATTERNS)
+        return contains_prompt_injection(text)
 
     @staticmethod
     def _is_personalized_trade_request(text: str) -> bool:

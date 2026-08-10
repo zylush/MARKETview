@@ -29,6 +29,13 @@ def test_vercel_uses_fastapi_zero_config_routing() -> None:
     assert "rewrites" not in config
 
 
+def test_ci_runtime_uses_an_approved_redis_placeholder() -> None:
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert "UPSTASH_REDIS_REST_URL: https://ci-cache.upstash.io" in workflow
+    assert "https://upstash.invalid" not in workflow
+
+
 def test_vercel_runtime_never_selects_process_local_cache() -> None:
     settings = Settings(
         environment="development",

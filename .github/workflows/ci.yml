@@ -19,7 +19,7 @@ env:
   MARKETDATA_DAILY_CREDIT_BUDGET: "90"
   APP_ACCESS_KEY_SHA256: 7c222fb2927d828af22f592134e8932480637c0d23f8469b0e9e25c531b77a92
   SESSION_SECRET: test-only-session-secret-with-at-least-32-characters
-  UPSTASH_REDIS_REST_URL: https://upstash.invalid
+  UPSTASH_REDIS_REST_URL: https://ci-cache.upstash.io
   UPSTASH_REDIS_REST_TOKEN: test-token-never-used
   ALLOWED_ORIGIN: http://testserver
   ALLOWED_HOSTS: testserver,localhost,127.0.0.1

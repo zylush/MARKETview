@@ -24,7 +24,13 @@ from app.research.domain import (
     FilingReference,
     GenerationManifest,
     GenerationVerification,
+    GenerationVerificationOutcome,
+    GenerationVerificationReason,
     SearchHit,
+)
+from app.research.ports import (
+    GenerationInspection,
+    GenerationInspectionState,
 )
 
 _UPSTASH_HOST_SUFFIX = ".upstash.io"
@@ -32,8 +38,8 @@ _NAMESPACE = re.compile(r"^sec-filings-v[1-9][0-9]{0,5}$")
 _SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,31}$")
 _MAX_RESPONSE_BYTES = 1_048_576
 _MAX_BATCH_SIZE = 100
-_MAX_CANDIDATES = 50
 _MAX_ACTIVE_GENERATIONS = 100
+_VERIFICATION_POLL_DELAYS_SECONDS = (0.05, 0.1, 0.2)
 
 
 class UpstashVectorConfigurationError(ValueError):
@@ -163,6 +169,76 @@ class UpstashVectorStore:
             raise ValueError("vector point digest input is invalid") from None
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
+    async def inspect_generation(
+        self,
+        manifest: GenerationManifest,
+        *,
+        deadline: RequestDeadline,
+    ) -> GenerationInspection:
+        """Inspect only the manifest's bounded point IDs without returning record data."""
+
+        if not isinstance(manifest, GenerationManifest):
+            raise ValueError("generation manifest is invalid")
+        expected_count = len(manifest.chunk_ids)
+        observed_ids: list[str] = []
+        inconsistent = False
+        for start in range(0, expected_count, _MAX_BATCH_SIZE):
+            batch_ids = manifest.chunk_ids[start : start + _MAX_BATCH_SIZE]
+            request_payload: dict[str, object] = {
+                "ids": list(batch_ids),
+                "includeVectors": False,
+                "includeMetadata": True,
+                "includeData": False,
+            }
+            outcome = await self._send(
+                "POST",
+                "/fetch",
+                request_payload,
+                deadline=deadline,
+            )
+            request_payload = {}
+            if outcome.kind != "ok":
+                self._raise_outcome(outcome)
+            decoded = self._decode_inspection_fetch(
+                outcome.payload,
+                maximum_records=len(batch_ids),
+            )
+            outcome = _WireOutcome("ok")
+            if decoded is None:
+                inconsistent = True
+                continue
+            batch_observed = tuple(point_id for point_id, _ in decoded)
+            expected_subset = tuple(
+                point_id for point_id in batch_ids if point_id in batch_observed
+            )
+            if (
+                len(set(batch_observed)) != len(batch_observed)
+                or batch_observed != expected_subset
+                or any(
+                    not self._inspection_metadata_matches_manifest(point_id, metadata, manifest)
+                    for point_id, metadata in decoded
+                )
+            ):
+                inconsistent = True
+            observed_ids.extend(batch_observed)
+            decoded = ()
+
+        observed_count = len(observed_ids)
+        if inconsistent or len(set(observed_ids)) != observed_count:
+            state = GenerationInspectionState.INCONSISTENT
+        elif observed_count == 0:
+            state = GenerationInspectionState.ABSENT
+        elif tuple(observed_ids) == manifest.chunk_ids:
+            state = GenerationInspectionState.EXACT
+        else:
+            state = GenerationInspectionState.PARTIAL
+        observed_ids = []
+        return GenerationInspection(
+            state=state,
+            expected_point_count=expected_count,
+            observed_point_count=observed_count,
+        )
+
     async def stage_generation(
         self,
         manifest: GenerationManifest,
@@ -189,10 +265,46 @@ class UpstashVectorStore:
         manifest: GenerationManifest,
         *,
         deadline: RequestDeadline,
-    ) -> GenerationVerification | None:
+    ) -> GenerationVerificationOutcome:
         if not isinstance(manifest, GenerationManifest):
             raise ValueError("generation manifest is invalid")
-        records: list[tuple[str, dict[str, object], str]] = []
+        result = await self._verify_generation_once(
+            manifest,
+            deadline=deadline,
+            attempt_count=1,
+        )
+        for attempt_count, delay_seconds in enumerate(
+            _VERIFICATION_POLL_DELAYS_SECONDS,
+            start=2,
+        ):
+            if result.reason not in {
+                GenerationVerificationReason.MISSING_POINTS,
+                GenerationVerificationReason.PARTIAL_VISIBILITY,
+            }:
+                return result
+            if deadline.remaining_seconds() <= delay_seconds:
+                raise UpstashVectorTimeoutError("the vector service request timed out") from None
+            await asyncio.sleep(delay_seconds)
+            if deadline.remaining_seconds() <= 0:
+                raise UpstashVectorTimeoutError("the vector service request timed out") from None
+            result = await self._verify_generation_once(
+                manifest,
+                deadline=deadline,
+                attempt_count=attempt_count,
+            )
+        return result
+
+    async def _verify_generation_once(
+        self,
+        manifest: GenerationManifest,
+        *,
+        deadline: RequestDeadline,
+        attempt_count: int,
+    ) -> GenerationVerificationOutcome:
+        expected_count = len(manifest.chunk_ids)
+        observed_count = 0
+        null_count = 0
+        point_ids: list[str] = []
         for start in range(0, len(manifest.chunk_ids), _MAX_BATCH_SIZE):
             batch_ids = manifest.chunk_ids[start : start + _MAX_BATCH_SIZE]
             request_payload: dict[str, object] = {
@@ -210,23 +322,97 @@ class UpstashVectorStore:
             request_payload = {}
             if outcome.kind != "ok":
                 self._raise_outcome(outcome)
-            decoded = self._decode_fetch(outcome.payload)
+            decoded = self._decode_verification_fetch(
+                outcome.payload,
+                maximum_records=len(batch_ids),
+            )
             outcome = _WireOutcome("ok")
             if decoded is None:
-                return None
-            records.extend(decoded)
+                return GenerationVerificationOutcome.failed(
+                    reason=GenerationVerificationReason.RESPONSE_SHAPE,
+                    expected_point_count=expected_count,
+                    observed_point_count=observed_count,
+                    null_point_count=null_count,
+                    attempt_count=attempt_count,
+                )
+            observed_count += sum(record is not None for record in decoded)
+            null_count += sum(record is None for record in decoded)
+            positional_result = len(decoded) == len(batch_ids)
+            expected_positions = {point_id: position for position, point_id in enumerate(batch_ids)}
+            last_visible_position = -1
+            for offset, record in enumerate(decoded):
+                if record is None:
+                    continue
+                point_id, metadata, data = record
+                expected_offset = offset if positional_result else expected_positions.get(point_id)
+                if (
+                    expected_offset is None
+                    or expected_offset <= last_visible_position
+                    or point_id != batch_ids[expected_offset]
+                ):
+                    return GenerationVerificationOutcome.failed(
+                        reason=GenerationVerificationReason.ORDERING_MISMATCH,
+                        expected_point_count=expected_count,
+                        observed_point_count=observed_count,
+                        null_point_count=null_count,
+                        attempt_count=attempt_count,
+                    )
+                last_visible_position = expected_offset
+                reason = self._verification_record_reason(
+                    point_id,
+                    metadata,
+                    data,
+                    manifest,
+                    ordinal=start + expected_offset,
+                )
+                metadata = {}
+                data = ""
+                if reason is not None:
+                    return GenerationVerificationOutcome.failed(
+                        reason=reason,
+                        expected_point_count=expected_count,
+                        observed_point_count=observed_count,
+                        null_point_count=null_count,
+                        attempt_count=attempt_count,
+                    )
+                point_ids.append(point_id)
+            decoded = ()
 
-        point_ids = tuple(point_id for point_id, _, _ in records)
-        if point_ids != manifest.chunk_ids or self.point_set_hash(point_ids) != self.point_set_hash(
-            manifest.chunk_ids
-        ):
-            return None
-        if not all(
-            self._record_matches_manifest(point_id, record, data, manifest)
-            for point_id, record, data in records
-        ):
-            return None
-        return GenerationVerification.from_point_ids(manifest.generation_id, point_ids)
+        if observed_count != expected_count:
+            point_ids = []
+            return GenerationVerificationOutcome.failed(
+                reason=(
+                    GenerationVerificationReason.MISSING_POINTS
+                    if observed_count == 0
+                    else GenerationVerificationReason.PARTIAL_VISIBILITY
+                ),
+                expected_point_count=expected_count,
+                observed_point_count=observed_count,
+                null_point_count=null_count,
+                attempt_count=attempt_count,
+            )
+        checked_ids = tuple(point_ids)
+        point_ids = []
+        if checked_ids != manifest.chunk_ids or self.point_set_hash(
+            checked_ids
+        ) != self.point_set_hash(manifest.chunk_ids):
+            return GenerationVerificationOutcome.failed(
+                reason=GenerationVerificationReason.ORDERING_MISMATCH,
+                expected_point_count=expected_count,
+                observed_point_count=observed_count,
+                null_point_count=null_count,
+                attempt_count=attempt_count,
+            )
+        verification = GenerationVerification.from_point_ids(
+            manifest.generation_id,
+            checked_ids,
+        )
+        checked_ids = ()
+        return GenerationVerificationOutcome.verified(
+            verification=verification,
+            expected_point_count=expected_count,
+            attempt_count=attempt_count,
+        )
 
     async def abort_generation(
         self,
@@ -284,7 +470,7 @@ class UpstashVectorStore:
         )
         if not active:
             return ()
-        candidate_limit = min(_MAX_CANDIDATES, limit * 5)
+        candidate_limit = limit
         request_payload: dict[str, object] = {
             "vector": list(vector.values),
             "topK": candidate_limit,
@@ -429,19 +615,58 @@ class UpstashVectorStore:
         }
 
     @staticmethod
-    def _metadata_matches_manifest(
+    def _inspection_metadata_matches_manifest(
         point_id: str,
         metadata: dict[str, object],
         manifest: GenerationManifest,
     ) -> bool:
+        expected_keys = {
+            "symbol",
+            "cik",
+            "accession_number",
+            "filing_type",
+            "title",
+            "filed_date",
+            "source_url",
+            "chunk_id",
+            "content_hash",
+            "ordinal",
+            "corpus_id",
+            "corpus_version",
+            "chunker_version",
+            "embedding_key",
+            "embedding_provider",
+            "embedding_model",
+            "embedding_version",
+            "embedding_dimensions",
+            "generation_id",
+            "evidence_digest",
+            "point_digest",
+        }
+        if set(metadata) != expected_keys:
+            return False
+        descriptor = manifest.corpus.embedding
+        text_fields = tuple(
+            key for key in expected_keys if key not in {"ordinal", "embedding_dimensions"}
+        )
         return bool(
-            metadata.get("chunk_id") == point_id
+            all(isinstance(metadata.get(key), str) for key in text_fields)
+            and type(metadata.get("ordinal")) is int
+            and int(cast(int, metadata.get("ordinal"))) >= 0
+            and type(metadata.get("embedding_dimensions")) is int
+            and metadata.get("chunk_id") == point_id
             and metadata.get("symbol") == manifest.symbol
             and metadata.get("accession_number") == manifest.accession_number
             and metadata.get("generation_id") == manifest.generation_id
             and metadata.get("content_hash") == manifest.content_hash
             and metadata.get("corpus_id") == manifest.corpus.canonical_key
-            and metadata.get("embedding_key") == manifest.corpus.embedding.canonical_key
+            and metadata.get("corpus_version") == manifest.corpus.corpus_version
+            and metadata.get("chunker_version") == manifest.corpus.chunker_version
+            and metadata.get("embedding_key") == descriptor.canonical_key
+            and metadata.get("embedding_provider") == descriptor.provider
+            and metadata.get("embedding_model") == descriptor.model
+            and metadata.get("embedding_version") == descriptor.version
+            and metadata.get("embedding_dimensions") == descriptor.dimensions
         )
 
     @classmethod
@@ -461,20 +686,51 @@ class UpstashVectorStore:
             return False
         return hmac.compare_digest(supplied, expected)
 
+    @staticmethod
+    def _decode_verification_fetch(
+        payload: object,
+        *,
+        maximum_records: int,
+    ) -> tuple[tuple[str, dict[str, object], str] | None, ...] | None:
+        if not isinstance(payload, dict) or set(payload) != {"result"}:
+            return None
+        result = payload.get("result")
+        if not isinstance(result, list) or len(result) > maximum_records:
+            return None
+        decoded: list[tuple[str, dict[str, object], str] | None] = []
+        for item in result:
+            if item is None:
+                decoded.append(None)
+                continue
+            if not isinstance(item, dict) or set(item) != {"id", "metadata", "data"}:
+                return None
+            point_id = item.get("id")
+            record_metadata = item.get("metadata")
+            data = item.get("data")
+            if (
+                not isinstance(point_id, str)
+                or not isinstance(record_metadata, dict)
+                or not isinstance(data, str)
+            ):
+                return None
+            decoded.append((point_id, dict(record_metadata), data))
+        return tuple(decoded)
+
     @classmethod
-    def _record_matches_manifest(
+    def _verification_record_reason(
         cls,
         point_id: str,
         metadata: dict[str, object],
         data: str,
         manifest: GenerationManifest,
-    ) -> bool:
-        if not cls._record_integrity_matches(
-            point_id,
-            metadata,
-            data,
-        ) or not cls._metadata_matches_manifest(point_id, metadata, manifest):
-            return False
+        *,
+        ordinal: int,
+    ) -> GenerationVerificationReason | None:
+        if (
+            not cls._inspection_metadata_matches_manifest(point_id, metadata, manifest)
+            or metadata.get("ordinal") != ordinal
+        ):
+            return GenerationVerificationReason.METADATA_MISMATCH
         try:
             descriptor = EmbeddingDescriptor(
                 provider=cast(str, metadata["embedding_provider"]),
@@ -496,54 +752,57 @@ class UpstashVectorStore:
                 filed_date=date.fromisoformat(cast(str, metadata["filed_date"])),
                 source_url=cast(str, metadata["source_url"]),
             )
-            evidence = EvidenceChunk(
-                reference=reference,
-                corpus=evidence_corpus,
-                generation_id=cast(str, metadata["generation_id"]),
-                chunk_id=cast(str, metadata["chunk_id"]),
-                content_hash=cast(str, metadata["content_hash"]),
-                ordinal=cast(int, metadata["ordinal"]),
+        except (KeyError, TypeError, ValueError):
+            return GenerationVerificationReason.METADATA_MISMATCH
+        if (
+            evidence_corpus != manifest.corpus
+            or EvidenceChunk.canonical_generation_id(
+                reference,
+                evidence_corpus,
+                manifest.content_hash,
+            )
+            != manifest.generation_id
+        ):
+            return GenerationVerificationReason.METADATA_MISMATCH
+        try:
+            expected_chunk_id = EvidenceChunk.canonical_chunk_id(
+                reference,
+                evidence_corpus,
+                manifest.content_hash,
+                ordinal,
                 text=data,
             )
-        except (KeyError, TypeError, ValueError):
-            return False
-        return bool(
-            evidence.chunk_id == point_id
-            and evidence.chunk_id
-            == EvidenceChunk.canonical_chunk_id(
-                evidence.reference,
-                evidence.corpus,
-                evidence.content_hash,
-                evidence.ordinal,
-                text=evidence.text,
-            )
-            and evidence.evidence_digest == metadata.get("evidence_digest")
-            and evidence.corpus == manifest.corpus
-        )
+            evidence_digest = EvidenceChunk.canonical_evidence_digest(reference, data)
+        except ValueError:
+            return GenerationVerificationReason.DATA_MISMATCH
+        if expected_chunk_id != point_id or evidence_digest != metadata.get("evidence_digest"):
+            return GenerationVerificationReason.DATA_MISMATCH
+        if not cls._record_integrity_matches(point_id, metadata, data):
+            return GenerationVerificationReason.INTEGRITY_MISMATCH
+        return None
 
     @staticmethod
-    def _decode_fetch(
+    def _decode_inspection_fetch(
         payload: object,
-    ) -> tuple[tuple[str, dict[str, object], str], ...] | None:
+        *,
+        maximum_records: int,
+    ) -> tuple[tuple[str, dict[str, object]], ...] | None:
         if not isinstance(payload, dict) or set(payload) != {"result"}:
             return None
         result = payload.get("result")
-        if not isinstance(result, list):
+        if not isinstance(result, list) or len(result) > maximum_records:
             return None
-        decoded: list[tuple[str, dict[str, object], str]] = []
+        decoded: list[tuple[str, dict[str, object]]] = []
         for item in result:
-            if not isinstance(item, dict):
+            if item is None:
+                continue
+            if not isinstance(item, dict) or set(item) != {"id", "metadata"}:
                 return None
             point_id = item.get("id")
             record_metadata = item.get("metadata")
-            data = item.get("data")
-            if (
-                not isinstance(point_id, str)
-                or not isinstance(record_metadata, dict)
-                or not isinstance(data, str)
-            ):
+            if not isinstance(point_id, str) or not isinstance(record_metadata, dict):
                 return None
-            decoded.append((point_id, dict(record_metadata), data))
+            decoded.append((point_id, dict(record_metadata)))
         return tuple(decoded)
 
     @staticmethod

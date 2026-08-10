@@ -17,6 +17,11 @@ from app.research.control import (
     GenerationStageRecord,
     GenerationState,
     IngestionCheckpoint,
+    IngestionRetryAttemptTwoClaim,
+    IngestionRetryAttemptTwoSnapshot,
+    IngestionRetryClaim,
+    IngestionRetryResult,
+    IngestionRetrySnapshot,
     ResearchControlUnavailableError,
     Reservation,
     ReservationState,
@@ -83,6 +88,33 @@ _CHECKPOINT_SCRIPT = (
     "elseif current~=ARGV[1] then return 0 end; "
     "redis.call('set',KEYS[1],ARGV[2]); return 1"
 )
+_CLAIM_RETRY_SCRIPT = (
+    "if redis.call('get',KEYS[1])~=ARGV[1] then return -1 end; "
+    "if redis.call('exists',KEYS[2])==1 or redis.call('exists',KEYS[3])==1 "
+    "then return 0 end; redis.call('set',KEYS[2],ARGV[2]); return 1"
+)
+_FINISH_RETRY_SCRIPT = (
+    "if redis.call('get',KEYS[1])~=ARGV[1] then return -1 end; "
+    "local current=redis.call('get',KEYS[2]); "
+    "if current==ARGV[2] then return 1 end; "
+    "if current then return -2 end; redis.call('set',KEYS[2],ARGV[2]); return 1"
+)
+_CLAIM_RETRY_ATTEMPT_TWO_SCRIPT = (
+    "if redis.call('get',KEYS[1])~=ARGV[1] then return -1 end; "
+    "if redis.call('get',KEYS[2])~=ARGV[2] then return -2 end; "
+    "if redis.call('get',KEYS[3])~=ARGV[3] then return -3 end; "
+    "if redis.call('exists',KEYS[4])==1 or redis.call('exists',KEYS[5])==1 "
+    "then return 0 end; redis.call('set',KEYS[4],ARGV[4]); return 1"
+)
+_FINISH_RETRY_ATTEMPT_TWO_SCRIPT = (
+    "if redis.call('get',KEYS[1])~=ARGV[1] then return -1 end; "
+    "if redis.call('get',KEYS[2])~=ARGV[2] then return -2 end; "
+    "if redis.call('get',KEYS[3])~=ARGV[3] then return -3 end; "
+    "if redis.call('get',KEYS[4])~=ARGV[4] then return -4 end; "
+    "local current=redis.call('get',KEYS[5]); "
+    "if current==ARGV[5] then return 1 end; "
+    "if current then return 0 end; redis.call('set',KEYS[5],ARGV[5]); return 1"
+)
 _AUTHORIZE_RESERVATION_SCRIPT = (
     "if redis.call('exists',KEYS[1])==1 then return 0 end; "
     "local current=tonumber(redis.call('get',KEYS[2]) or '0'); "
@@ -112,32 +144,42 @@ _MAX_RESPONSE_BYTES = 1_048_576
 _GENERATION_ID = re.compile(r"^gen-([0-9a-f]{64})$")
 _SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,31}$")
 _ACCESSION = re.compile(r"^\d{10}-\d{2}-\d{6}$")
+_UPSTASH_REST_HOST = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+upstash\.io$")
+_SAFE_TEST_HOST = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.example$")
 
 
 def _raise_unavailable() -> NoReturn:
     raise ResearchControlUnavailableError("research control plane is unavailable")
 
 
-def _safe_endpoint(endpoint: object) -> str:
-    if not isinstance(endpoint, str) or not endpoint:
-        raise ValueError("research control endpoint is invalid")
+def _safe_endpoint(endpoint: object, *, allow_test_endpoint: bool) -> str:
+    if not isinstance(endpoint, str):
+        raise ValueError("research control endpoint must be an approved HTTPS root")
+    normalized = endpoint.strip()
+    if not normalized or any(
+        ord(character) < 32 or ord(character) == 127 for character in endpoint
+    ):
+        raise ValueError("research control endpoint must be an approved HTTPS root")
     try:
-        parsed = urlsplit(endpoint)
-    except (TypeError, ValueError):
-        raise ValueError("research control endpoint is invalid") from None
+        parsed = urlsplit(normalized)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("research control endpoint must be an approved HTTPS root") from None
+    hostname = parsed.hostname.lower() if parsed.hostname else ""
+    approved_host = _UPSTASH_REST_HOST.fullmatch(hostname) is not None
+    safe_test_host = allow_test_endpoint and _SAFE_TEST_HOST.fullmatch(hostname) is not None
     if not (
         parsed.scheme == "https"
-        and parsed.hostname
+        and (approved_host or safe_test_host)
         and parsed.username is None
         and parsed.password is None
-        and parsed.port is None
+        and port is None
         and parsed.query == ""
         and parsed.fragment == ""
         and parsed.path in {"", "/"}
-        and parsed.netloc == parsed.hostname
     ):
-        raise ValueError("research control endpoint must be a root HTTPS endpoint")
-    return endpoint.rstrip("/")
+        raise ValueError("research control endpoint must be an approved HTTPS root")
+    return f"https://{hostname}"
 
 
 def _positive_seconds(value: object, name: str) -> int:
@@ -203,7 +245,10 @@ class RedisResearchControl:
         client: httpx.AsyncClient | None = None,
         timeout_seconds: float = 3.0,
     ) -> None:
-        self._endpoint = _safe_endpoint(endpoint)
+        allow_test_endpoint = client is not None and isinstance(
+            getattr(client, "_transport", None), httpx.MockTransport
+        )
+        self._endpoint = _safe_endpoint(endpoint, allow_test_endpoint=allow_test_endpoint)
         if not isinstance(token, SecretStr):
             raise TypeError("research control token must be SecretStr")
         if not token.get_secret_value():
@@ -262,6 +307,7 @@ class RedisResearchControl:
                     },
                     json=command,
                     timeout=timeout,
+                    follow_redirects=False,
                 ) as response:
                     if 200 <= response.status_code < 300:
                         received = 0
@@ -337,6 +383,24 @@ class RedisResearchControl:
     @staticmethod
     def _checkpoint_key(job_digest: str) -> str:
         return f"{_KEY_PREFIX}:checkpoint:{require_public_digest(job_digest)}"
+
+    @staticmethod
+    def _retry_claim_key(job_digest: str) -> str:
+        return f"{_KEY_PREFIX}:checkpoint-retry:{require_public_digest(job_digest)}"
+
+    @staticmethod
+    def _retry_result_key(job_digest: str) -> str:
+        return f"{_KEY_PREFIX}:checkpoint-retry-result:{require_public_digest(job_digest)}"
+
+    @staticmethod
+    def _retry_attempt_two_claim_key(job_digest: str) -> str:
+        return f"{_KEY_PREFIX}:checkpoint-retry-attempt-2:{require_public_digest(job_digest)}"
+
+    @staticmethod
+    def _retry_attempt_two_result_key(job_digest: str) -> str:
+        return (
+            f"{_KEY_PREFIX}:checkpoint-retry-attempt-2-result:{require_public_digest(job_digest)}"
+        )
 
     @staticmethod
     def _reservation_key(reservation_digest: str) -> str:
@@ -611,6 +675,24 @@ class RedisResearchControl:
             _raise_unavailable()
         return record.manifest
 
+    async def get_generation_stage(
+        self,
+        *,
+        manifest: GenerationManifest,
+        deadline: RequestDeadline,
+    ) -> GenerationStageRecord | None:
+        accession_digest = _accession_digest(manifest)
+        raw = await self._command(
+            ["GET", self._generation_key(accession_digest, manifest.generation_id)],
+            deadline=deadline,
+        )
+        if raw is None:
+            return None
+        record = self._parse_stage(raw)
+        if record.manifest != manifest:
+            _raise_unavailable()
+        return record
+
     async def list_active_generations(
         self,
         *,
@@ -842,6 +924,177 @@ class RedisResearchControl:
         if failed or checkpoint is None or checkpoint.job_digest != job_digest:
             _raise_unavailable()
         return checkpoint
+
+    async def load_retry_snapshot(
+        self, *, job_digest: str, deadline: RequestDeadline
+    ) -> IngestionRetrySnapshot:
+        checked = require_public_digest(job_digest, "job digest")
+        raw = await self._command(
+            [
+                "MGET",
+                self._checkpoint_key(checked),
+                self._retry_claim_key(checked),
+                self._retry_result_key(checked),
+            ],
+            deadline=deadline,
+        )
+        if not isinstance(raw, list) or len(raw) != 3:
+            _raise_unavailable()
+        try:
+            checkpoint = None if raw[0] is None else IngestionCheckpoint.from_json(raw[0])
+            claim = None if raw[1] is None else IngestionRetryClaim.from_json(raw[1])
+            result = None if raw[2] is None else IngestionRetryResult.from_json(raw[2])
+            snapshot = IngestionRetrySnapshot(checkpoint, claim, result)
+        except ValueError:
+            _raise_unavailable()
+        if any(item.job_digest != checked for item in (checkpoint, claim, result) if item):
+            _raise_unavailable()
+        return snapshot
+
+    async def claim_failed_retry(
+        self,
+        *,
+        checkpoint: IngestionCheckpoint,
+        claim: IngestionRetryClaim,
+        deadline: RequestDeadline,
+    ) -> bool:
+        if checkpoint.job_digest != claim.job_digest:
+            raise ValueError("retry claim and checkpoint job digests must match")
+        result = await self._command(
+            [
+                "EVAL",
+                _CLAIM_RETRY_SCRIPT,
+                3,
+                self._checkpoint_key(claim.job_digest),
+                self._retry_claim_key(claim.job_digest),
+                self._retry_result_key(claim.job_digest),
+                checkpoint.to_json(),
+                claim.to_json(),
+            ],
+            deadline=deadline,
+        )
+        return self._cas_result(result)
+
+    async def finish_failed_retry(
+        self,
+        *,
+        claim: IngestionRetryClaim,
+        result: IngestionRetryResult,
+        deadline: RequestDeadline,
+    ) -> bool:
+        if claim.job_digest != result.job_digest or claim.attempt_digest != result.attempt_digest:
+            raise ValueError("retry claim and result do not match")
+        saved = await self._command(
+            [
+                "EVAL",
+                _FINISH_RETRY_SCRIPT,
+                2,
+                self._retry_claim_key(claim.job_digest),
+                self._retry_result_key(claim.job_digest),
+                claim.to_json(),
+                result.to_json(),
+            ],
+            deadline=deadline,
+        )
+        return self._cas_result(saved)
+
+    async def load_retry_attempt_two_snapshot(
+        self, *, job_digest: str, deadline: RequestDeadline
+    ) -> IngestionRetryAttemptTwoSnapshot:
+        checked = require_public_digest(job_digest, "job digest")
+        raw = await self._command(
+            [
+                "MGET",
+                self._checkpoint_key(checked),
+                self._retry_claim_key(checked),
+                self._retry_result_key(checked),
+                self._retry_attempt_two_claim_key(checked),
+                self._retry_attempt_two_result_key(checked),
+            ],
+            deadline=deadline,
+        )
+        if not isinstance(raw, list) or len(raw) != 5:
+            _raise_unavailable()
+        try:
+            checkpoint = None if raw[0] is None else IngestionCheckpoint.from_json(raw[0])
+            first_claim = None if raw[1] is None else IngestionRetryClaim.from_json(raw[1])
+            first_result = None if raw[2] is None else IngestionRetryResult.from_json(raw[2])
+            claim = None if raw[3] is None else IngestionRetryAttemptTwoClaim.from_json(raw[3])
+            result = None if raw[4] is None else IngestionRetryResult.from_json(raw[4])
+            if checkpoint is None or first_claim is None or first_result is None:
+                raise ValueError("attempt-two snapshot is missing its legacy records")
+            snapshot = IngestionRetryAttemptTwoSnapshot(
+                checkpoint,
+                first_claim,
+                first_result,
+                claim,
+                result,
+            )
+        except ValueError:
+            _raise_unavailable()
+        if snapshot.checkpoint.job_digest != checked:
+            _raise_unavailable()
+        return snapshot
+
+    async def claim_failed_retry_attempt_two(
+        self,
+        *,
+        checkpoint: IngestionCheckpoint,
+        first_claim: IngestionRetryClaim,
+        first_result: IngestionRetryResult,
+        claim: IngestionRetryAttemptTwoClaim,
+        deadline: RequestDeadline,
+    ) -> bool:
+        IngestionRetryAttemptTwoSnapshot(checkpoint, first_claim, first_result, claim, None)
+        saved = await self._command(
+            [
+                "EVAL",
+                _CLAIM_RETRY_ATTEMPT_TWO_SCRIPT,
+                5,
+                self._checkpoint_key(claim.job_digest),
+                self._retry_claim_key(claim.job_digest),
+                self._retry_result_key(claim.job_digest),
+                self._retry_attempt_two_claim_key(claim.job_digest),
+                self._retry_attempt_two_result_key(claim.job_digest),
+                checkpoint.to_json(),
+                first_claim.to_json(),
+                first_result.to_json(),
+                claim.to_json(),
+            ],
+            deadline=deadline,
+        )
+        return self._cas_result(saved)
+
+    async def finish_failed_retry_attempt_two(
+        self,
+        *,
+        checkpoint: IngestionCheckpoint,
+        first_claim: IngestionRetryClaim,
+        first_result: IngestionRetryResult,
+        claim: IngestionRetryAttemptTwoClaim,
+        result: IngestionRetryResult,
+        deadline: RequestDeadline,
+    ) -> bool:
+        IngestionRetryAttemptTwoSnapshot(checkpoint, first_claim, first_result, claim, result)
+        saved = await self._command(
+            [
+                "EVAL",
+                _FINISH_RETRY_ATTEMPT_TWO_SCRIPT,
+                5,
+                self._checkpoint_key(claim.job_digest),
+                self._retry_claim_key(claim.job_digest),
+                self._retry_result_key(claim.job_digest),
+                self._retry_attempt_two_claim_key(claim.job_digest),
+                self._retry_attempt_two_result_key(claim.job_digest),
+                checkpoint.to_json(),
+                first_claim.to_json(),
+                first_result.to_json(),
+                claim.to_json(),
+                result.to_json(),
+            ],
+            deadline=deadline,
+        )
+        return self._cas_result(saved)
 
     async def authorize_reservation(
         self,

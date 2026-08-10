@@ -5,17 +5,33 @@ import asyncio
 import importlib
 import json
 import math
+import os
+import sys
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import date
 from typing import Protocol, cast
 
 from app.config import Settings, get_settings
-from app.research.control import IngestionCheckpoint
+from app.research.control import (
+    IngestionCheckpoint,
+    IngestionFailureStage,
+    IngestionRetryAttemptTwoClaim,
+    IngestionRetryAttemptTwoSnapshot,
+    IngestionRetryClaim,
+    IngestionRetryResult,
+    IngestionRetrySnapshot,
+    IngestionStageError,
+)
 from app.research.deadline import RequestDeadline
+from app.research.domain import GenerationVerificationOutcome
 from app.research.ingestion import (
     IngestionCheckpointStore,
+    ResearchIngestionRecoveryState,
     ResearchIngestionRequest,
+    ResearchIngestionRetryError,
+    RetryAttemptTwoCheckpointSnapshot,
+    RetryCheckpointSnapshot,
 )
 
 EXIT_SUCCESS = 0
@@ -82,6 +98,23 @@ class ResultLike(Protocol):
     skipped_count: int
 
 
+def _verification_payload(
+    diagnostic: GenerationVerificationOutcome,
+) -> dict[str, int | str]:
+    if (
+        not isinstance(diagnostic, GenerationVerificationOutcome)
+        or diagnostic.verification is not None
+    ):
+        raise ValueError("vector verification diagnostic is invalid")
+    return {
+        "attempt_count": diagnostic.attempt_count,
+        "expected_point_count": diagnostic.expected_point_count,
+        "null_point_count": diagnostic.null_point_count,
+        "observed_point_count": diagnostic.observed_point_count,
+        "reason": diagnostic.reason.value,
+    }
+
+
 class ControlCheckpointBackend(Protocol):
     async def load_checkpoint(
         self,
@@ -95,6 +128,57 @@ class ControlCheckpointBackend(Protocol):
         *,
         checkpoint: IngestionCheckpoint,
         expected_previous: IngestionCheckpoint | None,
+        deadline: RequestDeadline,
+    ) -> bool: ...
+
+    async def load_retry_snapshot(
+        self,
+        *,
+        job_digest: str,
+        deadline: RequestDeadline,
+    ) -> IngestionRetrySnapshot: ...
+
+    async def claim_failed_retry(
+        self,
+        *,
+        checkpoint: IngestionCheckpoint,
+        claim: IngestionRetryClaim,
+        deadline: RequestDeadline,
+    ) -> bool: ...
+
+    async def finish_failed_retry(
+        self,
+        *,
+        claim: IngestionRetryClaim,
+        result: IngestionRetryResult,
+        deadline: RequestDeadline,
+    ) -> bool: ...
+
+    async def load_retry_attempt_two_snapshot(
+        self,
+        *,
+        job_digest: str,
+        deadline: RequestDeadline,
+    ) -> IngestionRetryAttemptTwoSnapshot: ...
+
+    async def claim_failed_retry_attempt_two(
+        self,
+        *,
+        checkpoint: IngestionCheckpoint,
+        first_claim: IngestionRetryClaim,
+        first_result: IngestionRetryResult,
+        claim: IngestionRetryAttemptTwoClaim,
+        deadline: RequestDeadline,
+    ) -> bool: ...
+
+    async def finish_failed_retry_attempt_two(
+        self,
+        *,
+        checkpoint: IngestionCheckpoint,
+        first_claim: IngestionRetryClaim,
+        first_result: IngestionRetryResult,
+        claim: IngestionRetryAttemptTwoClaim,
+        result: IngestionRetryResult,
         deadline: RequestDeadline,
     ) -> bool: ...
 
@@ -161,8 +245,139 @@ class ControlCheckpointStore:
             deadline=deadline,
         )
         if not saved:
-            raise RuntimeError("research ingestion checkpoint conflict")
+            raise ResearchIngestionRetryError()
         self._previous[record.job_digest] = checkpoint
+
+    async def load_retry_snapshot(
+        self,
+        job_digest: str,
+        *,
+        deadline: RequestDeadline,
+    ) -> RetryCheckpointSnapshot:
+        snapshot = await self._control.load_retry_snapshot(
+            job_digest=job_digest,
+            deadline=deadline,
+        )
+        checkpoint = snapshot.checkpoint
+        record = (
+            None
+            if checkpoint is None
+            else IngestionCheckpointStore.Record(
+                job_digest=checkpoint.job_digest,
+                cursor_digest=checkpoint.cursor_digest,
+                processed_count=checkpoint.processed_count,
+                failed_count=checkpoint.failed_count,
+                complete=checkpoint.complete,
+            )
+        )
+        return RetryCheckpointSnapshot(record, snapshot.claim, snapshot.result)
+
+    async def claim_failed_retry(
+        self,
+        checkpoint: IngestionCheckpointStore.Record,
+        claim: IngestionRetryClaim,
+        *,
+        deadline: RequestDeadline,
+    ) -> bool:
+        baseline = IngestionCheckpoint(
+            job_digest=checkpoint.job_digest,
+            cursor_digest=checkpoint.cursor_digest,
+            processed_count=checkpoint.processed_count,
+            failed_count=checkpoint.failed_count,
+            complete=checkpoint.complete,
+        )
+        return await self._control.claim_failed_retry(
+            checkpoint=baseline,
+            claim=claim,
+            deadline=deadline,
+        )
+
+    async def finish_failed_retry(
+        self,
+        claim: IngestionRetryClaim,
+        result: IngestionRetryResult,
+        *,
+        deadline: RequestDeadline,
+    ) -> bool:
+        return await self._control.finish_failed_retry(
+            claim=claim,
+            result=result,
+            deadline=deadline,
+        )
+
+    async def load_retry_attempt_two_snapshot(
+        self,
+        job_digest: str,
+        *,
+        deadline: RequestDeadline,
+    ) -> RetryAttemptTwoCheckpointSnapshot:
+        snapshot = await self._control.load_retry_attempt_two_snapshot(
+            job_digest=job_digest,
+            deadline=deadline,
+        )
+        checkpoint = snapshot.checkpoint
+        record = IngestionCheckpointStore.Record(
+            job_digest=checkpoint.job_digest,
+            cursor_digest=checkpoint.cursor_digest,
+            processed_count=checkpoint.processed_count,
+            failed_count=checkpoint.failed_count,
+            complete=checkpoint.complete,
+        )
+        return RetryAttemptTwoCheckpointSnapshot(
+            checkpoint=record,
+            first_claim=snapshot.first_claim,
+            first_result=snapshot.first_result,
+            claim=snapshot.claim,
+            result=snapshot.result,
+        )
+
+    @staticmethod
+    def _control_checkpoint(
+        record: IngestionCheckpointStore.Record,
+    ) -> IngestionCheckpoint:
+        return IngestionCheckpoint(
+            job_digest=record.job_digest,
+            cursor_digest=record.cursor_digest,
+            processed_count=record.processed_count,
+            failed_count=record.failed_count,
+            complete=record.complete,
+        )
+
+    async def claim_failed_retry_attempt_two(
+        self,
+        checkpoint: IngestionCheckpointStore.Record,
+        first_claim: IngestionRetryClaim,
+        first_result: IngestionRetryResult,
+        claim: IngestionRetryAttemptTwoClaim,
+        *,
+        deadline: RequestDeadline,
+    ) -> bool:
+        return await self._control.claim_failed_retry_attempt_two(
+            checkpoint=self._control_checkpoint(checkpoint),
+            first_claim=first_claim,
+            first_result=first_result,
+            claim=claim,
+            deadline=deadline,
+        )
+
+    async def finish_failed_retry_attempt_two(
+        self,
+        checkpoint: IngestionCheckpointStore.Record,
+        first_claim: IngestionRetryClaim,
+        first_result: IngestionRetryResult,
+        claim: IngestionRetryAttemptTwoClaim,
+        result: IngestionRetryResult,
+        *,
+        deadline: RequestDeadline,
+    ) -> bool:
+        return await self._control.finish_failed_retry_attempt_two(
+            checkpoint=self._control_checkpoint(checkpoint),
+            first_claim=first_claim,
+            first_result=first_result,
+            claim=claim,
+            result=result,
+            deadline=deadline,
+        )
 
 
 def parse_iso_date(value: str) -> date:
@@ -182,6 +397,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--to", dest="date_to", required=True)
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--apply", action="store_true")
+    retries = parser.add_mutually_exclusive_group()
+    retries.add_argument("--retry-failed", action="store_true")
+    retries.add_argument("--retry-failed-attempt-two", metavar="JOB_DIGEST")
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
     return parser
 
@@ -195,6 +413,13 @@ def _request_from_args(args: argparse.Namespace) -> ResearchIngestionRequest:
         date_to=parse_iso_date(args.date_to),
         limit=args.limit,
         apply=bool(args.apply),
+        retry_failed=bool(args.retry_failed),
+        retry_failed_attempt_two=args.retry_failed_attempt_two,
+        retry_failed_attempt_two_authorization=(
+            os.environ.get("RESEARCH_RETRY_ATTEMPT_TWO_AUTHORIZATION")
+            if args.retry_failed_attempt_two is not None
+            else None
+        ),
     )
 
 
@@ -306,28 +531,52 @@ async def _default_runner_factory(config: RunnerConfig) -> OwnedResearchIngestio
 
 
 def _result_payload(result: ResultLike) -> dict[str, object]:
-    return {
+    recovery_state = getattr(
+        result,
+        "recovery_state",
+        ResearchIngestionRecoveryState.NOT_REQUESTED,
+    )
+    if not isinstance(recovery_state, ResearchIngestionRecoveryState):
+        recovery_state = ResearchIngestionRecoveryState.NOT_REQUESTED
+    payload: dict[str, object] = {
         "applied": not result.dry_run,
         "dry_run": result.dry_run,
         "errors": list(result.errors),
+        "failure_stages": [item.value for item in getattr(result, "failure_stages", ())],
         "failed_count": result.failed_count,
         "inserted_count": result.inserted_count,
         "job_id": result.opaque_job_id,
         "planned_count": result.planned_count,
         "processed_count": result.processed_count,
         "removed_count": result.removed_count,
+        "recovery_state": recovery_state.value,
         "skipped_count": result.skipped_count,
     }
+    diagnostics = tuple(getattr(result, "vector_verification_failures", ()))
+    if diagnostics:
+        payload["vector_verification_failures"] = [
+            _verification_payload(item) for item in diagnostics
+        ]
+    return payload
 
 
 def _failure_category(error: Exception) -> str:
     name = type(error).__name__
-    message = str(error).lower()
+    if isinstance(error, ResearchIngestionRetryError):
+        return "lock_recovery"
+    if isinstance(error, IngestionStageError):
+        if error.stage in {
+            IngestionFailureStage.REDIS_PUBLICATION,
+            IngestionFailureStage.CLEANUP,
+            IngestionFailureStage.CHECKPOINTING,
+        }:
+            return "lock_recovery"
+        return "provider"
     if isinstance(error, TimeoutError):
         return "timeout"
     if isinstance(error, ValueError):
         return "configuration"
-    if "checkpoint" in message or "control" in name.lower() or "lock" in message:
+    if "control" in name.lower():
         return "lock_recovery"
     if (
         "provider" in name.lower()
@@ -348,12 +597,18 @@ def _failure_exit_code(category: str) -> int:
     }.get(category, EXIT_UNEXPECTED)
 
 
-def _failure_payload(request: ResearchIngestionRequest, category: str) -> dict[str, object]:
-    return {
+def _failure_payload(
+    request: ResearchIngestionRequest,
+    category: str,
+    failure_stage: IngestionFailureStage | None = None,
+    verification: GenerationVerificationOutcome | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
         "applied": bool(request.apply),
         "dry_run": not request.apply,
         "error_category": category,
         "errors": [f"research ingestion {category} failure"],
+        "failure_stages": [] if failure_stage is None else [failure_stage.value],
         "failed_count": 1,
         "inserted_count": 0,
         "job_id": None,
@@ -362,6 +617,9 @@ def _failure_payload(request: ResearchIngestionRequest, category: str) -> dict[s
         "removed_count": 0,
         "skipped_count": 0,
     }
+    if verification is not None:
+        payload["vector_verification_failures"] = [_verification_payload(verification)]
+    return payload
 
 
 async def async_main(
@@ -370,7 +628,15 @@ async def async_main(
     runner_factory: object | None = None,
 ) -> int:
     parser = _parser()
-    args = parser.parse_args(argv)
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if any(
+        item == "--retry-failed-attempt-two-authorization"
+        or item.startswith("--retry-failed-attempt-two-authorization=")
+        for item in raw_args
+    ):
+        raw_args = []
+        parser.error("attempt-two authorization must use the operator environment")
+    args = parser.parse_args(raw_args)
     try:
         request = _request_from_args(args)
     except ValueError as error:
@@ -403,7 +669,14 @@ async def async_main(
             )
     except Exception as error:
         category = _failure_category(error)
-        print(json.dumps(_failure_payload(request, category), sort_keys=True))
+        failure_stage = error.stage if isinstance(error, IngestionStageError) else None
+        verification = error.verification if isinstance(error, IngestionStageError) else None
+        print(
+            json.dumps(
+                _failure_payload(request, category, failure_stage, verification),
+                sort_keys=True,
+            )
+        )
         return _failure_exit_code(category)
     payload = _result_payload(result)
     print(json.dumps(payload, sort_keys=True))

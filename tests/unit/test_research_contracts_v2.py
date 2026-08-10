@@ -9,6 +9,7 @@ import pytest
 from app.research.deadline import RequestDeadline
 from app.research.domain import (
     CorpusDescriptor,
+    EmbeddedChunk,
     EmbeddingDescriptor,
     EmbeddingVector,
     EvidenceChunk,
@@ -17,7 +18,16 @@ from app.research.domain import (
     FilingDiscoveryRequest,
     FilingDocument,
     FilingReference,
+    GenerationManifest,
+    GenerationVerification,
+    GenerationVerificationOutcome,
+    GenerationVerificationReason,
     RawFiling,
+)
+from app.research.memory import InMemoryResearchControlPlane, InMemoryVectorStore
+from app.research.ports import (
+    GenerationInspection,
+    GenerationInspectionState,
 )
 
 
@@ -174,3 +184,213 @@ def test_request_deadline_caps_children_and_fails_when_expired() -> None:
     assert deadline.remaining_seconds() == 0.0
     with pytest.raises(TimeoutError, match="deadline"):
         deadline.raise_if_expired()
+
+
+def test_generation_inspection_is_immutable_and_contains_only_safe_aggregate_state() -> None:
+    inspection = GenerationInspection(
+        state=GenerationInspectionState.PARTIAL,
+        expected_point_count=128,
+        observed_point_count=96,
+    )
+
+    assert inspection.state is GenerationInspectionState.PARTIAL
+    assert inspection.expected_point_count == 128
+    assert inspection.observed_point_count == 96
+    assert not hasattr(inspection, "point_ids")
+    assert not hasattr(inspection, "vectors")
+    assert not hasattr(inspection, "data")
+    with pytest.raises(FrozenInstanceError):
+        inspection.observed_point_count = 128  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("state", "expected", "observed"),
+    [
+        (GenerationInspectionState.ABSENT, 2, 1),
+        (GenerationInspectionState.EXACT, 2, 1),
+        (GenerationInspectionState.PARTIAL, 2, 0),
+        (GenerationInspectionState.PARTIAL, 2, 2),
+    ],
+)
+def test_generation_inspection_rejects_impossible_state_counts(
+    state: GenerationInspectionState,
+    expected: int,
+    observed: int,
+) -> None:
+    with pytest.raises(ValueError, match="inspection"):
+        GenerationInspection(
+            state=state,
+            expected_point_count=expected,
+            observed_point_count=observed,
+        )
+
+
+def test_generation_verification_outcome_is_immutable_and_sanitized() -> None:
+    filing_manifest, _ = _inspection_fixture()
+    verified = GenerationVerificationOutcome.verified(
+        verification=GenerationVerification.from_point_ids(
+            filing_manifest.generation_id,
+            filing_manifest.chunk_ids,
+        ),
+        expected_point_count=2,
+    )
+    missing = GenerationVerificationOutcome.failed(
+        reason=GenerationVerificationReason.PARTIAL_VISIBILITY,
+        expected_point_count=2,
+        observed_point_count=1,
+        null_point_count=1,
+        attempt_count=4,
+    )
+
+    assert verified.reason is GenerationVerificationReason.VERIFIED
+    assert verified.proves(filing_manifest)
+    reordered = GenerationVerification.from_point_ids(
+        filing_manifest.generation_id,
+        tuple(reversed(filing_manifest.chunk_ids)),
+    )
+    assert not reordered.proves(filing_manifest)
+    assert missing.reason is GenerationVerificationReason.PARTIAL_VISIBILITY
+    assert missing.expected_point_count == 2
+    assert missing.observed_point_count == 1
+    assert missing.null_point_count == 1
+    assert missing.attempt_count == 4
+    assert not missing.proves(filing_manifest)
+    assert "point_ids_hash" not in repr(verified)
+    assert not hasattr(missing, "point_ids")
+    assert not hasattr(missing, "vectors")
+    assert not hasattr(missing, "data")
+    with pytest.raises(FrozenInstanceError):
+        missing.observed_point_count = 2  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected", "observed", "nulls"),
+    [
+        (GenerationVerificationReason.VERIFIED, 2, 2, 0),
+        (GenerationVerificationReason.MISSING_POINTS, 2, 1, 0),
+        (GenerationVerificationReason.PARTIAL_VISIBILITY, 2, 0, 2),
+        (GenerationVerificationReason.PARTIAL_VISIBILITY, 2, 2, 0),
+        (GenerationVerificationReason.ORDERING_MISMATCH, 2, 3, 0),
+    ],
+)
+def test_generation_verification_outcome_rejects_impossible_counts(
+    reason: GenerationVerificationReason,
+    expected: int,
+    observed: int,
+    nulls: int,
+) -> None:
+    with pytest.raises(ValueError, match="verification outcome"):
+        GenerationVerificationOutcome(
+            reason=reason,
+            expected_point_count=expected,
+            observed_point_count=observed,
+            null_point_count=nulls,
+            attempt_count=1,
+        )
+
+
+@pytest.mark.parametrize("attempt_count", [0, 5, True])
+def test_generation_verification_outcome_rejects_invalid_attempt_count(
+    attempt_count: object,
+) -> None:
+    with pytest.raises(ValueError, match="attempt count"):
+        GenerationVerificationOutcome.failed(
+            reason=GenerationVerificationReason.MISSING_POINTS,
+            expected_point_count=2,
+            observed_point_count=0,
+            null_point_count=2,
+            attempt_count=attempt_count,  # type: ignore[arg-type]
+        )
+
+
+def _inspection_fixture() -> tuple[GenerationManifest, tuple[EmbeddedChunk, ...]]:
+    configured = corpus()
+    evidence = tuple(
+        EvidenceChunk.from_document(
+            document(),
+            corpus=configured,
+            ordinal=ordinal,
+            text=text,
+        )
+        for ordinal, text in enumerate(("First disclosure.", "Second disclosure."))
+    )
+    chunks = tuple(
+        EmbeddedChunk(
+            evidence=item,
+            embedding=EmbeddingVector(
+                descriptor=configured.embedding,
+                values=(1.0, 0.0) if index == 0 else (0.0, 1.0),
+            ),
+        )
+        for index, item in enumerate(evidence)
+    )
+    first = evidence[0]
+    return (
+        GenerationManifest(
+            corpus=configured,
+            symbol=first.symbol,
+            accession_number=first.accession_number,
+            generation_id=first.generation_id,
+            content_hash=first.content_hash,
+            chunk_ids=tuple(item.chunk_id for item in evidence),
+        ),
+        chunks,
+    )
+
+
+@pytest.mark.asyncio
+async def test_in_memory_vector_inspection_distinguishes_absent_exact_and_partial() -> None:
+    filing_manifest, chunks = _inspection_fixture()
+    vector_store = InMemoryVectorStore()
+    deadline = RequestDeadline.after(1)
+
+    absent = await vector_store.inspect_generation(filing_manifest, deadline=deadline)
+    await vector_store.stage_generation(filing_manifest, chunks, deadline=deadline)
+    exact = await vector_store.inspect_generation(filing_manifest, deadline=deadline)
+    vector_store._generations = ((filing_manifest, chunks[:1]),)
+    partial = await vector_store.inspect_generation(filing_manifest, deadline=deadline)
+
+    assert absent.state is GenerationInspectionState.ABSENT
+    assert exact.state is GenerationInspectionState.EXACT
+    assert partial.state is GenerationInspectionState.PARTIAL
+    assert partial.observed_point_count == 1
+
+
+@pytest.mark.asyncio
+async def test_in_memory_vector_inspection_fails_closed_for_inconsistent_state() -> None:
+    filing_manifest, chunks = _inspection_fixture()
+    vector_store = InMemoryVectorStore()
+    vector_store._generations = ((filing_manifest, (chunks[1], chunks[0])),)
+
+    inspection = await vector_store.inspect_generation(
+        filing_manifest,
+        deadline=RequestDeadline.after(1),
+    )
+
+    assert inspection.state is GenerationInspectionState.INCONSISTENT
+
+
+@pytest.mark.asyncio
+async def test_in_memory_control_reads_only_the_exact_generation_stage() -> None:
+    filing_manifest, _ = _inspection_fixture()
+    control = InMemoryResearchControlPlane()
+    deadline = RequestDeadline.after(1)
+    lease = await control.acquire_generation_lease(
+        manifest=filing_manifest,
+        owner_digest="a" * 64,
+        ttl_seconds=60,
+        deadline=deadline,
+    )
+    assert lease is not None
+    staged = await control.stage_generation(
+        lease=lease,
+        manifest=filing_manifest,
+        deadline=deadline,
+    )
+
+    observed = await control.get_generation_stage(
+        manifest=filing_manifest,
+        deadline=deadline,
+    )
+
+    assert observed == staged

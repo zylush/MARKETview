@@ -56,7 +56,11 @@ def _assert_secret_free_exception(error: BaseException) -> None:
             pending.append(current.__context__)
 
 
-def test_production_settings_fail_closed_when_security_values_are_missing() -> None:
+def test_production_settings_fail_closed_when_security_values_are_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MARKETDATA_TOKEN", raising=False)
+
     with pytest.raises(ValidationError, match="MARKETDATA_TOKEN"):
         Settings(environment="production", _env_file=None)
 
@@ -77,6 +81,9 @@ def test_vercel_markers_force_production_posture(
     monkeypatch: pytest.MonkeyPatch, marker: str, value: str
 ) -> None:
     monkeypatch.delenv("ENVIRONMENT", raising=False)
+    monkeypatch.delenv("MARKETDATA_TOKEN", raising=False)
+    monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.delenv("VERCEL_ENV", raising=False)
     monkeypatch.setenv(marker, value)
 
     with pytest.raises(ValidationError, match="MARKETDATA_TOKEN"):
@@ -108,6 +115,7 @@ def test_old_marketstack_only_configuration_is_not_an_alias(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.delenv("MARKETDATA_TOKEN", raising=False)
     monkeypatch.setenv("MARKETSTACK_API_KEY", "old-secret-must-not-appear")
     monkeypatch.setenv("MARKETSTACK_ACCESS_KEY", "old-legacy-secret-must-not-appear")
     for name, value in secure_production_values().items():
@@ -152,7 +160,13 @@ def test_non_text_tokens_are_rejected(invalid_token: object) -> None:
         Settings(marketdata_token=invalid_token, _env_file=None)
 
 
-def test_missing_token_is_allowed_only_in_explicit_local_environment() -> None:
+def test_missing_token_is_allowed_only_in_explicit_local_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MARKETDATA_TOKEN", raising=False)
+    monkeypatch.delenv("VERCEL", raising=False)
+    monkeypatch.delenv("VERCEL_ENV", raising=False)
+
     settings = Settings(environment="test", _env_file=None)
 
     assert settings.marketdata_token.get_secret_value() == ""
