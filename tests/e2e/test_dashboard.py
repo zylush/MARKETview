@@ -54,11 +54,17 @@ def test_inquiry_contact_is_available_on_login_and_dashboard(
     login_contact = page.get_by_role("link", name="paoloinigo30@gmail.com")
     assert login_contact.is_visible()
     assert login_contact.get_attribute("href") == "mailto:paoloinigo30@gmail.com"
+    assert page.get_by_text(
+        "Contact paoloinigo30@gmail.com for inquiries.", exact=True
+    ).is_visible()
 
     _sign_in(page, base_url, app_key)
     dashboard_contact = page.get_by_role("link", name="paoloinigo30@gmail.com")
     assert dashboard_contact.is_visible()
     assert dashboard_contact.get_attribute("href") == "mailto:paoloinigo30@gmail.com"
+    assert page.get_by_text(
+        "Contact paoloinigo30@gmail.com for inquiries.", exact=True
+    ).is_visible()
 
 
 def test_login_symbol_quote_history_usage_and_logout(

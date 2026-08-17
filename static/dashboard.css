@@ -173,11 +173,15 @@ tbody tr:hover { background: #f8fafc; }
 .research-metadata dd { margin: var(--space-1) 0 0; font-weight: 700; overflow-wrap: anywhere; }
 .research-result .research-result-disclaimer { margin-top: var(--space-3); color: var(--color-secondary); font-size: 0.8125rem; }
 .noscript-message { margin: 16px; padding: 12px; color: var(--color-error); background: var(--color-error-bg); }
+.app-footer { width: min(100%, 1440px); margin: 0 auto; padding: 0 16px 24px; }
+.inquiry-contact { margin: 0; color: var(--color-secondary); font-size: 0.8125rem; line-height: 1.5; text-align: center; overflow-wrap: anywhere; }
+.inquiry-contact a { color: var(--color-primary); font-weight: 700; }
 
 @media (min-width: 600px) {
   .header-inner { grid-template-columns: 1fr auto auto; padding-inline: 24px; }
   .header-context { display: flex; }
   .dashboard-shell { padding: 24px; }
+  .app-footer { padding-inline: 24px; }
   .search-section, .overview-section, .panel { padding: 20px; }
   .search-control { grid-template-columns: minmax(0, 1fr) auto; }
   .metric-grid { grid-template-columns: 1.3fr repeat(4, minmax(0, 1fr)); }

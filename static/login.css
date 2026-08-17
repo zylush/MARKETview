@@ -61,6 +61,8 @@ button { min-height: 46px; padding: 10px 18px; color: #fff; font: inherit; font-
 button:hover { background: #047857; border-color: #047857; }
 input:focus-visible, button:focus-visible, a:focus-visible { outline: 3px solid rgb(51 65 85 / 35%); outline-offset: 2px; }
 .form-alert { margin-bottom: 18px; padding: 12px; color: var(--color-error); background: var(--color-error-bg); border-left: 3px solid var(--color-error); line-height: 1.45; }
+.inquiry-contact { margin: 24px 0 0; padding-top: 18px; color: var(--color-secondary); border-top: 1px solid var(--color-border); font-size: 0.8125rem; line-height: 1.5; text-align: center; overflow-wrap: anywhere; }
+.inquiry-contact a { color: var(--color-primary); font-weight: 700; }
 
 @media (max-width: 420px) { .login-panel { padding: 24px 20px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; } }
