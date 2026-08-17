@@ -6,9 +6,13 @@ from app.cache.upstash import UpstashCache
 from app.config import Settings, get_settings
 from app.main import create_app
 from app.providers.marketdata import MarketDataAppProvider
+from app.providers.openai_market_analysis import OpenAIMarketAnalysis
 from app.services.dashboard import DashboardService
+from app.services.market_analysis import (
+    DisabledMarketAnalysisService,
+    MarketAnalysisService,
+)
 from app.services.market_data import MarketDataService
-from app.services.research import DisabledResearchService, build_research_runtime
 from app.services.symbols import SymbolSearchService
 
 
@@ -48,10 +52,24 @@ def _runtime_dependencies(settings: Settings | None = None) -> tuple[object, obj
         schema_version=settings.symbol_index_schema_version,
         directory_ttl_seconds=settings.symbol_directory_max_age_seconds,
     )
-    research = (
-        build_research_runtime(settings) if settings.research_enabled else DisabledResearchService()
-    )
-    service = DashboardService(market_data, symbols, research)
+    if settings.research_enabled:
+        if settings.openai_api_key is None:
+            raise RuntimeError("OPENAI_API_KEY is required for MarketView AI")
+        generator = OpenAIMarketAnalysis(
+            api_key=settings.openai_api_key,
+            model=settings.research_generation_model,
+            max_output_tokens=settings.research_generation_max_output_tokens,
+        )
+        market_analysis: MarketAnalysisService | DisabledMarketAnalysisService = (
+            MarketAnalysisService(
+                market_data,
+                generator,
+                timeout_seconds=min(7.5, settings.research_timeout_seconds),
+            )
+        )
+    else:
+        market_analysis = DisabledMarketAnalysisService()
+    service = DashboardService(market_data, symbols, market_analysis)
     return settings, service, cache
 
 

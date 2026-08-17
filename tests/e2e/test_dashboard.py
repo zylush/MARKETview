@@ -350,7 +350,7 @@ def test_symbol_autocomplete_renders_external_values_as_text_without_overflow(
     assert page.evaluate("window.autocompleteXss !== true")
 
 
-def test_research_panel_is_bounded_accessible_and_posts_with_csrf(
+def test_marketview_panel_is_bounded_accessible_posts_with_csrf_and_renders_metadata(
     page,
     base_url: str,
     app_key: str,
@@ -367,16 +367,41 @@ def test_research_panel_is_bounded_accessible_and_posts_with_csrf(
                 }
             )
 
+    def marketview_response(route) -> None:
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "success": True,
+                    "data": {
+                        "symbol": "AAPL",
+                        "status": "answered",
+                        "answer": "AAPL closed higher over the selected period.",
+                        "provider": "marketdata.app",
+                        "as_of": "2026-08-08T00:00:00Z",
+                        "period_start": "2026-07-09",
+                        "period_end": "2026-08-07",
+                        "evidence_count": 22,
+                        "disclaimer": "Informational only, not investment advice.",
+                    },
+                    "meta": {"request_id": "browser-fixture"},
+                    "error": None,
+                }
+            ),
+        )
+
+    page.route("**/api/v1/research/query", marketview_response)
     page.on("request", record_research)
     _sign_in(page, base_url, app_key)
     page.get_by_test_id("quote-summary").wait_for(state="visible")
 
     panel = page.get_by_test_id("research-panel")
-    question = page.get_by_label("Question about SEC filings")
+    question = page.get_by_label("Question about market data")
     submit = page.get_by_test_id("research-submit")
     counter = page.get_by_test_id("research-character-count")
 
-    assert panel.get_by_role("heading", name="Filing research").is_visible()
+    assert panel.get_by_role("heading", name="MarketView AI").is_visible()
     assert panel.get_by_text("Informational only, not investment advice.", exact=True).is_visible()
     assert question.get_attribute("maxlength") == "500"
     assert question.get_attribute("aria-describedby") == "research-help research-character-count"
@@ -384,15 +409,20 @@ def test_research_panel_is_bounded_accessible_and_posts_with_csrf(
     assert counter.text_content() == "0 / 500"
     assert submit.is_disabled()
 
-    prompt = "What risks did management identify?"
+    prompt = "How has the closing price changed recently?"
     question.fill(prompt)
     assert counter.text_content() == f"{len(prompt)} / 500"
     assert submit.is_enabled()
     submit.click()
 
-    panel.get_by_text("Apple identifies supply constraints as a risk.", exact=True).wait_for(
+    panel.get_by_text("AAPL closed higher over the selected period.", exact=True).wait_for(
         state="visible"
     )
+    assert panel.get_by_text("Answered", exact=True).is_visible()
+    assert panel.get_by_text("marketdata.app", exact=True).is_visible()
+    assert panel.get_by_text("Jul 9, 2026", exact=False).is_visible()
+    assert panel.get_by_text("Aug 7, 2026", exact=False).is_visible()
+    assert panel.get_by_text("22", exact=True).is_visible()
     assert page.evaluate("document.activeElement.id") == "research-result"
     assert research_requests == [
         {
@@ -409,27 +439,76 @@ def test_research_panel_is_bounded_accessible_and_posts_with_csrf(
     )
 
 
-def test_research_renders_success_insufficient_refused_timeout_and_unavailable_states(
+def test_marketview_renders_answered_insufficient_refused_timeout_and_unavailable_states(
     page,
     base_url: str,
     app_key: str,
 ) -> None:
+    def marketview_response(route) -> None:
+        question_text = route.request.post_data_json["question"].lower()
+        if "timeout" in question_text or "unavailable" in question_text:
+            timeout = "timeout" in question_text
+            route.fulfill(
+                status=504 if timeout else 503,
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "success": False,
+                        "data": None,
+                        "meta": {"request_id": "browser-fixture"},
+                        "error": {
+                            "code": "RESEARCH_TIMEOUT" if timeout else "RESEARCH_UNAVAILABLE",
+                            "message": "market analysis could not be completed",
+                        },
+                    }
+                ),
+            )
+            return
+        status = "answered"
+        answer = "AAPL gained 3.2% over the selected period."
+        if "missing" in question_text:
+            status = "insufficient_evidence"
+            answer = ""
+        elif "buy" in question_text:
+            status = "refused"
+            answer = ""
+        elif "unknown" in question_text:
+            status = "future_status"
+            answer = "THIS ANSWER MUST NOT RENDER"
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "success": True,
+                    "data": {
+                        "symbol": "AAPL",
+                        "status": status,
+                        "answer": answer,
+                        "provider": "marketdata.app",
+                        "as_of": "2026-08-08T00:00:00Z",
+                        "period_start": "2026-07-09",
+                        "period_end": "2026-08-07",
+                        "evidence_count": 22,
+                        "disclaimer": "Informational only, not investment advice.",
+                    },
+                    "error": None,
+                }
+            ),
+        )
+
+    page.route("**/api/v1/research/query", marketview_response)
     _sign_in(page, base_url, app_key)
     page.get_by_test_id("quote-summary").wait_for(state="visible")
     panel = page.get_by_test_id("research-panel")
-    question = page.get_by_label("Question about SEC filings")
+    question = page.get_by_label("Question about market data")
     submit = page.get_by_test_id("research-submit")
 
-    question.fill("What risks did management identify?")
+    question.fill("How has the closing price changed recently?")
     submit.click()
-    panel.get_by_text("Apple identifies supply constraints as a risk.", exact=True).wait_for(
+    panel.get_by_text("AAPL gained 3.2% over the selected period.", exact=True).wait_for(
         state="visible"
     )
-    citation = panel.get_by_role("link", name="Apple 2025 Form 10-K")
-    assert citation.get_attribute("href").startswith("https://www.sec.gov/Archives/edgar/data/")
-    assert citation.get_attribute("target") == "_blank"
-    assert citation.get_attribute("rel") == "noopener noreferrer"
-    assert panel.get_by_text("Filed Oct 31, 2025", exact=True).is_visible()
 
     question.fill("What evidence is missing?")
     submit.click()
@@ -441,43 +520,51 @@ def test_research_renders_success_insufficient_refused_timeout_and_unavailable_s
         "cannot provide personalized buy or sell recommendations", exact=False
     ).wait_for(state="visible")
 
-    def error_response(route) -> None:
-        body = route.request.post_data_json
-        timeout = "timeout" in body["question"].lower()
-        route.fulfill(
-            status=504 if timeout else 503,
-            content_type="application/json",
-            body=json.dumps(
-                {
-                    "success": False,
-                    "data": None,
-                    "meta": {"request_id": "browser-fixture"},
-                    "error": {
-                        "code": "RESEARCH_TIMEOUT" if timeout else "RESEARCH_UNAVAILABLE",
-                        "message": (
-                            "the research request timed out"
-                            if timeout
-                            else "research is not configured"
-                        ),
-                    },
-                }
-            ),
-        )
+    question.fill("Return an unknown status")
+    submit.click()
+    panel.get_by_text("Market analysis is temporarily unavailable.", exact=True).wait_for(
+        state="visible"
+    )
+    assert panel.get_by_text("THIS ANSWER MUST NOT RENDER", exact=True).count() == 0
 
-    page.route("**/api/v1/research/query", error_response)
     question.fill("Please timeout")
     submit.click()
-    panel.get_by_text("Research request timed out", exact=False).wait_for(state="visible")
+    panel.get_by_text("Market analysis timed out", exact=False).wait_for(state="visible")
     question.fill("Provider unavailable")
     submit.click()
-    panel.get_by_text("Research is temporarily unavailable", exact=False).wait_for(state="visible")
+    panel.get_by_text("Market analysis is temporarily unavailable", exact=False).wait_for(
+        state="visible"
+    )
 
 
-def test_research_cancel_and_symbol_change_abort_and_ignore_stale_completion(
+def test_marketview_cancel_and_symbol_change_abort_and_ignore_stale_completion(
     page,
     base_url: str,
     app_key: str,
 ) -> None:
+    def delayed_marketview_response(route) -> None:
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "success": True,
+                    "data": {
+                        "symbol": "AAPL",
+                        "status": "answered",
+                        "answer": "UNIQUE STALE AAPL ANALYSIS",
+                        "provider": "stale-provider",
+                        "as_of": "2026-08-08T00:00:00Z",
+                        "period_start": "2026-07-09",
+                        "period_end": "2026-08-07",
+                        "evidence_count": 22,
+                        "disclaimer": "Informational only, not investment advice.",
+                    },
+                    "error": None,
+                }
+            ),
+        )
+
     page.add_init_script(
         """
         const originalFetch = window.fetch.bind(window);
@@ -495,48 +582,94 @@ def test_research_cancel_and_symbol_change_abort_and_ignore_stale_completion(
         };
         """
     )
+    page.route("**/api/v1/research/query", delayed_marketview_response)
     _sign_in(page, base_url, app_key)
     page.get_by_test_id("quote-summary").wait_for(state="visible")
     panel = page.get_by_test_id("research-panel")
-    question = page.get_by_label("Question about SEC filings")
+    question = page.get_by_label("Question about market data")
     submit = page.get_by_test_id("research-submit")
     cancel = page.get_by_test_id("research-cancel")
 
-    question.fill("What risks did management identify?")
+    question.fill("How has the closing price changed recently?")
     submit.click()
-    panel.get_by_text("Searching SEC filings for AAPL", exact=False).wait_for(state="visible")
+    panel.get_by_text("Analyzing market data for AAPL", exact=False).wait_for(state="visible")
     assert submit.is_disabled()
     assert cancel.is_visible()
     cancel.click()
-    panel.get_by_text("Research request cancelled", exact=False).wait_for(state="visible")
+    panel.get_by_text("Analysis request cancelled", exact=False).wait_for(state="visible")
     assert page.evaluate("window.researchAbortCount") == 1
 
     submit.click()
-    panel.get_by_text("Searching SEC filings for AAPL", exact=False).wait_for(state="visible")
+    panel.get_by_text("Analyzing market data for AAPL", exact=False).wait_for(state="visible")
     question.press("Escape")
-    panel.get_by_text("Research request cancelled", exact=False).wait_for(state="visible")
+    panel.get_by_text("Analysis request cancelled", exact=False).wait_for(state="visible")
     assert page.evaluate("window.researchAbortCount") == 2
 
     submit.click()
-    panel.get_by_text("Searching SEC filings for AAPL", exact=False).wait_for(state="visible")
+    panel.get_by_text("Analyzing market data for AAPL", exact=False).wait_for(state="visible")
     search = page.get_by_test_id("ticker-search")
     search.fill("msft")
     search.press("Enter")
     page.locator("#company-symbol").get_by_text("MSFT", exact=True).wait_for(state="visible")
-    panel.get_by_text("Ask a question about MSFT", exact=False).wait_for(state="visible")
+    panel.get_by_text("Ask MarketView about MSFT", exact=False).wait_for(state="visible")
     page.wait_for_timeout(850)
     assert page.evaluate("window.researchAbortCount") >= 3
-    assert panel.get_by_text("Apple identifies supply constraints", exact=False).count() == 0
+    assert panel.get_by_text("UNIQUE STALE AAPL ANALYSIS", exact=True).count() == 0
+    assert panel.get_by_text("stale-provider", exact=True).count() == 0
     assert question.input_value() == ""
 
 
-def test_research_escapes_content_rejects_malicious_citations_and_fits_375px(
+def test_marketview_renders_partial_market_analysis_metadata(
+    page,
+    base_url: str,
+    app_key: str,
+) -> None:
+    def combined_response(route) -> None:
+        route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "success": True,
+                    "data": {
+                        "symbol": "AAPL",
+                        "status": "partial",
+                        "answer": "AAPL's available records show a closing price of 204.50.",
+                        "provider": "marketdata.app",
+                        "as_of": "2026-08-08T00:00:00Z",
+                        "period_start": "2026-08-07",
+                        "period_end": "2026-08-07",
+                        "evidence_count": 1,
+                        "disclaimer": "Informational only, not investment advice.",
+                    },
+                    "meta": {"request_id": "browser-fixture"},
+                    "error": None,
+                }
+            ),
+        )
+
+    page.route("**/api/v1/research/query", combined_response)
+    _sign_in(page, base_url, app_key)
+    page.get_by_test_id("quote-summary").wait_for(state="visible")
+    question = page.get_by_label("Question about market data")
+    question.fill("What is the latest closing price?")
+    page.get_by_test_id("research-submit").click()
+
+    panel = page.get_by_test_id("research-panel")
+    panel.get_by_text("AAPL's available records show a closing price of 204.50.").wait_for(
+        state="visible"
+    )
+    assert panel.get_by_text("Partial", exact=True).is_visible()
+    assert panel.get_by_text("marketdata.app", exact=True).is_visible()
+    assert panel.get_by_text("1", exact=True).is_visible()
+
+
+def test_marketview_escapes_all_response_fields_and_fits_375px(
     page,
     base_url: str,
     app_key: str,
 ) -> None:
     malicious = '<img src=x onerror="window.researchXss=true">'
-    valid_url = "https://www.sec.gov/Archives/edgar/data/320193/example/aapl.htm"
 
     def research_response(route) -> None:
         route.fulfill(
@@ -547,37 +680,14 @@ def test_research_escapes_content_rejects_malicious_citations_and_fits_375px(
                     "success": True,
                     "data": {
                         "symbol": "AAPL",
+                        "status": "answered",
                         "answer": malicious,
-                        "outcome": "answered",
-                        "insufficient_evidence": False,
-                        "refused": False,
-                        "citations": [
-                            {
-                                "title": malicious,
-                                "url": valid_url,
-                                "filed_date": "2025-10-31",
-                                "filing_type": "10-K",
-                                "accession_number": "0000320193-25-000001",
-                                "snippet": malicious,
-                            },
-                            {
-                                "title": "Unsafe filing",
-                                "url": "https://www.sec.gov.evil.test/Archives/edgar/data/1/x.htm",
-                                "filed_date": "2025-10-30",
-                                "filing_type": "10-K",
-                                "accession_number": "0000000001-25-000001",
-                                "snippet": "unsafe",
-                            },
-                            {
-                                "title": "Encoded traversal",
-                                "url": "https://www.sec.gov/Archives/edgar/data/320193/%2e%2e/x.htm",
-                                "filed_date": "2025-10-29",
-                                "filing_type": "10-K",
-                                "accession_number": "0000000001-25-000002",
-                                "snippet": "unsafe",
-                            },
-                        ],
-                        "disclaimer": "Informational only, not investment advice.",
+                        "provider": malicious,
+                        "as_of": "2026-08-08T00:00:00Z",
+                        "period_start": "2026-07-09",
+                        "period_end": "2026-08-07",
+                        "evidence_count": 22,
+                        "disclaimer": malicious,
                     },
                     "meta": {"request_id": "browser-fixture"},
                     "error": None,
@@ -590,18 +700,14 @@ def test_research_escapes_content_rejects_malicious_citations_and_fits_375px(
     _sign_in(page, base_url, app_key)
     page.get_by_test_id("quote-summary").wait_for(state="visible")
     panel = page.get_by_test_id("research-panel")
-    question = page.get_by_label("Question about SEC filings")
-    question.fill("What risks did management identify?")
+    question = page.get_by_label("Question about market data")
+    question.fill("How has the closing price changed recently?")
     page.get_by_test_id("research-submit").click()
 
     panel.get_by_text(malicious, exact=True).first.wait_for(state="visible")
     assert panel.locator("img").count() == 0
     assert page.evaluate("window.researchXss !== true")
-    links = panel.get_by_role("link")
-    assert links.count() == 1
-    assert links.first.get_attribute("href") == valid_url
-    assert panel.get_by_text("Unsafe filing", exact=True).count() == 0
-    assert panel.get_by_text("Encoded traversal", exact=True).count() == 0
+    assert panel.get_by_role("link").count() == 0
     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
     assert question.bounding_box()["height"] >= 44
     assert page.get_by_test_id("research-submit").bounding_box()["height"] >= 44

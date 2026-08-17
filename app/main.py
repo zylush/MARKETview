@@ -43,7 +43,7 @@ from app.errors import (
     QuotaExceededError,
     SymbolDirectoryUnavailableError,
 )
-from app.services.research import ResearchUnavailableError
+from app.services.market_analysis import MarketAnalysisUnavailableError
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CSRF_COOKIE = "marketdata_csrf"
@@ -328,17 +328,17 @@ def create_app(
         del exc
         return _error_response(request, 422, "VALIDATION_ERROR", "request validation failed")
 
-    @application.exception_handler(ResearchUnavailableError)
-    async def research_unavailable(
+    @application.exception_handler(MarketAnalysisUnavailableError)
+    async def market_analysis_unavailable(
         request: Request,
-        exc: ResearchUnavailableError,
+        exc: MarketAnalysisUnavailableError,
     ) -> JSONResponse:
         del exc
         return _error_response(
             request,
             503,
             "RESEARCH_UNAVAILABLE",
-            "research is not configured",
+            "market analysis is unavailable",
         )
 
     @application.exception_handler(SymbolDirectoryUnavailableError)

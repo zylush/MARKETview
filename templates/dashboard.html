@@ -188,25 +188,25 @@
       >
         <div class="section-heading">
           <div>
-            <p class="eyebrow">Citation-backed SEC evidence</p>
-            <h2 id="research-heading">Filing research</h2>
+            <p class="eyebrow">AI-powered market intelligence</p>
+            <h2 id="research-heading">MarketView AI</h2>
           </div>
           <p class="research-disclaimer">Informational only, not investment advice.</p>
         </div>
         <form id="research-form" class="research-form" novalidate>
-          <label for="research-question">Question about SEC filings</label>
+          <label for="research-question">Question about market data</label>
           <textarea
             id="research-question"
             name="question"
             rows="4"
             maxlength="500"
             aria-describedby="research-help research-character-count"
-            placeholder="For example: What risks did management identify?"
+            placeholder="For example: How has the closing price changed recently?"
             data-testid="research-question"
             required
           ></textarea>
           <div class="research-field-meta">
-            <p id="research-help" class="field-help">Answers are limited to indexed filings for <strong id="research-symbol">AAPL</strong>.</p>
+            <p id="research-help" class="field-help">MarketView analyzes collected market data for <strong id="research-symbol">AAPL</strong> with OpenAI-powered assistance.</p>
             <output
               id="research-character-count"
               class="character-count"
@@ -216,7 +216,7 @@
             >0 / 500</output>
           </div>
           <div class="research-actions">
-            <button class="button button-primary" type="submit" data-testid="research-submit" disabled>Research filings</button>
+            <button class="button button-primary" type="submit" data-testid="research-submit" disabled>Generate analysis</button>
             <button id="research-cancel" class="button button-secondary" type="button" data-testid="research-cancel" hidden>Cancel request</button>
           </div>
         </form>
@@ -226,7 +226,7 @@
           role="status"
           aria-live="polite"
           tabindex="-1"
-        >Ask a question about AAPL SEC filings.</div>
+        >Ask MarketView about AAPL market data.</div>
         <div id="research-error" class="section-message error-message" role="alert" tabindex="-1" hidden></div>
         <article
           id="research-result"
@@ -235,12 +235,16 @@
           tabindex="-1"
           hidden
         >
-          <h3 id="research-result-heading">Research response</h3>
+          <h3 id="research-result-heading">MarketView response</h3>
           <p id="research-answer"></p>
-          <div id="research-citations-wrap" hidden>
-            <h3>Sources</h3>
-            <ol id="research-citations" class="citation-list"></ol>
-          </div>
+          <dl id="research-metadata" class="research-metadata" aria-label="Analysis details">
+            <div><dt>Status</dt><dd id="research-result-status">—</dd></div>
+            <div><dt>Provider</dt><dd id="research-provider">—</dd></div>
+            <div><dt>As of</dt><dd id="research-as-of">—</dd></div>
+            <div><dt>Period</dt><dd id="research-period">—</dd></div>
+            <div><dt>Evidence records</dt><dd id="research-evidence-count">—</dd></div>
+          </dl>
+          <p id="research-result-disclaimer" class="research-result-disclaimer"></p>
         </article>
       </section>
       {% endif %}

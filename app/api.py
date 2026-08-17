@@ -5,9 +5,9 @@ import asyncio
 import hashlib
 import inspect
 from collections.abc import Callable
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -16,9 +16,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.auth import verify_app_key
 from app.dependencies import increment_rate, rate_limit_identity, setting
-from app.research.deadline import RequestDeadline
-from app.research.domain import ResearchAnswer
-from app.services.research import ResearchUnavailableError
+from app.market_analysis.domain import MarketAnalysisAnswer
+from app.services.market_analysis import MarketAnalysisUnavailableError
 from app.validation import (
     validate_research_question,
     validate_symbol,
@@ -43,7 +42,7 @@ def envelope(
     data: Any,
     metadata: object | None = None,
 ) -> dict[str, Any]:
-    encoded_data = jsonable_encoder(data)
+    encoded_data = jsonable_encoder(data, custom_encoder={Decimal: str})
     response_data = encoded_data
     pagination: dict[str, Any] | None = None
     if isinstance(encoded_data, dict) and {
@@ -205,20 +204,6 @@ def build_api_router(
         next_day = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), UTC)
         return max(1, int((next_day - now).total_seconds()))
 
-    async def release_research_reservation(
-        method: Callable[..., Any],
-        reservation: object,
-    ) -> None:
-        try:
-            cleanup = asyncio.create_task(invoke(method, reservation, deadline=None))
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            with suppress(Exception):
-                await cleanup
-            raise
-        except Exception:
-            return
-
     async def enforce_symbol_search_limit(request: Request) -> None:
         window = int(setting(settings, "rate_limit_window_seconds", 60))
         limit = int(setting(settings, "symbol_search_rate_limit", 30))
@@ -316,18 +301,6 @@ def build_api_router(
             unavailable_message="research service is unavailable",
             enabled=setting(settings, "research_enabled", False) is True,
         )
-        authorize_reservation = optional_service_method(
-            service,
-            "authorize_research_reservation",
-            unavailable_message="research service is unavailable",
-            enabled=setting(settings, "research_enabled", False) is True,
-        )
-        release_reservation = optional_service_method(
-            service,
-            "release_research_reservation",
-            unavailable_message="research service is unavailable",
-            enabled=setting(settings, "research_enabled", False) is True,
-        )
         maximum_bytes = int(
             setting(settings, "research_max_request_bytes", DEFAULT_RESEARCH_REQUEST_BYTES)
         )
@@ -345,38 +318,32 @@ def build_api_router(
                 DEFAULT_RESEARCH_DAILY_BUDGET,
             )
         )
-        deadline = RequestDeadline.after(timeout_seconds)
-        reservation: object | None = None
-        try:
+
+        async def authorize_generation() -> None:
             try:
-                async with asyncio.timeout(timeout_seconds):
-                    reservation = await invoke(
-                        authorize_reservation,
-                        authorization.principal_digest,
-                        daily_limit=daily_limit,
-                        window_seconds=research_daily_window_seconds(),
-                        deadline=deadline,
-                    )
-                    if reservation is None:
-                        raise HTTPException(429, detail="research daily budget exceeded")
-                    data = await invoke(
-                        method,
-                        payload.symbol,
-                        payload.question,
-                        reservation=reservation,
-                        deadline=deadline,
-                    )
-            except TimeoutError:
-                raise HTTPException(504, detail="the research request timed out") from None
-            if not isinstance(data, ResearchAnswer) or data.symbol != payload.symbol:
-                data = None
-                raise ResearchUnavailableError("research response was invalid") from None
-            return envelope(request, data)
-        finally:
-            if reservation is not None:
-                await release_research_reservation(
-                    release_reservation,
-                    reservation,
+                budget_count = await increment_rate(
+                    cache,
+                    f"budget:market-analysis:{datetime.now(UTC).date().isoformat()}",
+                    research_daily_window_seconds(),
                 )
+            except Exception as exc:
+                raise HTTPException(503, detail="rate limiter unavailable") from exc
+            if budget_count > daily_limit:
+                raise HTTPException(429, detail="research daily budget exceeded")
+
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                data = await invoke(
+                    method,
+                    payload.symbol,
+                    payload.question,
+                    before_generation=authorize_generation,
+                )
+        except TimeoutError:
+            raise HTTPException(504, detail="the research request timed out") from None
+        if not isinstance(data, MarketAnalysisAnswer) or data.symbol != payload.symbol:
+            data = None
+            raise MarketAnalysisUnavailableError("market analysis response was invalid") from None
+        return envelope(request, data)
 
     return router

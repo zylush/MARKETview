@@ -47,6 +47,8 @@ class ServiceMetadata:
 class MarketDataService:
     """Provider-neutral, cache-aside service with a local daily credit guard."""
 
+    provider_name = "marketdata.app"
+
     def __init__(
         self,
         provider: MarketDataProvider,

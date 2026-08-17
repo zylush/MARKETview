@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import inspect
+from collections.abc import Awaitable, Callable
 from datetime import date
 from typing import Any, Protocol
 
-from app.research.control import Reservation
-from app.research.deadline import RequestDeadline
+from app.market_analysis.domain import MarketAnalysisAnswer
 
 
 class MarketDataDashboardProtocol(Protocol):
@@ -12,12 +13,11 @@ class MarketDataDashboardProtocol(Protocol):
     def last_metadata(self) -> object | None: ...
 
     async def latest_eod(self, symbol: str) -> Any: ...
-
     async def history(
         self,
         symbol: str,
-        start_date: date,
-        end_date: date,
+        start: date,
+        end: date,
         *,
         limit: int = 100,
         cursor: str | None = None,
@@ -34,7 +34,6 @@ class MarketDataDashboardProtocol(Protocol):
         cursor: str | None = None,
         offset: int | None = None,
     ) -> Any: ...
-
     async def usage(self) -> Any: ...
 
 
@@ -42,45 +41,28 @@ class SymbolSearchProtocol(Protocol):
     async def search_symbols(self, query: str, *, limit: int = 8) -> Any: ...
 
 
-class ResearchQueryProtocol(Protocol):
-    async def authorize_research_reservation(
-        self,
-        principal_digest: str,
-        *,
-        daily_limit: int,
-        window_seconds: int,
-        deadline: RequestDeadline | None = None,
-    ) -> Reservation | None: ...
-
+class MarketAnalysisProtocol(Protocol):
     async def query_research(
         self,
         symbol: str,
         question: str,
         *,
-        reservation: Reservation | None = None,
-        deadline: RequestDeadline | None = None,
-    ) -> Any: ...
-
-    async def release_research_reservation(
-        self,
-        reservation: Reservation,
-        *,
-        deadline: RequestDeadline | None = None,
-    ) -> bool: ...
+        before_generation: Callable[[], Awaitable[None]] | None = None,
+    ) -> MarketAnalysisAnswer: ...
 
 
 class DashboardService:
-    """Compose market data, symbol lookup, and research services behind one route object."""
+    """Expose market data, symbol lookup, and AI market analysis as one route facade."""
 
     def __init__(
         self,
         market_data: MarketDataDashboardProtocol,
         symbol_search: SymbolSearchProtocol,
-        research: ResearchQueryProtocol,
+        market_analysis: MarketAnalysisProtocol,
     ) -> None:
         self._market_data = market_data
         self._symbol_search = symbol_search
-        self._research = research
+        self._market_analysis = market_analysis
 
     @property
     def last_metadata(self) -> object | None:
@@ -89,13 +71,7 @@ class DashboardService:
     async def latest_eod(self, symbol: str) -> Any:
         return await self._market_data.latest_eod(symbol)
 
-    async def history(
-        self,
-        symbol: str,
-        start: date,
-        end: date,
-        **params: Any,
-    ) -> Any:
+    async def history(self, symbol: str, start: date, end: date, **params: Any) -> Any:
         return await self._market_data.history(symbol, start, end, **params)
 
     async def eod_history(self, symbol: str, **params: Any) -> Any:
@@ -107,49 +83,21 @@ class DashboardService:
     async def search_symbols(self, query: str, *, limit: int = 8) -> Any:
         return await self._symbol_search.search_symbols(query, limit=limit)
 
-    async def authorize_research_reservation(
-        self,
-        principal_digest: str,
-        *,
-        daily_limit: int,
-        window_seconds: int,
-        deadline: RequestDeadline | None = None,
-    ) -> Reservation | None:
-        return await self._research.authorize_research_reservation(
-            principal_digest,
-            daily_limit=daily_limit,
-            window_seconds=window_seconds,
-            deadline=deadline,
-        )
-
     async def query_research(
         self,
         symbol: str,
         question: str,
         *,
-        reservation: Reservation | None = None,
-        deadline: RequestDeadline | None = None,
+        before_generation: Callable[[], Awaitable[None]] | None = None,
     ) -> Any:
-        return await self._research.query_research(
+        return await self._market_analysis.query_research(
             symbol,
             question,
-            reservation=reservation,
-            deadline=deadline,
-        )
-
-    async def release_research_reservation(
-        self,
-        reservation: Reservation,
-        *,
-        deadline: RequestDeadline | None = None,
-    ) -> bool:
-        return await self._research.release_research_reservation(
-            reservation,
-            deadline=deadline,
+            before_generation=before_generation,
         )
 
     async def aclose(self) -> None:
-        configured = (self._market_data, self._symbol_search, self._research)
+        configured = (self._market_data, self._symbol_search, self._market_analysis)
         components = tuple(
             component
             for index, component in enumerate(configured)
@@ -158,10 +106,12 @@ class DashboardService:
         for component in components:
             close = getattr(component, "aclose", None)
             if close is not None:
-                await close()
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
 
     def manages(self, resource: object) -> bool:
-        components = (self._market_data, self._symbol_search, self._research)
+        components = (self._market_data, self._symbol_search, self._market_analysis)
         return any(
             bool(manages and manages(resource))
             for component in components

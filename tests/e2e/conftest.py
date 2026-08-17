@@ -8,7 +8,7 @@ import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -16,14 +16,7 @@ import pytest
 import uvicorn
 
 from app.main import create_app
-from app.research.control import Reservation, ReservationState
-from app.research.deadline import RequestDeadline
-from app.research.domain import (
-    EvidenceQuote,
-    GeneratedClaim,
-    ResearchAnswer,
-    ResearchCitation,
-)
+from app.market_analysis.domain import MarketAnalysisAnswer, MarketAnswerStatus, MarketPeriod
 
 try:
     from playwright.sync_api import Error as PlaywrightError
@@ -166,71 +159,29 @@ class FakeMarketService:
             "as_of": "2026-08-09T00:00:00Z",
         }
 
-    async def authorize_research_reservation(
-        self,
-        principal_digest: str,
-        *,
-        daily_limit: int,
-        window_seconds: int,
-        deadline: RequestDeadline | None = None,
-    ) -> Reservation | None:
-        del daily_limit, window_seconds
-        if deadline is not None:
-            deadline.raise_if_expired()
-        return Reservation(
-            reservation_digest="1" * 64,
-            budget_digest="2" * 64,
-            principal_digest=principal_digest,
-            units=1,
-            state=ReservationState.AUTHORIZED,
-        )
-
     async def query_research(
         self,
         symbol: str,
         question: str,
         *,
-        reservation: Reservation | None = None,
-        deadline: RequestDeadline | None = None,
-    ) -> ResearchAnswer:
-        if reservation is None or reservation.state is not ReservationState.AUTHORIZED:
-            raise RuntimeError("research reservation is required")
-        if deadline is not None:
-            deadline.raise_if_expired()
+        before_generation=None,
+    ) -> MarketAnalysisAnswer:
+        if before_generation is not None:
+            await before_generation()
         if "buy" in question.lower() or "sell" in question.lower():
-            return ResearchAnswer.refusal(symbol)
-        if symbol == "AAPL" and "risk" in question.lower():
-            chunk_id = "chunk-" + "a" * 64
-            quote = EvidenceQuote(
-                chunk_id=chunk_id,
-                quote="supply constraints could affect results",
+            return MarketAnalysisAnswer(
+                symbol=symbol,
+                status=MarketAnswerStatus.INSUFFICIENT_EVIDENCE,
+                answer="MarketView cannot provide personalized investment advice.",
             )
-            claim = GeneratedClaim(
-                text="Apple identifies supply constraints as a risk.",
-                supporting_chunk_ids=(chunk_id,),
-                evidence_quotes=(quote,),
-            )
-            citation = ResearchCitation(
-                chunk_id=chunk_id,
-                title="Apple 2025 Form 10-K",
-                url=("https://www.sec.gov/Archives/edgar/data/320193/000032019325000001/aapl.htm"),
-                filed_date=date(2025, 10, 31),
-                filing_type="10-K",
-                accession_number="0000320193-25-000001",
-                snippet="supply constraints could affect results",
-            )
-            return ResearchAnswer.answered(symbol, (claim,), (citation,))
-        return ResearchAnswer.insufficient(symbol)
-
-    async def release_research_reservation(
-        self,
-        reservation: Reservation,
-        *,
-        deadline: RequestDeadline | None = None,
-    ) -> bool:
-        if deadline is not None:
-            deadline.raise_if_expired()
-        return reservation.state is ReservationState.AUTHORIZED
+        return MarketAnalysisAnswer(
+            symbol=symbol,
+            status=MarketAnswerStatus.ANSWERED,
+            answer=f"AI-assisted analysis of collected {symbol} market data.",
+            provider="marketdata.app",
+            as_of=datetime(2026, 8, 9, tzinfo=UTC),
+            periods=(MarketPeriod(start=date(2026, 7, 10), end=date(2026, 8, 9)),),
+        )
 
 
 def _wait_until_ready(base_url: str, thread: threading.Thread) -> None:

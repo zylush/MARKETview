@@ -489,9 +489,13 @@
     if (!elements.researchForm) return;
     setVisible($("research-error"), false);
     setVisible($("research-result"), false);
-    setVisible($("research-citations-wrap"), false);
-    $("research-citations").replaceChildren();
     setText("research-answer", "");
+    setText("research-result-status", "—");
+    setText("research-provider", "—");
+    setText("research-as-of", "—");
+    setText("research-period", "—");
+    setText("research-evidence-count", "—");
+    setText("research-result-disclaimer", "");
   }
 
   function setResearchStatus(message, { loading = false, focus = false } = {}) {
@@ -512,103 +516,70 @@
     error.focus({ preventScroll: true });
   }
 
-  function canonicalSecCitationUrl(value) {
-    if (typeof value !== "string" || value.includes("%")) return null;
-    try {
-      const url = new URL(value);
-      const validPath = /^\/Archives\/edgar\/data\/[0-9]+\/[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(url.pathname);
-      const unsafeSegment = url.pathname.split("/").some((segment) => segment === "." || segment === "..");
-      if (
-        url.protocol !== "https:"
-        || url.hostname !== "www.sec.gov"
-        || url.host !== "www.sec.gov"
-        || url.username
-        || url.password
-        || url.port
-        || url.search
-        || url.hash
-        || !validPath
-        || unsafeSegment
-        || url.href !== value
-      ) return null;
-      return url.href;
-    } catch (_error) {
-      return null;
-    }
+  function displayStatus(value) {
+    const status = typeof value === "string" ? value.trim().toLowerCase() : "";
+    const labels = Object.freeze({
+      answered: "Answered",
+      partial: "Partial",
+      insufficient_evidence: "Insufficient evidence",
+      unavailable: "Unavailable",
+      refused: "Refused",
+    });
+    return labels[status] || "Unavailable";
   }
 
-  function normalizedCitation(value) {
-    const url = canonicalSecCitationUrl(value?.url);
-    const title = typeof value?.title === "string" ? value.title.trim() : "";
-    const filedDate = typeof value?.filed_date === "string" ? value.filed_date : "";
-    const filingType = typeof value?.filing_type === "string" ? value.filing_type.trim() : "";
-    const snippet = typeof value?.snippet === "string" ? value.snippet.trim() : "";
-    if (!url || !title || !/^\d{4}-\d{2}-\d{2}$/.test(filedDate)) return null;
-    return Object.freeze({ url, title, filedDate, filingType, snippet });
-  }
-
-  function citationItem(citation) {
-    const item = document.createElement("li");
-    const link = document.createElement("a");
-    const metadata = document.createElement("span");
-    const filed = document.createElement("span");
-    link.className = "citation-link";
-    link.href = citation.url;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    link.textContent = citation.title;
-    metadata.className = "citation-meta";
-    filed.textContent = `Filed ${dateValue(citation.filedDate)}`;
-    metadata.append(filed);
-    if (citation.filingType) {
-      const filingType = document.createElement("span");
-      filingType.textContent = ` · ${citation.filingType}`;
-      metadata.append(filingType);
-    }
-    item.replaceChildren(link, metadata);
-    if (citation.snippet) {
-      const snippet = document.createElement("span");
-      snippet.className = "citation-snippet";
-      snippet.textContent = citation.snippet;
-      item.append(snippet);
-    }
-    return item;
+  function safeResponseText(value, fallback = "—") {
+    return typeof value === "string" && value.trim() ? value.trim() : fallback;
   }
 
   function renderResearchAnswer(data) {
     const result = data && typeof data === "object" ? data : {};
     if (normalizeSymbol(result.symbol) !== state.symbol) {
-      setResearchError("Research is temporarily unavailable. Try again later.");
+      setResearchError("Market analysis is temporarily unavailable. Try again later.");
       return;
     }
-    const refused = result.outcome === "refused" || result.refused === true;
-    const insufficient = result.outcome === "insufficient_evidence"
-      || result.insufficient_evidence === true;
+    const status = typeof result.status === "string"
+      ? result.status.trim().toLowerCase()
+      : (typeof result.outcome === "string" ? result.outcome.trim().toLowerCase() : "unavailable");
     clearResearchOutput();
     setVisible($("research-status"), false);
     const answer = $("research-answer");
-    if (refused) {
+    if (status === "refused" || result.refused === true) {
       answer.textContent = "I cannot provide personalized buy or sell recommendations.";
-    } else if (insufficient) {
-      answer.textContent = "Insufficient evidence in the indexed SEC filings.";
-    } else {
-      const citations = Object.freeze(
-        asList(result.citations).map(normalizedCitation).filter(Boolean),
+    } else if (status === "unavailable") {
+      answer.textContent = "Market analysis is temporarily unavailable.";
+    } else if (status === "insufficient_evidence" || result.insufficient_evidence === true) {
+      answer.textContent = "There is not enough collected market data to answer this question.";
+    } else if (status === "answered" || status === "partial") {
+      answer.textContent = safeResponseText(
+        result.answer,
+        "There is not enough collected market data to answer this question.",
       );
-      if (!citations.length || typeof result.answer !== "string" || !result.answer.trim()) {
-        answer.textContent = "Insufficient evidence in the indexed SEC filings.";
-      } else {
-        answer.textContent = result.answer.trim();
-        $("research-citations").replaceChildren(...citations.map(citationItem));
-        setVisible($("research-citations-wrap"), true);
-      }
+    } else {
+      answer.textContent = "Market analysis is temporarily unavailable.";
     }
+    const start = typeof result.period_start === "string" ? dateValue(result.period_start) : "";
+    const end = typeof result.period_end === "string" ? dateValue(result.period_end) : "";
+    const period = start && end ? `${start} – ${end}` : (start || end || "—");
+    const evidenceCount = result.evidence_count == null ? Number.NaN : Number(result.evidence_count);
+    setText("research-result-status", displayStatus(status));
+    setText("research-provider", safeResponseText(result.provider));
+    setText("research-as-of", typeof result.as_of === "string" ? dateValue(result.as_of) : "—");
+    setText("research-period", period);
+    setText(
+      "research-evidence-count",
+      Number.isInteger(evidenceCount) && evidenceCount >= 0 ? formatNumber(evidenceCount) : "—",
+    );
+    setText(
+      "research-result-disclaimer",
+      safeResponseText(result.disclaimer, "AI-assisted analysis is informational only, not investment advice."),
+    );
     const response = $("research-result");
     setVisible(response, true);
     response.focus({ preventScroll: true });
   }
 
-  function cancelResearch(message = "Research request cancelled.") {
+  function cancelResearch(message = "Analysis request cancelled.") {
     if (!elements.researchForm) return;
     const { controller, requestVersion } = state.research;
     if (controller) controller.abort();
@@ -634,24 +605,24 @@
     elements.researchQuestion.value = "";
     setText("research-symbol", symbol);
     clearResearchOutput();
-    setResearchStatus(`Ask a question about ${symbol} SEC filings.`);
+    setResearchStatus(`Ask MarketView about ${symbol} market data.`);
     updateResearchControls();
   }
 
   function researchErrorMessage(error) {
     if (error?.status === 504 || error?.code === "RESEARCH_TIMEOUT") {
-      return "Research request timed out. Try again.";
+      return "Market analysis timed out. Try again.";
     }
     if (error?.status === 503 || error?.code === "RESEARCH_UNAVAILABLE") {
-      return "Research is temporarily unavailable. Try again later.";
+      return "Market analysis is temporarily unavailable. Try again later.";
     }
     if (error?.status === 429) {
-      return "Research request limit reached. Try again later.";
+      return "Market analysis request limit reached. Try again later.";
     }
     if (error?.status === 422 || error?.status === 413) {
       return "Check the question length and try again.";
     }
-    return "Could not complete the research request. Check your connection and try again.";
+    return "Could not complete the market analysis. Check your connection and try again.";
   }
 
   async function submitResearch() {
@@ -667,7 +638,7 @@
     const requestedSymbol = state.symbol;
     updateResearch({ controller, requestVersion, loading: true });
     clearResearchOutput();
-    setResearchStatus(`Searching SEC filings for ${requestedSymbol}…`, { loading: true });
+    setResearchStatus(`Analyzing market data for ${requestedSymbol}…`, { loading: true });
     updateResearchControls();
     try {
       const response = await postJson(

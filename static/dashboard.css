@@ -167,11 +167,11 @@ tbody tr:hover { background: #f8fafc; }
 .research-result { min-width: 0; margin-top: var(--space-3); padding-top: var(--space-3); border-top: 1px solid var(--color-border); }
 .research-result h3 { margin: 0 0 var(--space-2); font-size: 1rem; }
 .research-result p { max-width: 75ch; margin: 0; line-height: 1.65; overflow-wrap: anywhere; }
-.citation-list { display: grid; gap: var(--space-3); margin: 0; padding-left: 1.35rem; }
-.citation-list li { min-width: 0; padding-left: var(--space-1); overflow-wrap: anywhere; }
-.citation-link { display: inline-block; min-height: 44px; padding-block: 10px; color: var(--color-accent-dark); font-weight: 700; text-underline-offset: 3px; overflow-wrap: anywhere; }
-.citation-meta, .citation-snippet { display: block; color: var(--color-secondary); font-size: 0.8125rem; line-height: 1.5; }
-.citation-snippet { margin-top: var(--space-1); }
+.research-metadata { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: var(--space-2); margin: var(--space-3) 0 0; }
+.research-metadata div { min-width: 0; padding: var(--space-2); background: var(--color-muted); border-radius: var(--radius); }
+.research-metadata dt { color: var(--color-secondary); font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
+.research-metadata dd { margin: var(--space-1) 0 0; font-weight: 700; overflow-wrap: anywhere; }
+.research-result .research-result-disclaimer { margin-top: var(--space-3); color: var(--color-secondary); font-size: 0.8125rem; }
 .noscript-message { margin: 16px; padding: 12px; color: var(--color-error); background: var(--color-error-bg); }
 
 @media (min-width: 600px) {
