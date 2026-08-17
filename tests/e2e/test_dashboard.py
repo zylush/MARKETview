@@ -45,6 +45,22 @@ def test_missing_app_key_is_rejected(base_url: str) -> None:
     assert payload["error"]["code"] == "unauthorized"
 
 
+def test_inquiry_contact_is_available_on_login_and_dashboard(
+    page,
+    base_url: str,
+    app_key: str,
+) -> None:
+    page.goto(f"{base_url}/")
+    login_contact = page.get_by_role("link", name="paoloinigo30@gmail.com")
+    assert login_contact.is_visible()
+    assert login_contact.get_attribute("href") == "mailto:paoloinigo30@gmail.com"
+
+    _sign_in(page, base_url, app_key)
+    dashboard_contact = page.get_by_role("link", name="paoloinigo30@gmail.com")
+    assert dashboard_contact.is_visible()
+    assert dashboard_contact.get_attribute("href") == "mailto:paoloinigo30@gmail.com"
+
+
 def test_login_symbol_quote_history_usage_and_logout(
     page,
     base_url: str,
