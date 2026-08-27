@@ -67,6 +67,27 @@ def test_inquiry_contact_is_available_on_login_and_dashboard(
     ).is_visible()
 
 
+def test_login_landing_is_static_accessible_and_responsive(page, base_url: str) -> None:
+    api_requests: list[str] = []
+    page.on("request", lambda request: api_requests.append(_api_path(request.url)))
+    page.set_viewport_size({"width": 375, "height": 800})
+
+    page.goto(f"{base_url}/")
+
+    assert page.get_by_role("heading", name="A clearer view of the market.").is_visible()
+    assert page.get_by_text("MarketView", exact=True).is_visible()
+    assert page.get_by_text("Private workspace", exact=True).is_visible()
+    assert page.get_by_test_id("landing-preview").is_visible()
+    assert page.get_by_text("Illustrative snapshot", exact=True).is_visible()
+    assert page.get_by_role("heading", name="Sign in to your workspace").is_visible()
+    assert page.get_by_label("Password").is_visible()
+    assert page.get_by_role("button", name="Sign in").is_visible()
+    assert page.locator("body").evaluate("element => element.scrollWidth <= element.clientWidth")
+    assert page.get_by_label("Password").bounding_box()["height"] >= 44
+    assert page.get_by_role("button", name="Sign in").bounding_box()["height"] >= 44
+    assert [path for path in api_requests if path] == []
+
+
 def test_login_symbol_quote_history_usage_and_logout(
     page,
     base_url: str,

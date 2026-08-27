@@ -3,42 +3,200 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="light">
-    <title>Sign in | Market Data Dashboard</title>
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#020617">
+    <meta
+      name="description"
+      content="MarketView is a focused workspace for daily market data and historical context."
+    >
+    <title>MarketView | Sign in</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='login.css') }}">
   </head>
   <body>
     <a class="skip-link" href="#login-main">Skip to sign in</a>
-    <main id="login-main" class="login-shell">
-      <section class="login-panel" aria-labelledby="login-heading">
-        <div class="brand" aria-label="Market Data Dashboard">
+
+    <main id="login-main" class="landing-shell">
+      <header class="landing-header">
+        <a class="brand" href="/" aria-label="MarketView home">
           <span class="brand-mark" aria-hidden="true">M</span>
-          <span>Market Data</span>
+          <span class="brand-name">MarketView</span>
+          <span class="brand-descriptor">/ market intelligence</span>
+        </a>
+        <div class="workspace-badge">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span>Private workspace</span>
         </div>
-        <div class="login-intro">
-          <p class="eyebrow">Personal market dashboard</p>
-          <h1 id="login-heading">Sign in to your workspace</h1>
-          <p>Enter the app password to access daily quotes and market history.</p>
-        </div>
+      </header>
 
-        {% if error %}
-          <div class="form-alert" role="alert" data-testid="login-error">{{ error }}</div>
-        {% endif %}
+      <div class="landing-grid">
+        <section class="hero-copy" aria-labelledby="landing-heading">
+          <p class="hero-kicker">
+            <span class="kicker-rule" aria-hidden="true"></span>
+            Daily market intelligence
+          </p>
+          <h1 id="landing-heading">A clearer view of the market.</h1>
+          <p class="hero-lead">
+            Search symbols, see unadjusted daily history, and ask better questions from one
+            focused workspace.
+          </p>
 
-        <form class="login-form" method="post" action="/auth/login" data-testid="login-form">
-          {% if csrf_token is defined and csrf_token %}
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          {% endif %}
-          <div class="field">
-            <label for="password">Password</label>
-            <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
+          <ul class="feature-list" aria-label="MarketView capabilities">
+            <li>
+              <span class="feature-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <path d="M4 18V6m0 12h16" stroke-linecap="round" />
+                  <path d="m7 15 3-4 3 2 5-6" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </span>
+              <span>
+                <strong>Daily EOD quotes</strong>
+                <small>Know what the session actually closed at.</small>
+              </span>
+            </li>
+            <li>
+              <span class="feature-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <rect x="4" y="4" width="16" height="16" rx="2" />
+                  <path d="M8 8h8M8 12h8M8 16h4" stroke-linecap="round" />
+                </svg>
+              </span>
+              <span>
+                <strong>Historical context</strong>
+                <small>Trace a symbol across a clean daily range.</small>
+              </span>
+            </li>
+            <li>
+              <span class="feature-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+                  <path d="M12 3 5 6v5c0 4.2 2.8 7.8 7 9 4.2-1.2 7-4.8 7-9V6l-7-3Z" stroke-linejoin="round" />
+                  <path d="m9 12 2 2 4-4" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              </span>
+              <span>
+                <strong>Read-only by design</strong>
+                <small>Focused market context without trade execution.</small>
+              </span>
+            </li>
+          </ul>
+        </section>
+
+        <section class="login-panel" aria-labelledby="login-heading">
+          <div class="panel-header">
+            <p class="eyebrow">Private access</p>
+            <span class="panel-lock" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
+                <rect x="5" y="10" width="14" height="10" rx="2" />
+                <path d="M8 10V7a4 4 0 0 1 8 0v3" stroke-linecap="round" />
+              </svg>
+            </span>
           </div>
-          <button type="submit">Sign in</button>
-        </form>
-        <p class="inquiry-contact">
-          Contact <a href="mailto:paoloinigo30@gmail.com">paoloinigo30@gmail.com</a> for inquiries.
-        </p>
-      </section>
+          <div class="login-intro">
+            <h2 id="login-heading">Sign in to your workspace</h2>
+            <p>Enter your app password to access daily quotes and market history.</p>
+          </div>
+
+          {% if error %}
+            <div class="form-alert" role="alert" data-testid="login-error">{{ error }}</div>
+          {% endif %}
+
+          <form class="login-form" method="post" action="/auth/login" data-testid="login-form">
+            {% if csrf_token is defined and csrf_token %}
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            {% endif %}
+            <div class="field">
+              <label for="password">Password</label>
+              <input
+                id="password"
+                name="password"
+                type="password"
+                autocomplete="current-password"
+                aria-describedby="password-help"
+                required
+                autofocus
+              >
+              <p id="password-help" class="field-help">Use your MarketView app password.</p>
+            </div>
+            <button type="submit">
+              <span>Sign in</span>
+              <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M5 12h13m-5-5 5 5-5 5" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </button>
+          </form>
+          <p class="login-note">
+            <span class="note-marker" aria-hidden="true"></span>
+            Informational market data only. Not investment advice.
+          </p>
+        </section>
+
+        <figure class="market-preview" data-testid="landing-preview" aria-labelledby="preview-heading">
+          <div class="preview-topline">
+            <div>
+              <p class="preview-overline">Illustrative snapshot</p>
+              <h2 id="preview-heading">AAPL <span>/ DAILY</span></h2>
+            </div>
+            <span class="preview-status">
+              <span class="status-dot" aria-hidden="true"></span>
+              EOD
+            </span>
+          </div>
+
+          <div class="preview-price-row">
+            <div>
+              <span class="preview-label">Unadjusted close</span>
+              <strong class="preview-price">$204.50</strong>
+            </div>
+            <span class="preview-change">+3.20%</span>
+          </div>
+
+          <div class="chart-wrap">
+            <svg
+              class="preview-chart"
+              viewBox="0 0 640 190"
+              role="img"
+              aria-labelledby="preview-chart-title preview-chart-description"
+            >
+              <title id="preview-chart-title">Illustrative upward price trend</title>
+              <desc id="preview-chart-description">
+                A sample line chart rising from the lower left to the upper right.
+              </desc>
+              <defs>
+                <linearGradient id="chart-fill" x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0" class="chart-fill-start" />
+                  <stop offset="1" class="chart-fill-end" />
+                </linearGradient>
+              </defs>
+              <path class="chart-grid" d="M0 30h640M0 95h640M0 160h640" />
+              <path class="chart-area" d="M0 151 58 136 108 143 167 105 225 120 286 82 345 93 404 58 463 70 523 40 582 52 640 18v172H0Z" />
+              <path class="chart-line" d="M0 151 58 136 108 143 167 105 225 120 286 82 345 93 404 58 463 70 523 40 582 52 640 18" />
+              <circle class="chart-point" cx="640" cy="18" r="5" />
+            </svg>
+          </div>
+
+          <div class="preview-metrics">
+            <div class="preview-metric">
+              <span>High</span>
+              <strong>$205.10</strong>
+            </div>
+            <div class="preview-metric">
+              <span>Low</span>
+              <strong>$198.70</strong>
+            </div>
+            <div class="preview-metric">
+              <span>History</span>
+              <strong>1 year</strong>
+            </div>
+          </div>
+          <figcaption>Illustrative data — live requests begin after sign-in.</figcaption>
+        </figure>
+      </div>
     </main>
+
+    <footer class="landing-footer" aria-label="Contact">
+      <p class="inquiry-contact">
+        Contact <a href="mailto:paoloinigo30@gmail.com">paoloinigo30@gmail.com</a> for inquiries.
+      </p>
+      <p class="footer-meta">MarketView <span aria-hidden="true">/</span> Private workspace</p>
+    </footer>
   </body>
 </html>
